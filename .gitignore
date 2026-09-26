@@ -5,6 +5,8 @@ build/
 server.jar
 cache
 phisap_error.log
+.old_version/
+.phisap_version
 __pycache__/
 
 # 官谱样例数据(游戏版权素材，不入库，仅本地开发验证用)
