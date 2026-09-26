@@ -133,6 +133,12 @@ class DeviceController:
             )
         finally:
             skt.close()
+        # 关闭Nagle算法: 触控消息都很小(32字节), 默认会被攒包/等待ACK后才发出,
+        # 可能让个别按下/抬起延迟几十毫秒以上
+        try:
+            self.control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self.video_socket.settimeout(None)
         self.control_socket.settimeout(None)
         subprocess.run(

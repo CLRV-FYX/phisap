@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from chart import Chart
 from note import NoteType
-from .algo_base import (TouchAction, VirtualTouchEvent, recalc_pos, MAX_POINTERS, note_point,
+from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, MAX_POINTERS, note_point,
                         flick_path, flick_time_shift)
 
 
@@ -152,8 +152,8 @@ class PointerAllocator:
         """按下后同一个指针逐毫秒跟随判定线移动, 直到hold结束; 期间该指针不会被其他音符占用"""
         self._tap(pointer, note)
         path = note.path or ()
-        for delta, pos in enumerate(path, start=1):
-            self._insert(self.now + delta, VirtualTouchEvent(pos, TouchAction.MOVE, pointer.id))
+        for i in thin_path(path, note.pos):  # 位置不变或变化很小的毫秒不发送MOVE
+            self._insert(self.now + i + 1, VirtualTouchEvent(path[i], TouchAction.MOVE, pointer.id))
         if path:
             pointer.note = note._replace(pos=path[-1])
         pointer.age = -len(path)

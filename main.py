@@ -415,7 +415,7 @@ class App(ttk.Frame):
     def refresh_algos(self):
         """根据当前曲目/难度刷新算法列表；当前算法无效时自动选择默认算法（有规划缓存时默认使用缓存）"""
         songid, diff = self.song_id.get(), self.difficulty.get()
-        algos = ['algo1', 'algo2']
+        algos = ['algo3', 'algo1', 'algo2']  # algo3: 扫屏(推荐)
         if songid and diff and has_ans_cache(songid, diff):
             algos.insert(0, self.ALGO_CACHED)
         self.algo_select['values'] = algos
@@ -472,6 +472,12 @@ class App(ttk.Frame):
                 import algo.algo2
 
                 ans = algo.algo2.solve(chart, self.console, max_touch_points())
+                with open(ans_file, 'w', encoding='utf-8') as f:
+                    export_to_json(ans, f)
+            elif algo_method == 'algo3':
+                import algo.algo3
+
+                ans = algo.algo3.solve(chart, self.console, max_touch_points())
                 with open(ans_file, 'w', encoding='utf-8') as f:
                     export_to_json(ans, f)
             else:
@@ -551,7 +557,8 @@ class App(ttk.Frame):
                 self.delay_input.bind('<<Increment>>', incremented)
                 self.delay_input.bind('<<Decrement>>', decremented)
 
-                self.start_time = time.time() + offset
+                # perf_counter: Windows上Python 3.12的time.time()精度只有约15.6ms
+                self.start_time = time.perf_counter() + offset
 
                 begin = False
                 self.running = True
@@ -561,7 +568,7 @@ class App(ttk.Frame):
                 try:
                     while self.running:
                         self.update()
-                        now = round((time.time() - self.start_time) * 1000)
+                        now = round((time.perf_counter() - self.start_time) * 1000)
                         if now >= timestamp:
                             if not begin:
                                 self.info_label['text'] = '开始操作'
@@ -595,11 +602,11 @@ class App(ttk.Frame):
                     """打歌线程"""
                     if self.controller:
                         timestamp, events = next(ans_iter)
-                        self.start_time = time.time() - timestamp / 1000 - 0.01  # 0.01 for the delay time
+                        self.start_time = time.perf_counter() - timestamp / 1000 - 0.01  # 0.01 for the delay time
 
                         try:
                             while self.running:
-                                now = round((time.time() - self.start_time) * 1000)
+                                now = round((time.perf_counter() - self.start_time) * 1000)
                                 if now >= timestamp:
                                     for event in events:
                                         self.controller.touch(*event.pos, event.action, pointer_id=event.pointer)

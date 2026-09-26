@@ -13,7 +13,8 @@ MAX_POINTERS = 16
 # 规划缓存文件后缀。规划逻辑或谱面解析有影响结果的修改时递增版本号,
 # 旧版本生成的缓存会被自动忽略(需要重新规划)。
 # v2: 修正官谱/RPE转换谱的y方向、RPE缓动/多层/父线、长按与滑键跟随判定线、16触点
-PLAN_CACHE_SUFFIX = '.ans.v2.json'
+# v3: 精简长按的MOVE事件; 新增algo3(扫屏)
+PLAN_CACHE_SUFFIX = '.ans.v3.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -165,6 +166,31 @@ class VirtualTouchEvent(NamedTuple):
         )
 
 
+def thin_path(points, start: tuple[float, float] | None = None, min_step: float = 1.0, max_lag: float = 6.0,
+              min_interval: int = 4) -> list[int]:
+    """精简长按的逐毫秒轨迹, 返回需要发送MOVE的下标(轨迹中第i个点对应按下后第i+1毫秒)。
+
+    长按跟随判定线时原本每毫秒发送一个MOVE, 判定线静止时全是重复的位置, 会给scrcpy/模拟器
+    的注入造成不必要的压力。这里: 与上次发送的位置相差不到 min_step 像素的点不发送(静止的长按
+    完全不发送MOVE); 相差不到 max_lag 像素且距上次发送不足 min_interval 毫秒的点也不发送;
+    最后一个点总是发送。位置误差最多 max_lag 像素(1280x720), 远小于判定宽度。
+    start: 按下时的位置(默认为轨迹的第一个点)
+    """
+    keep: list[int] = []
+    if not points:
+        return keep
+    last_i, (lx, ly) = -1, (start if start is not None else points[0])
+    for i, (x, y) in enumerate(points):
+        d = math.hypot(x - lx, y - ly)
+        if d < min_step or (d < max_lag and i - last_i < min_interval):
+            continue
+        keep.append(i)
+        last_i, lx, ly = i, x, y
+    if keep[-1:] != [len(points) - 1]:
+        keep.append(len(points) - 1)
+    return keep
+
+
 def export_to_json(ans: dict[int, list[VirtualTouchEvent]], out_file: IO):
     json.dump(
         {timestamp: [event.to_serializable() for event in events] for timestamp, events in ans.items()},
@@ -180,5 +206,5 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
-           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
+           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'thin_path', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
            'clamp_to_screen']
