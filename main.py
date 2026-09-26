@@ -1,11 +1,12 @@
 import configparser
 import json
+import locale
 import os
 import re
 import shutil
 import subprocess
 import sys
-from tkinter import ttk, messagebox, Tk, W, X, IntVar, StringVar, DoubleVar, filedialog, simpledialog
+from tkinter import ttk, messagebox, Tk, W, X, EW, IntVar, StringVar, DoubleVar, filedialog, simpledialog
 from typing import Iterator
 from algo.algo_base import TouchEvent
 from threading import Thread
@@ -116,7 +117,7 @@ def import_charts(app: 'App') -> None:
     for path in paths:
         name = os.path.basename(path)
         try:
-            with open(path, 'r', encoding='utf-8', newline='') as f:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
                 data = json.load(f)
         except Exception as e:
             results.append(f'✗ {name}: 读取失败({e.__class__.__name__}: {e})')
@@ -213,13 +214,13 @@ class App(ttk.Frame):
 
         # ---- 工具栏 ----
         tb = ttk.Frame(frm)
-        tb.grid(row=0, column=0, sticky=X, pady=(0, 6))
+        tb.grid(row=0, column=0, sticky=EW, pady=(0, 6))
         ttk.Button(tb, text='导入谱面', command=lambda: import_charts(self)).pack(side='left', padx=(0, 6))
         ttk.Button(tb, text='打开谱面目录', command=open_tracks_dir).pack(side='left')
 
         def section(row: int, title: str) -> ttk.Frame:
             lf = ttk.LabelFrame(frm, text=title, padding=8)
-            lf.grid(row=row, column=0, sticky=X, pady=4)
+            lf.grid(row=row, column=0, sticky=EW, pady=4)
             lf.columnconfigure(1, weight=1)
             return lf
 
@@ -228,12 +229,12 @@ class App(ttk.Frame):
         ttk.Label(sec, text='曲目ID：').grid(column=0, row=0, sticky=W)
         self.song_id = StringVar()
         self.songs_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.song_id)
-        self.songs_select.grid(column=1, row=0, sticky=X, padx=4)
+        self.songs_select.grid(column=1, row=0, sticky=EW, padx=4)
         self.songs_select.bind('<<ComboboxSelected>>', self.song_selected)
         ttk.Label(sec, text='难度：').grid(column=0, row=1, sticky=W)
         self.difficulty = StringVar()
         self.difficulties_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.difficulty)
-        self.difficulties_select.grid(column=1, row=1, sticky=X, padx=4)
+        self.difficulties_select.grid(column=1, row=1, sticky=EW, padx=4)
         self.difficulties_select.bind('<<ComboboxSelected>>', self.difficulty_selected)
 
         # ---- 规划 ----
@@ -241,14 +242,14 @@ class App(ttk.Frame):
         ttk.Label(sec, text='规划算法：').grid(column=0, row=0, sticky=W)
         self.algo = StringVar()
         self.algo_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.algo)
-        self.algo_select.grid(column=1, row=0, sticky=X, padx=4)
+        self.algo_select.grid(column=1, row=0, sticky=EW, padx=4)
 
         # ---- 设备与屏幕 ----
         sec = section(3, '设备与屏幕')
         ttk.Label(sec, text='设备Serial: ').grid(column=0, row=0, sticky=W)
         self.serial = StringVar()
         self.serial_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.serial)
-        self.serial_select.grid(column=1, row=0, sticky=X, padx=4)
+        self.serial_select.grid(column=1, row=0, sticky=EW, padx=4)
         self.serial_select.bind('<<ComboboxSelected>>', self.adb_serial_selected)
         ttk.Button(sec, text='刷新', command=self.detect_adb_devices).grid(column=2, row=0, padx=(0, 10))
         ttk.Label(sec, text='屏幕尺寸: ').grid(column=0, row=1, sticky=W)
@@ -278,10 +279,10 @@ class App(ttk.Frame):
 
         # ---- 开始按钮 ----
         self.go = ttk.Button(frm, text='开始!', command=self.run)
-        self.go.grid(row=5, column=0, sticky=X, pady=8, ipady=4)
+        self.go.grid(row=5, column=0, sticky=EW, pady=8, ipady=4)
 
         self.info_label = ttk.Label(frm, wraplength=560, justify='left')
-        self.info_label.grid(row=6, column=0, sticky=X)
+        self.info_label.grid(row=6, column=0, sticky=EW)
 
         agreement()
 
@@ -316,7 +317,15 @@ class App(ttk.Frame):
         cache = configparser.ConfigParser()
 
         if os.path.exists(cache_path):
-            cache.read(cache_path)
+            try:
+                cache.read(cache_path, encoding='utf-8')
+            except (UnicodeDecodeError, configparser.Error):
+                # 旧版本按系统默认编码(如GBK)写入的缓存，或已损坏的缓存
+                try:
+                    cache = configparser.ConfigParser()
+                    cache.read(cache_path, encoding=locale.getpreferredencoding(False))
+                except (UnicodeDecodeError, configparser.Error):
+                    cache = configparser.ConfigParser()
 
         if not cache.has_section('cache'):
             cache.add_section('cache')
@@ -391,7 +400,8 @@ class App(ttk.Frame):
 
             chart_path = find_chart_path(self.song_id.get(), self.difficulty.get())
 
-            chart = Chart.from_dict(json.load(open(chart_path)))
+            with open(chart_path, encoding='utf-8-sig') as f:
+                chart = Chart.from_dict(json.load(f))
 
             assert self.cache
             assert self.cache_path
@@ -399,23 +409,27 @@ class App(ttk.Frame):
             self.cache.set('cache', 'difficulty', self.difficulty.get())
             self.cache.set('cache', 'offset', str(self.delay.get()))
             self.cache.set('cache', 'screen', self.screen_size.get())
-            self.cache.write(open(self.cache_path, 'w'))
+            with open(self.cache_path, 'w', encoding='utf-8') as f:
+                self.cache.write(f)
 
             algo_method = self.algo.get()
             ans: dict
             ans_file = chart_path + '.ans.json'
             if algo_method == '不规划(使用缓存)':
-                ans = load_from_json(open(ans_file))
+                with open(ans_file, encoding='utf-8') as f:
+                    ans = load_from_json(f)
             elif algo_method == 'algo1':
                 import algo.algo1
 
                 ans = algo.algo1.solve(chart, self.console)
-                export_to_json(ans, open(ans_file, 'w'))
+                with open(ans_file, 'w', encoding='utf-8') as f:
+                    export_to_json(ans, f)
             elif algo_method == 'algo2':
                 import algo.algo2
 
                 ans = algo.algo2.solve(chart, self.console)
-                export_to_json(ans, open(ans_file, 'w'))
+                with open(ans_file, 'w', encoding='utf-8') as f:
+                    export_to_json(ans, f)
             else:
                 raise RuntimeError(f'unknown algo_method: {algo_method}')
 

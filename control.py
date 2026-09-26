@@ -144,15 +144,13 @@ class DeviceController:
         ret, output = subprocess.getstatusoutput('adb devices')
         if ret != 0:
             return []
-        return [
-            serial
-            for serial, status in (
-                line.split('\t')
-                for line in output.splitlines()
-                if not line.startswith('*') and line != 'List of devices attached'
-            )
-            if status == 'device'
-        ]
+        devices = []
+        for line in output.splitlines():
+            # 跳过 '* daemon started' 、'List of devices attached' 、adb版本警告等非设备行
+            parts = line.strip().split('\t')
+            if len(parts) == 2 and parts[1].strip() == 'device':
+                devices.append(parts[0].strip())
+        return devices
 
 
 if __name__ == '__main__':
