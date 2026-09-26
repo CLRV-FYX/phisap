@@ -9,7 +9,7 @@
 + Hold: 头部同Tap, 之后每帧都需要有触点在范围内(允许断开50ms), 最后220ms自动判定
 
 用法:
-    python tools/judge_sim.py <谱面.json> [algo1|algo2|algo3 ...] [--fps 60] [--width 151]
+    python tools/judge_sim.py <谱面.json> [algo1|algo2|algo3|algo3f ...] [--fps 60] [--width 151]
 """
 
 from __future__ import annotations
@@ -284,6 +284,7 @@ def main():
     import algo.algo1
     import algo.algo2
     import algo.algo3
+    import algo.algo3f
 
     args = sys.argv[1:]
     fps, width = 60.0, None
@@ -291,13 +292,14 @@ def main():
         i = args.index('--fps'); fps = float(args[i + 1]); del args[i:i + 2]
     if '--width' in args:
         i = args.index('--width'); width = float(args[i + 1]); del args[i:i + 2]
-    path, algos = args[0], args[1:] or ['algo1', 'algo2', 'algo3']
+    path, algos = args[0], args[1:] or ['algo1', 'algo2', 'algo3', 'algo3f']
     with open(path, encoding='utf-8-sig') as f:
         d = json.load(f)
     if detect_kind(d) == 'rpe':
         d, _ = rpe_to_official_v3(d)
     chart = Chart.from_dict(d)
-    solvers = {'algo1': algo.algo1.solve, 'algo2': algo.algo2.solve, 'algo3': algo.algo3.solve}
+    solvers = {'algo1': algo.algo1.solve, 'algo2': algo.algo2.solve, 'algo3': algo.algo3.solve,
+               'algo3f': algo.algo3f.solve}
     for name in algos:
         ans = solvers[name](chart, Console(file=io.StringIO()), 16)
         print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width))}')

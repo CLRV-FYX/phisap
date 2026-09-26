@@ -191,6 +191,49 @@ def thin_path(points, start: tuple[float, float] | None = None, min_step: float 
     return keep
 
 
+# 扫屏触点(algo3/algo3f)使用的指针id下限, 普通触点的id都小于它
+SWEEP_POINTER_BASE_MIN = 2000
+
+
+def first_note_ms(chart) -> int | None:
+    """谱面第一个音符的判定时间(ms)"""
+    times = [round(line.seconds(n.time) * 1000) for line in chart.judge_lines for n in line.notes]
+    return min(times) if times else None
+
+
+def manual_start_plan(plan: list, first_note: int | None, sweep_pointer_base: int = SWEEP_POINTER_BASE_MIN) -> list:
+    """手动开始模式下的事件序列: 以"第一个音符"和"第一个非扫屏触点的事件"中较早者作为按下按钮的时刻。
+
+    algo1/algo2没有扫屏触点, 对齐点就是第一个事件(与之前的行为相同);
+    algo3/algo3f的扫屏触点在第一个音符之前就会按下, 这些事件在按下按钮时立即发送,
+    其中的MOVE只保留每个触点最后的位置(避免一次性发送几百个过时的MOVE)。
+    plan: [(时间ms, [事件, ...]), ...], 按时间排序; 事件需有 action / pointer 属性
+    """
+    if not plan:
+        return plan
+    first_normal = next((ts for ts, evs in plan if any(e.pointer < sweep_pointer_base for e in evs)), None)
+    candidates = [t for t in (first_normal, first_note) if t is not None]
+    align = min(candidates) if candidates else plan[0][0]
+    head, rest = [], []
+    last_move: dict = {}
+    for ts, evs in plan:
+        if ts >= align:
+            rest.append((ts, evs))
+            continue
+        for e in evs:
+            if e.action == TouchAction.MOVE:
+                last_move[e.pointer] = e
+            else:
+                last_move.pop(e.pointer, None)
+                head.append(e)
+    head.extend(last_move.values())
+    if not head:
+        return rest
+    if rest and rest[0][0] == align:
+        return [(align, head + rest[0][1])] + rest[1:]
+    return [(align, head)] + rest
+
+
 def export_to_json(ans: dict[int, list[VirtualTouchEvent]], out_file: IO):
     json.dump(
         {timestamp: [event.to_serializable() for event in events] for timestamp, events in ans.items()},
@@ -206,5 +249,5 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
-           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'thin_path', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
+           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'thin_path', 'first_note_ms', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
            'clamp_to_screen']

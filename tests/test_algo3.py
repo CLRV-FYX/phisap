@@ -1,4 +1,4 @@
-"""algo3(扫屏)测试, 以及用判定模拟器(tools/judge_sim.py, 照搬Phira的判定逻辑)检查规划结果。"""
+"""algo3/algo3f(扫屏)测试, 以及用判定模拟器(tools/judge_sim.py, 照搬Phira的判定逻辑)检查规划结果。"""
 import io
 import os
 import random
@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import algo.algo1  # noqa: E402
 import algo.algo2  # noqa: E402
 import algo.algo3  # noqa: E402
-from algo.algo_base import TouchAction, thin_path  # noqa: E402
+import algo.algo3f  # noqa: E402
+from algo.algo_base import TouchAction, VirtualTouchEvent, manual_start_plan, thin_path  # noqa: E402
 from judge_sim import simulate  # noqa: E402
 from tests.test_algo import TAIL, Timeline, chart_of, line_dict, note, rotating_line  # noqa: E402
 
@@ -136,6 +137,107 @@ class TestSweeper(unittest.TestCase):
                             self.assertTrue(0 <= x <= 1280 and 0 <= y <= 720)
 
 
+class TestAxisSweeper(unittest.TestCase):
+    """algo3f: 横竖各1个触点, 像坐标轴一样分别左右/上下扫, 全程不抬起"""
+
+    def sweeps(self, ans):
+        out = {}
+        for ms in sorted(ans):
+            for e in ans[ms]:
+                if e.pointer >= 2000:
+                    out.setdefault(e.pointer, []).append((ms, e.action, e.pos))
+        return out
+
+    def test_layout_like_axes(self):
+        chart = drag_flick_chart()
+        sw = self.sweeps(algo.algo3f.solve(chart, quiet(), 16))
+        self.assertEqual(len(sw), 2)
+        (h, hs), (v, vs) = sorted(sw.items())
+        # 横轴: y固定在屏幕高度正中, x扫过整个宽度
+        self.assertEqual({p[1] for _, _, p in hs}, {360.0})
+        xs = [p[0] for _, _, p in hs]
+        self.assertLess(min(xs), 40)
+        self.assertGreater(max(xs), 1240)
+        # 纵轴: x固定在屏幕宽度正中, y扫过整个高度
+        self.assertEqual({p[0] for _, _, p in vs}, {640.0})
+        ys = [p[1] for _, _, p in vs]
+        self.assertLess(min(ys), 40)
+        self.assertGreater(max(ys), 680)
+
+    def test_whole_song_single_press(self):
+        chart = drag_flick_chart()
+        line_times = [chart.judge_lines[i].seconds(n.time) * 1000 for i in range(3) for n in chart.judge_lines[i].notes]
+        for pid, evs in self.sweeps(algo.algo3f.solve(chart, quiet(), 16)).items():
+            with self.subTest(pointer=pid):
+                acts = [a for _, a, _ in evs]
+                self.assertEqual(acts.count(TouchAction.DOWN), 1)
+                self.assertEqual(acts.count(TouchAction.UP), 1)
+                self.assertLess(evs[0][0], min(line_times) - 300)
+                self.assertGreater(evs[-1][0], max(line_times))
+                # 中间没有长时间停顿
+                gaps = [b[0] - a[0] for a, b in zip(evs[1:], evs[2:-1])]
+                self.assertLessEqual(max(gaps), 6)
+
+    def test_judges_drag_and_flick(self):
+        chart = drag_flick_chart()
+        for mp in (16, 10):
+            ans = algo.algo3f.solve(chart, quiet(), mp)
+            tl = Timeline(ans)
+            self.assertEqual(tl.errors, [])
+            self.assertLessEqual(tl.max_active, mp)
+            for fps in (60, 120):
+                for seed in range(3):
+                    with self.subTest(max_pointers=mp, fps=fps, seed=seed):
+                        self.assertEqual(non_perfect(simulate(chart, ans, fps=fps, seed=seed)), {})
+
+    def test_does_not_steal_taps(self):
+        rng = random.Random(3)
+        taps = [note(t, rng.uniform(-7, 7), 1) for t in range(0, 200, 3)]
+        drags = [note(t, rng.uniform(-6, 6), 2) for t in range(20, 180, 5)]
+        chart = chart_of(line_dict(taps), line_dict(drags))
+        ans = algo.algo3f.solve(chart, quiet(), 16)
+        for seed in range(3):
+            with self.subTest(seed=seed):
+                st = simulate(chart, ans, seed=seed)
+                self.assertEqual(non_perfect(st), {})
+                self.assertEqual([n for n in st['notes'] if n.kind in ('tap', 'hold') and n.by and n.by[0] >= 2000], [])
+
+
+class TestManualStart(unittest.TestCase):
+    """手动开始: 按下按钮的时刻应对齐第一个音符, 而不是扫屏触点的第一个事件"""
+
+    @staticmethod
+    def ev(action, pid, x=0.0):
+        return VirtualTouchEvent((x, 0.0), action, pid)
+
+    def test_plain_plan_unchanged(self):
+        plan = [(970, [self.ev(TouchAction.DOWN, 1000)]), (1000, [self.ev(TouchAction.DOWN, 1001)]),
+                (1001, [self.ev(TouchAction.UP, 1001)])]
+        self.assertEqual(manual_start_plan(plan, 1000), plan)  # flick提前30ms开始: 仍以第一个事件对齐
+
+    def test_sweeper_events_before_first_note(self):
+        plan = [(0, [self.ev(TouchAction.DOWN, 2100, 1)])]
+        plan += [(t, [self.ev(TouchAction.MOVE, 2100, t)]) for t in range(40, 1000, 6)]
+        plan += [(1000, [self.ev(TouchAction.DOWN, 1000)]), (1002, [self.ev(TouchAction.MOVE, 2100, 5)])]
+        out = manual_start_plan(plan, 1000)
+        self.assertEqual(out[0][0], 1000)
+        first = out[0][1]
+        self.assertEqual([(e.action, e.pointer) for e in first],
+                         [(TouchAction.DOWN, 2100), (TouchAction.MOVE, 2100), (TouchAction.DOWN, 1000)])
+        self.assertEqual(first[1].pos[0], 994)  # 只保留最后的位置
+        self.assertEqual(out[1:], plan[-1:])
+
+    def test_first_note_is_drag(self):
+        # algo3: 第一个音符是drag(没有普通触点事件), 以音符时间对齐
+        chart = chart_of(line_dict([note(64, 0.0, 2), note(96, 0.0, 1)]))
+        ans = algo.algo3.solve(chart, quiet(), 16)
+        plan = manual_start_plan([(ms, ans[ms]) for ms in sorted(ans)], 1000)
+        self.assertEqual(plan[0][0], 1000)
+        self.assertLess(min(ans), 1000)
+        downs = [e.pointer for e in plan[0][1] if e.action == TouchAction.DOWN]
+        self.assertEqual(len(downs), 4)
+
+
 class TestThinPath(unittest.TestCase):
     def test_static_hold_sends_only_last(self):
         self.assertEqual(thin_path([(100.0, 200.0)] * 500), [499])
@@ -176,7 +278,8 @@ class TestJudgeSim(unittest.TestCase):
         chart = chart_of(rotating_line([note(t, x, k) for t, x, k in
                                         ((70, -3.0, 1), (90, 2.0, 2), (110, 4.0, 4), (130, -2.0, 1),
                                          (150, 1.0, 2), (170, -4.0, 4))] + [note(80, 3.0, 3, 96.0)]))
-        for name, solve in (('algo1', algo.algo1.solve), ('algo2', algo.algo2.solve), ('algo3', algo.algo3.solve)):
+        for name, solve in (('algo1', algo.algo1.solve), ('algo2', algo.algo2.solve), ('algo3', algo.algo3.solve),
+                            ('algo3f', algo.algo3f.solve)):
             with self.subTest(algo=name):
                 self.assertEqual(non_perfect(simulate(chart, solve(chart, quiet(), 16), seed=3)), {})
 

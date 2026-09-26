@@ -14,9 +14,14 @@ from threading import Thread
 from chart import Chart
 from control import DeviceController, max_touch_points
 from rpe import detect_kind, rpe_to_official_v3
-from algo.algo_base import load_from_json, export_to_json, PLAN_CACHE_SUFFIX
+from algo.algo_base import load_from_json, export_to_json, PLAN_CACHE_SUFFIX, first_note_ms, manual_start_plan
 
 from rich.console import Console
+
+
+# 规划算法(下拉列表中的顺序)
+# algo3: 扫屏(4行, 只在drag/flick附近扫); algo3f: 坐标轴扫屏(横竖各1个, 全程扫)
+ALGORITHMS = ('algo3', 'algo3f', 'algo1', 'algo2')
 
 
 def agreement():
@@ -415,7 +420,7 @@ class App(ttk.Frame):
     def refresh_algos(self):
         """根据当前曲目/难度刷新算法列表；当前算法无效时自动选择默认算法（有规划缓存时默认使用缓存）"""
         songid, diff = self.song_id.get(), self.difficulty.get()
-        algos = ['algo3', 'algo1', 'algo2']  # algo3: 扫屏(推荐)
+        algos = list(ALGORITHMS)
         if songid and diff and has_ans_cache(songid, diff):
             algos.insert(0, self.ALGO_CACHED)
         self.algo_select['values'] = algos
@@ -462,22 +467,11 @@ class App(ttk.Frame):
             if algo_method == self.ALGO_CACHED:
                 with open(ans_file, encoding='utf-8') as f:
                     ans = load_from_json(f)
-            elif algo_method == 'algo1':
-                import algo.algo1
+            elif algo_method in ALGORITHMS:
+                import importlib
 
-                ans = algo.algo1.solve(chart, self.console, max_touch_points())
-                with open(ans_file, 'w', encoding='utf-8') as f:
-                    export_to_json(ans, f)
-            elif algo_method == 'algo2':
-                import algo.algo2
-
-                ans = algo.algo2.solve(chart, self.console, max_touch_points())
-                with open(ans_file, 'w', encoding='utf-8') as f:
-                    export_to_json(ans, f)
-            elif algo_method == 'algo3':
-                import algo.algo3
-
-                ans = algo.algo3.solve(chart, self.console, max_touch_points())
+                solver = importlib.import_module(f'algo.{algo_method}')
+                ans = solver.solve(chart, self.console, max_touch_points())
                 with open(ans_file, 'w', encoding='utf-8') as f:
                     export_to_json(ans, f)
             else:
@@ -628,7 +622,9 @@ class App(ttk.Frame):
                     self.delay_input.unbind('<<Increment>>')
                     self.delay_input.unbind('<<Decrement>>')
 
-                self.player_worker_thread = Thread(target=player_worker, args=(ans_iter,), daemon=True)
+                # 手动开始: 按下按钮的时刻对齐第一个音符(扫屏触点会在第一个音符之前就按下, 不能以第一个事件对齐)
+                manual_ans = manual_start_plan(adapted_ans, first_note_ms(chart))
+                self.player_worker_thread = Thread(target=player_worker, args=(iter(manual_ans),), daemon=True)
 
                 def go_now():
                     def stop():
