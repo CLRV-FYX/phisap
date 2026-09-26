@@ -15,8 +15,9 @@
 验证方式：
 
 ```bash
-python3 -m unittest tests.test_chart      # v1/v2/v3 解析单元测试
+python3 -m unittest tests.test_chart tests.test_catalog tests.test_rpe_import   # 解析与转换单元测试
 python3 tools/verify_v3.py                # v3官谱 vs RPE转换谱交叉验证(默认读取上面两个样例)
+python3 tools/verify_rpe_import.py        # RPE导入转换往返验证: RPE→v3 与官谱原谱逐点等价
 ```
 
 ## 已逆向出的 v3 格式要点（相对 v2）

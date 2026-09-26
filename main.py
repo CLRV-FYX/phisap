@@ -2,131 +2,20 @@ import configparser
 import json
 import os
 import re
-import zipfile
-from tkinter import ttk, messagebox, Tk, X, IntVar, StringVar, DoubleVar, filedialog, Toplevel
+import shutil
+import subprocess
+import sys
+from tkinter import ttk, messagebox, Tk, X, IntVar, StringVar, DoubleVar, filedialog, simpledialog
 from typing import Iterator
 from algo.algo_base import TouchEvent
 from threading import Thread
 
-from catalog import load_catalog
 from chart import Chart
 from control import DeviceController
-from extract import AssetsManager, TextAsset
+from rpe import detect_kind, rpe_to_official_v3
 from algo.algo_base import load_from_json, export_to_json
 
 from rich.console import Console
-from rich.progress import track
-
-
-def _extract_with_legacy(apk_file: zipfile.ZipFile, catalog, console: Console, popup):
-    """旧版解析器：适用于3.14及以前的安装包（自定义UnityFS解析）"""
-    manager = AssetsManager()
-    for file in track(apk_file.namelist(), description='正在加载文件...', console=console):
-        if not file.startswith('assets/aa/Android'):
-            continue
-        with apk_file.open(file) as f:
-            manager.load_file(f)
-    popup.title('已加载')
-    popup.update()
-    manager.read_assets(console)
-
-    popup.title('正在解包，请稍候...')
-    popup.update()
-    for file in track(manager.asset_files, description='正在写入文件...', console=console):
-        assert file.parent
-        filepath = file.parent.reader.path
-        if filepath.name not in catalog.fname_map:
-            continue
-        asset_name = catalog.fname_map[filepath.name]
-        if not asset_name.startswith('Assets/'):
-            continue
-        basedir = os.path.dirname(asset_name)
-        if basedir and not os.path.exists(basedir):
-            os.makedirs(basedir)
-
-        for obj in file.objects:
-            if isinstance(obj, TextAsset):
-                with open(normalize_chart_name(asset_name), 'w') as out:
-                    out.write(obj.text)
-
-
-def _extract_with_unitypy(apk_file: zipfile.ZipFile, catalog, console: Console, popup):
-    """UnityPy解析器：适用于3.20.0起的新版安装包（Unity 2022资源包）"""
-    try:
-        import UnityPy
-    except ImportError as e:
-        raise e
-    console.print('正在用UnityPy加载资源（3.20.0+新版安装包）...')
-    envs = {}
-    for name in track(apk_file.namelist(), description='正在加载文件...', console=console):
-        if not name.startswith('assets/aa/Android'):
-            continue
-        try:
-            envs[name] = UnityPy.load(apk_file.read(name))
-        except Exception as e:
-            console.print(f'警告: 加载{name}失败({e.__class__.__name__})，已跳过')
-    popup.title('正在解包，请稍候...')
-    popup.update()
-    for name, env in track(envs.items(), description='正在写入文件...', console=console):
-        bundle_name = os.path.basename(name)
-        if bundle_name not in catalog.fname_map:
-            continue
-        asset_name = catalog.fname_map[bundle_name]
-        if not asset_name.startswith('Assets/'):
-            continue
-        basedir = os.path.dirname(asset_name)
-        if basedir and not os.path.exists(basedir):
-            os.makedirs(basedir)
-        for obj in env.objects:
-            if obj.type.name != 'TextAsset':
-                continue
-            with open(normalize_chart_name(asset_name), 'w') as out:
-                script = obj.read().m_Script
-                out.write(script.decode('utf-8') if isinstance(script, (bytes, bytearray)) else script)
-
-
-def extract_apk(console: Console):
-    apk_path = filedialog.askopenfilename(filetypes=[('安装包', '.apk'), ('通用数据包', '.obb')], title='请选择要解包的游戏安装包或通用数据包')
-    if not apk_path:
-        return
-    popup = Toplevel()
-    popup.title('正在解包，请稍候...')
-    popup.minsize(300, 60)
-    popup.resizable(False, False)
-    popup.pack_slaves()
-    popup.update()
-
-    console.print('正在读取...')
-    apk_file = zipfile.ZipFile(apk_path)
-    console.print('正在解析catalog.json...')
-    catalog = None
-
-    try:
-        with apk_file.open('assets/aa/catalog.json') as f:
-            catalog = load_catalog(json.load(f))
-    except KeyError:
-        messagebox.showerror('解包失败',
-                             '未在包内找到catalog.json\n'
-                             '这可能是由于安装包损坏，或者你的安装包是Google Play版本的\n'
-                             '如果是后者，请提取对应的obb文件，并解包该文件\n'
-                             '详见phisap的README说明')
-
-    if not catalog:
-        popup.destroy()
-        return
-
-    try:
-        _extract_with_legacy(apk_file, catalog, console, popup)
-    except Exception as e:
-        # 3.20.0起（Unity 2022）的安装包旧解析器无法处理，回退到UnityPy
-        console.print(f'旧解析器失败({e.__class__.__name__}: {e})，改用UnityPy重试...')
-        try:
-            _extract_with_unitypy(apk_file, catalog, console, popup)
-        except ImportError as e2:
-            messagebox.showerror('解包失败',
-                                 f'新版安装包(3.20.0+)需要UnityPy才能解析：\n{e2}\n'
-                                 '请先运行 pip install -r requirements.txt 安装依赖后重试')
-    popup.destroy()
 
 
 def agreement():
@@ -136,24 +25,34 @@ def agreement():
         exit(1)
 
 
-# 3.20.0+的官谱文件名带" #<id>"后缀(如Chart_AT #4159.json)，统一规范化为Chart_AT.json
-_CHART_DIFF_RE = re.compile(r'^Chart_(.+?)(?:\s+#.*)?\.json$')
-_CHART_SUFFIX_RE = re.compile(r'^(Chart_.+?)(?:\s+#.+)\.json$')
+# 从谱面文件名识别难度。兼容: Chart_AT.json / Chart_AT #4159.json / chart_at_4159.json /
+# Chart_DT_4874a.json 等常见命名。取"chart"之后的第一个字母串，与已知难度表比对。
+_KNOWN_DIFFICULTIES = ('SPB', 'INB', 'HDB', 'ATB', 'SP', 'IN', 'HD', 'AT', 'DT')
+_CHART_TOKEN_RE = re.compile(r'chart[_\s\-#]?([a-z]+)', re.IGNORECASE)
 
 
 def chart_difficulty(filename: str) -> str | None:
-    """从谱面文件名中提取难度(兼容带" #<id>"后缀的新版命名)，无法识别时返回None"""
-    m = _CHART_DIFF_RE.match(os.path.basename(filename))
-    return m.group(1) if m else None
+    """从谱面文件名中提取难度，无法识别时返回None"""
+    base = os.path.basename(filename)
+    if base.lower() == 'chart.json':
+        # 游戏旧版本中Chart.json即SP谱
+        return 'SP'
+    m = _CHART_TOKEN_RE.search(base)
+    if not m:
+        return None
+    token = m.group(1).upper()
+    for d in _KNOWN_DIFFICULTIES:
+        if token == d:
+            return d
+    # 容错: 难度字母后紧跟其他内容(如ATX)时取难度前缀
+    for d in _KNOWN_DIFFICULTIES:
+        if token.startswith(d) and len(token) <= len(d) + 2:
+            return d
+    return None
 
 
-def normalize_chart_name(asset_name: str) -> str:
-    """把Chart_XX #<id>.json规范化为Chart_XX.json，其余名称原样返回"""
-    base = os.path.basename(asset_name)
-    m = _CHART_SUFFIX_RE.match(base)
-    if m:
-        return os.path.join(os.path.dirname(asset_name), m.group(1) + '.json')
-    return asset_name
+def guess_difficulty(filename: str) -> str | None:
+    return chart_difficulty(filename)
 
 
 def list_difficulties(songid: str) -> list[str]:
@@ -191,6 +90,90 @@ def has_ans_cache(songid: str, difficulty: str) -> bool:
         return False
 
 
+def open_tracks_dir():
+    """在文件管理器中打开谱面库目录(便于直接拖放谱面文件)"""
+    tracks = './Assets/Tracks'
+    os.makedirs(tracks, exist_ok=True)
+    if sys.platform.startswith('win'):
+        os.startfile(tracks)  # type: ignore[attr-defined]
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', tracks])
+    else:
+        subprocess.Popen(['xdg-open', tracks])
+
+
+def import_charts(app: 'App') -> None:
+    """导入谱面文件：支持各版本官谱(v1/v2/v3, 原样保存)与RPE谱面(转换为v3格式保存)"""
+    paths = filedialog.askopenfilenames(
+        title='选择要导入的谱面文件（可多选：各版本官谱或RPE谱面）',
+        filetypes=[('谱面文件', '*.json'), ('所有文件', '*.*')])
+    if not paths:
+        return
+    results: list[str] = []
+    last_songid = app.song_id.get()
+    top = app.winfo_toplevel()
+
+    for path in paths:
+        name = os.path.basename(path)
+        try:
+            with open(path, 'r', encoding='utf-8', newline='') as f:
+                data = json.load(f)
+        except Exception as e:
+            results.append(f'✗ {name}: 读取失败({e.__class__.__name__}: {e})')
+            continue
+        kind = detect_kind(data)
+        if kind == 'unknown':
+            results.append(f'✗ {name}: 无法识别的格式(仅支持官谱v1/v2/v3与RPE谱面)')
+            continue
+
+        diff = guess_difficulty(name)
+        if not diff:
+            diff = simpledialog.askstring(
+                '难度', f'无法从文件名 {name} 识别难度。\n请输入难度(如 SP/IN/HD/AT/DT):', parent=top)
+            if not diff:
+                results.append(f'✗ {name}: 已取消(未输入难度)')
+                continue
+            diff = diff.strip().upper()
+
+        kind_desc = f'官谱v{data["formatVersion"]}' if kind == 'official' else 'RPE谱面'
+        songid = simpledialog.askstring(
+            '曲目ID',
+            f'{name} ({kind_desc}, 难度{diff})\n它属于哪个曲目？\n请输入曲目ID(将作为谱面目录名):',
+            initialvalue=last_songid, parent=top)
+        if not songid or not songid.strip():
+            results.append(f'✗ {name}: 已取消(未输入曲目ID)')
+            continue
+        songid = songid.strip()
+        last_songid = songid
+
+        warns: list[str] = []
+        try:
+            target_dir = os.path.join('./Assets/Tracks', songid)
+            os.makedirs(target_dir, exist_ok=True)
+            target = os.path.join(target_dir, f'Chart_{diff}.json')
+            if os.path.exists(target) and not messagebox.askyesno(
+                    '覆盖', f'已存在:\n{target}\n确定覆盖？', parent=top):
+                results.append(f'✗ {name}: 已取消(目标文件已存在)')
+                continue
+            if kind == 'rpe':
+                out, warns = rpe_to_official_v3(data)
+                with open(target, 'w', encoding='utf-8') as f:
+                    json.dump(out, f, ensure_ascii=False)
+                note = 'RPE已转换为v3格式'
+            else:
+                shutil.copyfile(path, target)
+                note = f'官谱v{data["formatVersion"]}原样保存'
+            results.append(f'✓ {name} → {target} ({note})')
+        except Exception as e:
+            results.append(f'✗ {name}: 写入失败({e.__class__.__name__}: {e})')
+            continue
+        for w in warns:
+            results.append(f'    [warn] {w}')
+
+    app.refresh_songs()
+    messagebox.showinfo('导入完成', '\n'.join(results), parent=top)
+
+
 # 屏幕尺寸预设：常见手机分辨率（横屏/竖屏），用户也可以手动输入任意"宽×高"
 SCREEN_PRESETS = [
     '自动',
@@ -222,113 +205,83 @@ class App(ttk.Frame):
         self.running = True
         self.start_time = 0.0
         self.cache = None
-        self.pack()
+        self.pack(fill=X, expand=1)
 
-        frm = ttk.Frame()
-        frm.pack()
-        self.extract_btn = ttk.Button(frm, text='提取谱面', command=lambda: extract_apk(self.console))
-        self.extract_btn.pack()
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill=X)
+        frm.columnconfigure(0, weight=1)
 
-        ttk.Separator(orient='horizontal').pack(fill=X)
+        # ---- 工具栏 ----
+        tb = ttk.Frame(frm)
+        tb.grid(row=0, column=0, sticky=X, pady=(0, 6))
+        ttk.Button(tb, text='导入谱面', command=lambda: import_charts(self)).pack(side='left', padx=(0, 6))
+        ttk.Button(tb, text='打开谱面目录', command=open_tracks_dir).pack(side='left')
 
-        frm = ttk.Frame()
-        frm.pack()
+        def section(row: int, title: str) -> ttk.Frame:
+            lf = ttk.LabelFrame(frm, text=title, padding=8)
+            lf.grid(row=row, column=0, sticky=X, pady=4)
+            lf.columnconfigure(1, weight=1)
+            return lf
 
-        ttk.Label(frm, text='设备Serial: ').grid(column=0, row=0)
-        self.serial = StringVar()
-        self.serial_select = ttk.Combobox(frm, state='readonly', values=[], textvariable=self.serial)
-        self.serial_select.grid(column=1, row=0)
-        self.serial_select.bind('<<ComboboxSelected>>', self.adb_serial_selected)
-        self.serial_refresh_btn = ttk.Button(frm, text='刷新', command=self.detect_adb_devices)
-        self.serial_refresh_btn.grid(column=2, row=0)
-
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        frm = ttk.Frame()
-        frm.pack()
-
-        ttk.Label(frm, text='屏幕尺寸: ').grid(column=0, row=0)
-        self.screen_size = StringVar()
-        self.screen_size.set('自动')
-        self.screen_select = ttk.Combobox(frm, values=SCREEN_PRESETS, textvariable=self.screen_size, width=16)
-        self.screen_select.grid(column=1, row=0)
-        ttk.Label(frm, text='（自动=设备实际尺寸；也可手动输入 宽×高，如 1920×1080）').grid(column=2, row=0)
-
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        self.sync_mode = IntVar()
-        self.sync_mode.set(self.SYNC_MODE_MANUAL)
-
-        frm = ttk.Frame()
-        frm.pack()
-
-        ttk.Label(frm, text='计时器同步方式：').grid(column=0, row=0)
-
-        self.sync_mode1 = ttk.Radiobutton(
-            frm, text='延时同步', variable=self.sync_mode, value=self.SYNC_MODE_DELAY, command=self.sync_mode_changed
-        )
-        self.sync_mode2 = ttk.Radiobutton(
-            frm, text='手动同步', variable=self.sync_mode, value=self.SYNC_MODE_MANUAL, command=self.sync_mode_changed
-        )
-        self.sync_mode1.grid(column=2, row=0)
-        self.sync_mode2.grid(column=1, row=0)
-
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        frm = ttk.Frame()
-        frm.pack()
-
-        ttk.Label(frm, text='曲目ID：').grid(column=0, row=0)
-
+        # ---- 曲目 ----
+        sec = section(1, '曲目')
+        ttk.Label(sec, text='曲目ID：').grid(column=0, row=0, sticky=W)
         self.song_id = StringVar()
-        self.songs_select = ttk.Combobox(frm, state='readonly', values=[], textvariable=self.song_id)
-        self.songs_select.grid(column=1, row=0)
+        self.songs_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.song_id)
+        self.songs_select.grid(column=1, row=0, sticky=X, padx=4)
         self.songs_select.bind('<<ComboboxSelected>>', self.song_selected)
-
-        ttk.Label(frm, text='难度：').grid(column=0, row=1)
-
+        ttk.Label(sec, text='难度：').grid(column=0, row=1, sticky=W)
         self.difficulty = StringVar()
-        self.difficulties_select = ttk.Combobox(frm, state='readonly', values=[], textvariable=self.difficulty)
-        self.difficulties_select.grid(column=1, row=1)
+        self.difficulties_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.difficulty)
+        self.difficulties_select.grid(column=1, row=1, sticky=X, padx=4)
         self.difficulties_select.bind('<<ComboboxSelected>>', self.difficulty_selected)
 
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        frm = ttk.Frame()
-        frm.pack()
-
-        ttk.Label(frm, text='规划算法：').grid(column=0, row=0)
-
+        # ---- 规划 ----
+        sec = section(2, '规划')
+        ttk.Label(sec, text='规划算法：').grid(column=0, row=0, sticky=W)
         self.algo = StringVar()
-        self.algo_select = ttk.Combobox(frm, state='readonly', values=[], textvariable=self.algo)
-        self.algo_select.grid(column=1, row=0)
+        self.algo_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.algo)
+        self.algo_select.grid(column=1, row=0, sticky=X, padx=4)
 
-        ttk.Separator(orient='horizontal').pack(fill=X)
+        # ---- 设备与屏幕 ----
+        sec = section(3, '设备与屏幕')
+        ttk.Label(sec, text='设备Serial: ').grid(column=0, row=0, sticky=W)
+        self.serial = StringVar()
+        self.serial_select = ttk.Combobox(sec, state='readonly', values=[], textvariable=self.serial)
+        self.serial_select.grid(column=1, row=0, sticky=X, padx=4)
+        self.serial_select.bind('<<ComboboxSelected>>', self.adb_serial_selected)
+        ttk.Button(sec, text='刷新', command=self.detect_adb_devices).grid(column=2, row=0, padx=(0, 10))
+        ttk.Label(sec, text='屏幕尺寸: ').grid(column=0, row=1, sticky=W)
+        self.screen_size = StringVar()
+        self.screen_size.set('自动')
+        self.screen_select = ttk.Combobox(sec, values=SCREEN_PRESETS, textvariable=self.screen_size, width=16)
+        self.screen_select.grid(column=1, row=1, sticky=W, padx=4)
+        ttk.Label(sec, text='（自动=设备实际尺寸；可手动输入 宽×高，如 1920×1080）').grid(column=2, row=1, sticky=W)
 
-        ttk.Label()
-
-        frm = ttk.Frame()
-        frm.pack()
-
-        self.delay_lbl = ttk.Label(frm, text='延时时长：')
-        self.delay_lbl.grid(column=0, row=0)
-
+        # ---- 计时器同步 ----
+        self.sync_mode = IntVar()
+        self.sync_mode.set(self.SYNC_MODE_MANUAL)
+        sec = section(4, '计时器同步')
+        self.sync_mode2 = ttk.Radiobutton(
+            sec, text='手动同步', variable=self.sync_mode, value=self.SYNC_MODE_MANUAL, command=self.sync_mode_changed)
+        self.sync_mode1 = ttk.Radiobutton(
+            sec, text='延时同步', variable=self.sync_mode, value=self.SYNC_MODE_DELAY, command=self.sync_mode_changed)
+        self.sync_mode2.grid(column=0, row=0, sticky=W)
+        self.sync_mode1.grid(column=1, row=0, sticky=W, padx=(16, 0))
+        self.delay_lbl = ttk.Label(sec, text='延时时长：')
+        self.delay_lbl.grid(column=0, row=1, sticky=W)
         self.delay = DoubleVar()
-        self.delay_input = ttk.Spinbox(frm, increment=0.01, textvariable=self.delay, from_=-100, to=100)
-        self.delay_input.grid(column=1, row=0)
+        self.delay_input = ttk.Spinbox(sec, increment=0.01, textvariable=self.delay, from_=-100, to=100)
+        self.delay_input.grid(column=1, row=1, sticky=W, padx=4)
         self.delay_input['state'] = 'disabled'
+        ttk.Label(sec, text='秒').grid(column=2, row=1, sticky=W)
 
-        ttk.Label(frm, text='秒').grid(column=2, row=0)
+        # ---- 开始按钮 ----
+        self.go = ttk.Button(frm, text='开始!', command=self.run)
+        self.go.grid(row=5, column=0, sticky=X, pady=8, ipady=4)
 
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        self.go = ttk.Button(text='开始!', command=self.run)
-        self.go.pack(anchor='center', expand=1)
-
-        ttk.Separator(orient='horizontal').pack(fill=X)
-
-        self.info_label = ttk.Label()
-        self.info_label.pack()
+        self.info_label = ttk.Label(frm, wraplength=560, justify='left')
+        self.info_label.grid(row=6, column=0, sticky=X)
 
         agreement()
 
@@ -340,23 +293,23 @@ class App(ttk.Frame):
             self.info_label['text'] = ''
             self.delay_input['state'] = 'disabled'
 
-    def load_songs(self):
+    def refresh_songs(self):
         try:
             self.songs_select['values'] = sorted(os.listdir('./Assets/Tracks'))
-            if not len(self.songs_select['values']):
-                raise RuntimeError('no chart files')
-        except Exception:
+        except FileNotFoundError:
+            self.songs_select['values'] = []
+
+    def load_songs(self):
+        self.refresh_songs()
+        if not len(self.songs_select['values']):
             messagebox.showinfo(
                 '谱面库为空',
-                'phisap需要依赖游戏的谱面文件才能工作，然而您当前的谱面库为空\n'
-                'phisap支持从游戏安装包中解包并读取谱面文件\n'
-                '接下来请您选择游戏的安装包(.apk)或通用数据包(.obb)\n'
-                '此外，每当游戏更新后，您都需要重新点击"提取谱面"按钮来更新谱面库',
+                'phisap需要依赖谱面文件才能工作，然而您当前的谱面库为空\n'
+                '请点击左上角"导入谱面"按钮，选择谱面文件导入\n'
+                '支持各版本官方谱面(v1/v2/v3, 如Chart_AT.json)与RPE谱面(JSON格式)\n'
+                '导入的谱面保存在 ./Assets/Tracks/<曲目ID>/ 下，也可以直接把json文件放到该目录',
             )
-            extract_apk(self.console)
-            self.load_songs()
-        finally:
-            return self
+        return self
 
     def load_cache(self, cache_path):
         self.cache_path = cache_path
@@ -592,7 +545,6 @@ class App(ttk.Frame):
                     self.go['text'] = pre_text
                     self.info_label['text'] = pre_info
                     self.delay_lbl['text'] = pre_delay_lbl
-
                     self.delay_input['textvariable'] = pre_delay_var
                     self.delay_input['state'] = 'disabled'
 

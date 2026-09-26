@@ -67,26 +67,15 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
         + 如果你非要用，请使用`3.11.0a5`及以后的版本，否则你可能会遇到一些问题，见issue#71
 1. 使用`pip install -r requirements.txt`安装依赖
 2. 请安装`Android Debug Bridge`，**要求版本号至少为`1.0.41`**，并确保相应的环境变量已经配置好。
-3. 请准备Phigros的游戏安装包/通用数据包。目前支持的游戏版本为2.0.0至3.20.0
-    + 3.20.0起官方谱面改用`formatVersion: 3`的新格式，phisap已支持解析
-        + 新格式的谱面文件名带有` #<id>`后缀（如`Chart_AT #4159.json`），提取时会自动规范化为`Chart_AT.json`，无需额外处理
-    + 3.20.0起的新版安装包（Unity 2022资源包、新版catalog.json格式）也已支持直接解包，无需手动转换
-        + 解析新版安装包需要`UnityPy`（已包含在`requirements.txt`中，会随依赖一起安装）
-    + 如果你的phigros是taptap版，那么只需要游戏安装包即可
-        + 如果你使用*nix系统(如Linux或Mac OS)，则你可以使用如下的`bash shell`命令从安卓设备上提取安装包
-            ```bash
-            adb pull $(adb shell pm path com.PigeonGames.Phigros | cut -f2 -d:) ./Phigros.apk
-            ```
-        + 如果你使用Windows操作系统，那么你可以在`powershell`中运行下面的命令
-            ```powershell
-            adb pull (adb shell pm path com.PigeonGames.Phigros).Split(":")[1] ./Phigros.apk
-            ```
-    + 如果你的phigros是Google Play版，那么**不要提取安装包，请提取数据包**(后缀为.obb)，因为谱面数据并不在安装包内
-        + 这个数据包一般在游戏设备的`/sdcard/Android/obb/com.PigeonGames.Phigros/`目录下
-        + 名称类似于`main.82.com.PigeonGames.Phigros.obb`
-        + 大小约为1.3GB
-        + 使用`adb pull`或者文件管理器直接复制出来即可
-    + 当然，如果你不想手动提取，也可以直接去网上下载一个phigros的安装包或数据包，注意版本对应即可
+3. 准备谱面文件（JSON）。**phisap当前为"谱面导入"模式：不解析游戏安装包，只需提供谱面json**
+    + 支持**各版本官方谱面**（`formatVersion` 1/2/3，覆盖Phigros 2.x至3.20.0+，如`Chart_SP.json`、`Chart_AT #4159.json`），原样保存
+        + 3.20.0起的新版官谱（`formatVersion: 3`）已支持解析；带` #<id>`后缀的文件名会自动识别难度
+    + 支持**RPE谱面**（RPE/PEConverter输出的JSON）
+        + 导入时自动转换为等价的v3结构（时间/x/旋转/透明度/速度/类型/按住时长均与官方原谱逐点验证过），之后与官谱走完全相同的解析/规划流程
+    + 导入方式（二选一）:
+        + 点击程序左上角"导入谱面"按钮，选择一个或多个json文件，按提示输入曲目ID（谱面将保存为`./Assets/Tracks/<曲目ID>/Chart_<难度>.json`）
+        + 直接把json文件放入`./Assets/Tracks/<曲目ID>/`目录（可点"打开谱面目录"按钮定位），文件名需含难度（如`Chart_AT.json`）
+    + 谱面json请使用你自己的渠道获取（如PEConverter等工具导出）。phisap本身不附带、不传播任何版权谱面数据
 4. 准备服务端。`scrcpy-server-v2.0` 已随本仓库提供（与`main.py`同目录），**无需单独下载**。
     + 请确认你使用的scrcpy-server版本为`v2.0`——phisap的协议实现与2.0对应，使用其他版本（包括v4.x）将无法连接
     + 如果该文件缺失（比如你从别处复制了不完整的目录），可以用下面的命令补全:
@@ -97,7 +86,7 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
         Windows用户直接双击`start.cmd`，它会在文件缺失时自动下载
 
 ### 运行
-**Windows**: 双击`start.cmd`（首次运行会自动安装依赖并下载`scrcpy-server-v2.0`）
+**Windows**: 双击`start.cmd`（首次运行会自动安装依赖）
 
 *nix/手动方式*:
 ```bash
@@ -108,8 +97,8 @@ python main.py
 **屏幕尺寸**: phisap会将Phigros的`1280×720`逻辑画布按16:9居中适配(contain)到实际屏幕，非16:9屏幕（如`2400×1080`）自动留边。屏幕尺寸默认自动检测，如果检测不准，可以在程序界面的"屏幕尺寸"一栏选择常见预设（如`1920×1080`），也可以直接手动输入`宽×高`（如`1290×2712`），设置会被记住
 
 ## 工作原理
-+ 读取并缓存游戏安装包中的所有谱面文件
-+ 解析谱面文件，分析出每个音符的击打位置、击打方式和击打时间
++ 读取谱面库（`./Assets/Tracks/<曲目ID>/`）中的谱面文件；RPE谱面在导入时已转换为v3格式
++ 解析谱面文件（官方v1/v2/v3），分析出每个音符的击打位置、击打方式和击打时间
 + 将这些击打操作转换为触控事件序列
     + 即按下(DOWN)、移动(MOVE)和抬起(UP)
 + 开始操作后，逐一向设备发送这些触控事件
@@ -132,7 +121,7 @@ PS: 如果你知道怎样实现不root的前提下精确获知当前曲目进度
 
 暂时没有找到什么可以自动化判断当前谱面的办法，如果你有好的想法，请开issue。或许图像识别是一个可行的方式
 
-不过目前phisap可以解包出全部的随机谱面（ID为`Random.SobremSilentroom.<n>`，`<n>`从0到6），所以理论上，如果你的手速够快，完全可以应对随机谱面
+不过，如果你把全部随机谱面（ID为`Random.SobremSilentroom.<n>`，`<n>`从0到6）的json导入phisap，那么理论上，如果你的手速够快，完全可以应对随机谱面
 
 ### 愚人节谱
 
@@ -191,7 +180,12 @@ phisap并没有对课题模式做特殊的支持，将来也许会有
 图标仅限phisap项目本身使用，其他任何人或团体不得以任何方式使用，原作者 @ShintoKosei 保留所有权利
 
 ## 更新日志
-### (2026/09/26)
+### (2026/09/26) 谱面导入版
++ 改为"谱面导入"模式：不再解析游戏安装包（APK/obb解包代码保留在仓库中但暂未启用）
+    + 新增"导入谱面"入口：支持各版本官方谱面(v1/v2/v3, 原样保存)与RPE谱面(导入时自动转换为等价的v3结构)
+    + RPE转换关系(时间/x/旋转/透明度/速度/类型/按住时长)已与官方原谱逐点交叉验证，转换后的谱面与官谱走完全相同的解析/规划链路
+    + 新增"打开谱面目录"按钮，可直接将json文件放入谱面库
+    + UI重新分组整理(曲目/规划/设备与屏幕/计时器同步)，操作流程与之前基本一致
 + 支持Phigros 3.20.0起的新版官方谱面格式(`formatVersion: 3`)
     + 新格式`speedEvents`移除了`floorPosition`字段，改由phisap从0开始按`1.875*value/bpm`的速率逐段累积推导（推导方式与v1相同）
     + 新格式判定线移动事件的y分量改为标准屏幕坐标（0在顶部），旧格式为0在底部，解析时按版本区分
