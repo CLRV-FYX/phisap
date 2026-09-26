@@ -7,7 +7,7 @@
 import unittest
 
 from chart import Chart
-from rpe import detect_kind, rpe_beat, rpe_to_official_v3
+from rpe import detect_kind, rpe_to_official_v3
 
 
 def _mk_rpe() -> dict:
@@ -79,7 +79,8 @@ class TestRpeImport(unittest.TestCase):
 
     def test_meta(self):
         self.assertEqual(self.converted['formatVersion'], 3)
-        self.assertEqual(self.chart.offset, 2.5)
+        # RPE的offset单位为毫秒(与Phira一致: offset / 1000)
+        self.assertAlmostEqual(self.chart.offset, 0.0025)
         self.assertEqual(len(self.chart.judge_lines), 1)
         self.assertAlmostEqual(self.chart.judge_lines[0].bpm, 100.0)
 
@@ -105,9 +106,11 @@ class TestRpeImport(unittest.TestCase):
 
     def test_speed_and_floor(self):
         line = self.chart.judge_lines[0]
-        self.assertEqual(len(line.speed_events), 2)
+        # 0..4拍, 4..8拍, 8拍之后(保持最后一个事件的值)
+        self.assertEqual(len(line.speed_events), 3)
         self.assertAlmostEqual(line.speed_events[0].value, 1.0)
         self.assertAlmostEqual(line.speed_events[1].value, 2.0)
+        self.assertAlmostEqual(line.speed_events[2].value, 2.0)
         # floor推导: 0..4拍按1.0累积, 4拍处=128*1.0*1.875/100=2.4
         self.assertAlmostEqual(line.floor(4 * 32), 2.4, places=6)
         # 96时刻(第3拍, 第一段内): 96*1.0*1.875/100=1.8

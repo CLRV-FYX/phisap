@@ -154,15 +154,51 @@ class TestChartParsing(unittest.TestCase):
         self.assertAlmostEqual(chart.judge_lines[0].pos(50.0)[0], 0.5 * 1280)
 
     def test_move_y_convention_v2_vs_v3(self):
-        # v1/v2: move事件y分量0在屏幕底部 → y = 720 - frac*720
-        # v3: 标准屏幕坐标，0在顶部 → y = frac*720
+        # 官谱formatVersion 1/3(含3.20.0+新官谱)的move事件y分量都以屏幕底部为0、向上为正
+        # → 屏幕y = 720 - frac*720 (与Phira pgr.rs、原版phisap、谱面格式文档一致)
         move = [{'startTime': 0.0, 'endTime': 1e9, 'start': 0.5, 'end': 0.5,
                  'start2': 0.25, 'end2': 0.25}]
         events = [{'startTime': 0.0, 'endTime': 1e9, 'value': 1.0}]
         c2 = Chart.from_dict(make_chart(2, [make_line(events, move=move)]))
         c3 = Chart.from_dict(make_chart(3, [make_line(events, move=move)]))
         self.assertAlmostEqual(c2.judge_lines[0].pos(0.0)[1], 720 - 0.25 * 720)
-        self.assertAlmostEqual(c3.judge_lines[0].pos(0.0)[1], 0.25 * 720)
+        self.assertAlmostEqual(c3.judge_lines[0].pos(0.0)[1], 720 - 0.25 * 720)
+
+    def test_rotated_line_note_position(self):
+        # 判定线在屏幕下方(y分数0.25)并逆时针旋转90度: x=+1的音符应在线中心的正上方72像素
+        move = [{'startTime': 0.0, 'endTime': 1e9, 'start': 0.5, 'end': 0.5,
+                 'start2': 0.25, 'end2': 0.25}]
+        rot = [{'startTime': 0.0, 'endTime': 1e9, 'start': 90.0, 'end': 90.0}]
+        events = [{'startTime': 0.0, 'endTime': 1e9, 'value': 1.0}]
+        notes = [make_note(1, 16, 1.0)]
+        c3 = Chart.from_dict(make_chart(3, [make_line(events, notes_above=notes, move=move, rotate=rot)]))
+        line = c3.judge_lines[0]
+        x, y = line.pos_of(line.notes[0])
+        self.assertAlmostEqual(x, 640.0, places=6)
+        self.assertAlmostEqual(y, 540.0 - 72.0, places=6)
+
+    def test_event_lookup_bisect_matches_linear(self):
+        # 二分查找与逐个查找的结果一致, 包括边界时刻(属于前一个事件)与零长度事件
+        rot = [
+            {'startTime': -999999.0, 'endTime': 0.0, 'start': 0.0, 'end': 0.0},
+            {'startTime': 0.0, 'endTime': 10.0, 'start': 0.0, 'end': 10.0},
+            {'startTime': 10.0, 'endTime': 10.0, 'start': 50.0, 'end': 60.0},
+            {'startTime': 10.0, 'endTime': 20.0, 'start': 30.0, 'end': 40.0},
+            {'startTime': 20.0, 'endTime': 1e9, 'start': 40.0, 'end': 40.0},
+        ]
+        events = [{'startTime': 0.0, 'endTime': 1e9, 'value': 1.0}]
+        line = Chart.from_dict(make_chart(3, [make_line(events, rotate=rot)])).judge_lines[0]
+        self.assertTrue(line._rotate_idx.ordered)
+        self.assertAlmostEqual(line.angle(5.0), 5.0)
+        self.assertAlmostEqual(line.angle(10.0), 10.0)   # 边界属于前一个事件
+        self.assertAlmostEqual(line.angle(10.5), 30.5)
+        self.assertAlmostEqual(line.angle(25.0), 40.0)
+        line._rotate_idx.ordered = False
+        for t in (-5.0, 0.0, 5.0, 10.0, 10.5, 20.0, 25.0):
+            linear = line.angle(t)
+            line._rotate_idx.ordered = True
+            self.assertAlmostEqual(line.angle(t), linear)
+            line._rotate_idx.ordered = False
 
     def test_v2_v3_equivalent_when_floor_present(self):
         # 同一份谱面数据，仅v3去掉floorPosition，两者解析结果应一致

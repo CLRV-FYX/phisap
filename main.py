@@ -12,9 +12,9 @@ from algo.algo_base import TouchEvent
 from threading import Thread
 
 from chart import Chart
-from control import DeviceController
+from control import DeviceController, max_touch_points
 from rpe import detect_kind, rpe_to_official_v3
-from algo.algo_base import load_from_json, export_to_json
+from algo.algo_base import load_from_json, export_to_json, PLAN_CACHE_SUFFIX
 
 from rich.console import Console
 
@@ -80,13 +80,13 @@ def find_chart_path(songid: str, difficulty: str) -> str:
 
 
 def has_ans_cache(songid: str, difficulty: str) -> bool:
-    """该难度是否已有规划缓存"""
+    """该难度是否已有(当前版本的)规划缓存; 旧版本的 .ans.json 缓存会被忽略"""
     tracks_dir = os.path.join('./Assets/Tracks', songid)
     direct = os.path.join(tracks_dir, f'Chart_{difficulty}.json')
-    if os.path.exists(direct + '.ans.json'):
+    if os.path.exists(direct + PLAN_CACHE_SUFFIX):
         return True
     try:
-        return os.path.exists(find_chart_path(songid, difficulty) + '.ans.json')
+        return os.path.exists(find_chart_path(songid, difficulty) + PLAN_CACHE_SUFFIX)
     except FileNotFoundError:
         return False
 
@@ -458,20 +458,20 @@ class App(ttk.Frame):
 
             algo_method = self.algo.get()
             ans: dict
-            ans_file = chart_path + '.ans.json'
+            ans_file = chart_path + PLAN_CACHE_SUFFIX
             if algo_method == self.ALGO_CACHED:
                 with open(ans_file, encoding='utf-8') as f:
                     ans = load_from_json(f)
             elif algo_method == 'algo1':
                 import algo.algo1
 
-                ans = algo.algo1.solve(chart, self.console)
+                ans = algo.algo1.solve(chart, self.console, max_touch_points())
                 with open(ans_file, 'w', encoding='utf-8') as f:
                     export_to_json(ans, f)
             elif algo_method == 'algo2':
                 import algo.algo2
 
-                ans = algo.algo2.solve(chart, self.console)
+                ans = algo.algo2.solve(chart, self.console, max_touch_points())
                 with open(ans_file, 'w', encoding='utf-8') as f:
                     export_to_json(ans, f)
             else:

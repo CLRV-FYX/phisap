@@ -7,7 +7,8 @@ from collections import defaultdict
 
 from chart import Chart
 from note import NoteType
-from .algo_base import TouchAction, VirtualTouchEvent, recalc_pos, in_screen
+from .algo_base import (TouchAction, VirtualTouchEvent, recalc_pos, MAX_POINTERS, note_point,
+                        flick_path, flick_time_shift)
 
 
 from rich.console import Console
@@ -19,6 +20,8 @@ class PlainNote(NamedTuple):
     timestamp: int
     pos: tuple[float, float]
     angle: float
+    # flick: 滑动轨迹(每毫秒一个点, 从pos所在时刻开始); hold: 按下之后每毫秒的位置
+    path: tuple[tuple[float, float], ...] | None = None
 
 
 class Frame:
@@ -31,9 +34,16 @@ class Frame:
         self.timestamp = timestamp
         self.unallocated = defaultdict(list)
 
-    def add(self, note_type: NoteType, pos: tuple[float, float], angle: float) -> None:
+    def add(self, note_type: NoteType, pos: tuple[float, float], angle: float,
+            path: tuple[tuple[float, float], ...] | None = None) -> None:
         pos = recalc_pos(pos, math.sin(angle), math.cos(angle))
-        self.unallocated[note_type].append(PlainNote(note_type, self.timestamp, pos, angle))
+        self.unallocated[note_type].append(PlainNote(note_type, self.timestamp, pos, angle, path))
+
+    def holds(self) -> Iterator[PlainNote]:
+        holds = self.unallocated[NoteType.HOLD]
+        for hold in holds:
+            yield hold
+        holds.clear()
 
     def taps(self) -> Iterator[PlainNote]:
         taps = self.unallocated[NoteType.TAP]
@@ -99,10 +109,11 @@ class PointerAllocator:
     last_timestamp: int | None
     now: int
 
-    def __init__(self, max_pointers_count: int = 10, begin_at: int = 1000):
+    def __init__(self, max_pointers_count: int = MAX_POINTERS, begin_at: int = 1000):
         self.pointers = [Pointer(i + begin_at) for i in range(max_pointers_count)]
         self.events = defaultdict(list)
         self.last_timestamp = None
+        self.dropped: list[tuple[int, NoteType]] = []  # 触点不足而无法执行的音符
 
     def _find_available_pointers(self, note: PlainNote) -> Pointer | None:
         """查找当前屏幕上可以直接拿来用的指针
@@ -118,9 +129,12 @@ class PointerAllocator:
                 return pointer
         return None
 
-    def _alloc(self, note: PlainNote) -> Pointer:
+    def _alloc(self, note: PlainNote) -> Pointer | None:
         available_pointers = [p for p in self.pointers if p.note is None or p.age > 0]
-        assert available_pointers
+        if not available_pointers:
+            # 所有触点都在按住/滑动中(超过触点上限), 只能放弃这个音符
+            self.dropped.append((self.now, note.type))
+            return None
         return min(available_pointers, key=lambda p: distance_of(p.note, note))  # 优先使用废弃的Pointer
 
     def _insert(self, timestamp: int, event: VirtualTouchEvent) -> None:
@@ -134,21 +148,36 @@ class PointerAllocator:
         pointer.age = 0
         self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.DOWN, pointer.id))
 
+    def _hold(self, pointer: Pointer, note: PlainNote) -> None:
+        """按下后同一个指针逐毫秒跟随判定线移动, 直到hold结束; 期间该指针不会被其他音符占用"""
+        self._tap(pointer, note)
+        path = note.path or ()
+        for delta, pos in enumerate(path, start=1):
+            self._insert(self.now + delta, VirtualTouchEvent(pos, TouchAction.MOVE, pointer.id))
+        if path:
+            pointer.note = note._replace(pos=path[-1])
+        pointer.age = -len(path)
+
     def _flick(self, pointer: Pointer, note: PlainNote) -> None:
-        if pointer.note is None:
-            self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.DOWN, pointer.id))
+        if note.path:
+            path = note.path
         else:
-            self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.MOVE, pointer.id))
-        alpha = note.angle
-        sa, ca = math.sin(alpha), math.cos(alpha)
-        px, py = recalc_pos(note.pos, sa, ca)  # 对于flick，需先判断是否在屏幕内判定，否则之后生成的一系列滑动事件将会被recalc_pos给映射到同一点，使得flick漏判
-        x, y = recalc_pos(note.pos, sa, ca)
-        for delta in range(FLICK_DURATION):
-            rate = 1 - 2 * delta / FLICK_DURATION
-            px, py = (x - rate * FLICK_RADIUS * sa, y + rate * FLICK_RADIUS * ca)
-            self._insert(self.now + delta, VirtualTouchEvent((px, py), TouchAction.MOVE, pointer.id))
-        pointer.note = note._replace(pos=(px, py))
-        pointer.age = FLICK_START - FLICK_END
+            alpha = note.angle
+            sa, ca = math.sin(alpha), math.cos(alpha)
+            # 对于flick，需先判断是否在屏幕内判定，否则之后生成的一系列滑动事件将会被recalc_pos给映射到同一点，使得flick漏判
+            x, y = recalc_pos(note.pos, sa, ca)
+            path = tuple(
+                (x - (1 - 2 * d / FLICK_DURATION) * FLICK_RADIUS * sa, y + (1 - 2 * d / FLICK_DURATION) * FLICK_RADIUS * ca)
+                for d in range(FLICK_DURATION)
+            )
+        if pointer.note is None:
+            self._insert(self.now, VirtualTouchEvent(path[0], TouchAction.DOWN, pointer.id))
+        else:
+            self._insert(self.now, VirtualTouchEvent(path[0], TouchAction.MOVE, pointer.id))
+        for delta, pos in enumerate(path):
+            self._insert(self.now + delta, VirtualTouchEvent(pos, TouchAction.MOVE, pointer.id))
+        pointer.note = note._replace(pos=path[-1])
+        pointer.age = -(len(path) - 1)
 
     def _drag(self, pointer: Pointer, note: PlainNote) -> None:
         if pointer.note is None:
@@ -166,15 +195,21 @@ class PointerAllocator:
             for pointer in self.pointers:
                 pointer.age += self.now - self.last_timestamp
 
-        # 步骤1：分配tap
+        # 步骤1：分配tap与hold(hold按下后由同一个指针跟随到结束)
         for note in frame.taps():
             pointer = self._alloc(note)
-            self._tap(pointer, note)
+            if pointer is not None:
+                self._tap(pointer, note)
+        for note in frame.holds():
+            pointer = self._alloc(note)
+            if pointer is not None:
+                self._hold(pointer, note)
 
         # 步骤2: 分配flick
         for note in frame.flicks():
             pointer = self._alloc(note)
-            self._flick(pointer, note)
+            if pointer is not None:
+                self._flick(pointer, note)
 
         # 步骤3：分配drag
         for note in frame.drags():
@@ -183,7 +218,8 @@ class PointerAllocator:
                 pointer.age = 0
                 continue
             pointer = self._alloc(note)
-            self._drag(pointer, note)
+            if pointer is not None:
+                self._drag(pointer, note)
 
         self.last_timestamp = frame.timestamp
 
@@ -192,9 +228,10 @@ class PointerAllocator:
         if self.last_timestamp is None:
             return
 
-        final = self.last_timestamp + 1
         for pointer in self.pointers:
             if pointer.note:
+                # 仍在按住/滑动中的指针(age < 0)要等其移动事件结束后再抬起
+                final = self.last_timestamp + max(0, -pointer.age) + 1
                 self._insert(final, VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
 
     def done(self) -> defaultdict[int, list[VirtualTouchEvent]]:
@@ -202,7 +239,7 @@ class PointerAllocator:
         return self.events
 
 
-def solve(chart: Chart, console: Console) -> defaultdict[int, list[VirtualTouchEvent]]:
+def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> defaultdict[int, list[VirtualTouchEvent]]:
     frames = Frames()
 
     # 统计frames
@@ -215,41 +252,28 @@ def solve(chart: Chart, console: Console) -> defaultdict[int, list[VirtualTouchE
             pos = x + off_x * math.cos(alpha), y + off_x * math.sin(alpha)
             match note.type:
                 case NoteType.HOLD:
+                    # 按下之后每毫秒的位置(随判定线移动/旋转), 由同一个指针执行
                     hold_ms = math.ceil(line.seconds(note.hold) * 1000)
-                    frames[ms].add(NoteType.TAP, pos, alpha)
-                    for offset in range(1, hold_ms + 1):
-                        alpha = -line.angle(line.time((ms + offset) / 1000)) * math.pi / 180
-                        frames[ms + offset].add(
-                            NoteType.DRAG, line.pos_of(note, line.time((ms + offset) / 1000)), alpha
-                        )
+                    path = tuple(note_point(line, note, ms + offset) for offset in range(1, hold_ms + 1))
+                    frames[ms].add(NoteType.HOLD, pos, alpha, path)
                 case NoteType.FLICK:
-                    if not in_screen(pos):
-                        # 这块的逻辑在algo1.py中有解释
-                        px, py = pos
-                        for dt in range(-3, 4):
-                            new_time = note.time + dt
-                            xx, yy = line.pos(new_time)
-                            new_alpha = -line.angle(new_time) * math.pi / 180
-                            new_sa = math.sin(new_alpha)
-                            new_ca = math.cos(new_alpha)
-                            pxx, pyy = xx + off_x * new_ca, yy + off_x * new_sa
-                            if in_screen((pxx, pyy)):
-                                console.print(f'[red]微调判定时间：flick(pos=({px, py}), time={note.time}) => flick(pos=({pxx}, {pyy}), time={new_time})[/red]')
-                                alpha = new_alpha
-                                pos = (pxx, pyy)
-                                break
-
-                    frames[ms + FLICK_START].add(NoteType.FLICK, pos, alpha)
+                    # 判定点在屏幕外时的时间微调(说明见algo1.py); 滑动轨迹逐毫秒跟随判定线
+                    shift = flick_time_shift(line, note, console)
+                    path = tuple(flick_path(line, note, ms, FLICK_START, FLICK_END, FLICK_RADIUS, shift))
+                    frames[ms + FLICK_START].add(NoteType.FLICK, path[0], alpha, path)
                 case _:
                     frames[ms].add(note.type, pos, alpha)
 
     console.print(f'统计完毕，当前谱面共计{len(frames)}帧')
 
-    allocator = PointerAllocator()
+    allocator = PointerAllocator(max_pointers)
 
-    for frame in track(frames, description='规划触控事件...'):
+    for frame in track(frames, description='规划触控事件...', console=console):
         allocator.allocate(frame)
 
+    if allocator.dropped:
+        console.print(f'[yellow]警告: 有{len(allocator.dropped)}个音符因同时需要超过{max_pointers}个触点而无法执行'
+                      f'(首次出现在{allocator.dropped[0][0]}ms)[/yellow]')
     return allocator.done()
 
 

@@ -1,6 +1,43 @@
 from typing import Self
+from bisect import bisect_left
 from note import Note
 import math
+
+
+class _EventIndex:
+    """按时间查找事件: 返回列表中第一个满足 start_time <= t <= end_time 的事件。
+
+    事件按时间有序且互不重叠时(官谱与RPE转换谱均如此)用二分查找, 否则退回逐个查找,
+    两种方式的结果完全相同(边界时刻属于前一个事件)。
+    RPE缓动会被转换器采样成大量短事件, 逐个查找在规划时会非常慢。
+    """
+
+    __slots__ = ('events', 'starts', 'ends', 'ordered')
+
+    def __init__(self, events: list) -> None:
+        self.events = events
+        self.starts = [e.start_time for e in events]
+        self.ends = [e.end_time for e in events]
+        self.ordered = all(s <= e for s, e in zip(self.starts, self.ends)) and all(
+            self.ends[i] <= self.starts[i + 1] for i in range(len(events) - 1)
+        )
+
+    def find(self, t: float):
+        if self.ordered:
+            i = bisect_left(self.ends, t)
+            if i < len(self.events) and self.starts[i] <= t:
+                return self.events[i]
+            return None
+        for e in self.events:
+            if e.start_time <= t <= e.end_time:
+                return e
+        return None
+
+
+def _progress(e, t: float) -> float:
+    """事件内的线性进度(0..1), 零长度事件取1(即直接取end)"""
+    span = e.end_time - e.start_time
+    return (t - e.start_time) / span if span else 1.0
 
 
 class SpeedEvent:
@@ -85,12 +122,17 @@ class JudgeLine:
         self.disappear_events = disappear_events
         self.move_events = move_events
         self.rotate_events = rotate_events
-        # v1/v2的move事件y分量为"0在屏幕底部"，需要翻转；v3(3.20.0+)改为标准屏幕坐标(0在顶部)
+        # 官谱(formatVersion 1/3)的move事件y分量均以屏幕底部为0、向上为正, 需要翻转成
+        # 屏幕坐标(0在顶部)。与Phira及原版phisap的解析一致。
         self.flip_y = flip_y
+        self._speed_idx = _EventIndex(speed_events)
+        self._alpha_idx = _EventIndex(disappear_events)
+        self._move_idx = _EventIndex(move_events)
+        self._rotate_idx = _EventIndex(rotate_events)
 
     @classmethod
     def from_dict(cls, d: dict):
-        # v2(Phigros 2.x~3.1.x官谱): speedEvents显式携带floorPosition，move事件y分量为"0在底部"
+        # speedEvents显式携带floorPosition的谱面(formatVersion 2, 仅phisap内部/旧工具使用)
         return cls(
             [*map(Note.load, d['notesAbove'])],
             [*map(Note.load, d['notesBelow'])],
@@ -104,9 +146,10 @@ class JudgeLine:
 
     @classmethod
     def from_dict_v3(cls, d: dict) -> Self:
-        # v3(Phigros 3.20.0+)相对v2的区别:
-        # 1. speedEvents移除了floorPosition，需从0开始按 1.875*value/bpm 逐段累积推导(推导方式同v1)
-        # 2. move事件的y分量改为标准屏幕坐标(0在顶部)，不再翻转
+        # formatVersion 3(v2.5.0及之后的官谱, 含3.20.0+):
+        # speedEvents移除了floorPosition, 需从0开始按 1.875*value/bpm 逐段累积推导(推导方式同v1)。
+        # move事件的y分量与之前完全相同: 0在屏幕底部、向上为正(见Phira pgr.rs与谱面格式文档),
+        # 因此同样需要翻转。(曾误认为3.20.0改成了0在顶部, 导致判定线上下镜像、旋转线上的音符全部错位)
         speed_events = d['speedEvents']
         current_floor = 0.0
         for ev in speed_events:
@@ -121,7 +164,7 @@ class JudgeLine:
             [*map(NormalEvent.from_dict, d['judgeLineDisappearEvents'])],
             [*map(NormalEvent.from_dict, d['judgeLineMoveEvents'])],
             [*map(NormalEvent.from_dict, d['judgeLineRotateEvents'])],
-            flip_y=False,
+            flip_y=True,
         )
 
     @classmethod
@@ -144,9 +187,9 @@ class JudgeLine:
         )
 
     def floor(self, t: float) -> float:
-        for e in self.speed_events:
-            if e.start_time <= t <= e.end_time:
-                return self.seconds((t - e.start_time) * e.value) + e.floor
+        e = self._speed_idx.find(t)
+        if e is not None:
+            return self.seconds((t - e.start_time) * e.value) + e.floor
         # t超出最后一段speed事件的范围时(个别谱面末尾没有延伸到1e9)，
         # 按最后一段事件的速率继续外推(与Phira的解析行为一致)
         last = self.speed_events[-1]
@@ -161,24 +204,25 @@ class JudgeLine:
         return second * self.bpm / 1.875
 
     def opacity(self, t: float) -> float:
-        for e in self.disappear_events:
-            if e.start_time <= t <= e.end_time:
-                return e.start + (e.end - e.start) * (t - e.start_time) / (e.end_time - e.start_time)
-        return 1.0
+        e = self._alpha_idx.find(t)
+        if e is None:
+            return 1.0
+        return e.start + (e.end - e.start) * _progress(e, t)
 
     def pos(self, t: float) -> tuple[float, float]:
-        for e in self.move_events:
-            if e.start_time <= t <= e.end_time:
-                x = (e.start + (e.end - e.start) * (t - e.start_time) / (e.end_time - e.start_time)) * 1280
-                y_frac = e.start2 + (e.end2 - e.start2) * (t - e.start_time) / (e.end_time - e.start_time)
-                return x, (720 - y_frac * 720) if self.flip_y else y_frac * 720
-        return 0, 0
+        e = self._move_idx.find(t)
+        if e is None:
+            return 0, 0
+        f = _progress(e, t)
+        x = (e.start + (e.end - e.start) * f) * 1280
+        y_frac = e.start2 + (e.end2 - e.start2) * f
+        return x, ((720 - y_frac * 720) if self.flip_y else y_frac * 720)
 
     def angle(self, t: float) -> float:
-        for e in self.rotate_events:
-            if e.start_time <= t <= e.end_time:
-                return e.start + (e.end - e.start) * (t - e.start_time) / (e.end_time - e.start_time)
-        return 0.0
+        e = self._rotate_idx.find(t)
+        if e is None:
+            return 0.0
+        return e.start + (e.end - e.start) * _progress(e, t)
 
     @property
     def notes(self) -> list[Note]:

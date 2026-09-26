@@ -6,6 +6,16 @@ import math
 import json
 
 
+# Android 系统允许同时存在的最大触点数(MotionEvent 硬上限)。
+# phisap 会推送补丁版 scrcpy-server 以解除官方的10触点限制, 补丁失败时退回10。
+MAX_POINTERS = 16
+
+# 规划缓存文件后缀。规划逻辑或谱面解析有影响结果的修改时递增版本号,
+# 旧版本生成的缓存会被自动忽略(需要重新规划)。
+# v2: 修正官谱/RPE转换谱的y方向、RPE缓动/多层/父线、长按与滑键跟随判定线、16触点
+PLAN_CACHE_SUFFIX = '.ans.v2.json'
+
+
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
     p1x, p1y = p1
     p2x, p2y = p2
@@ -61,6 +71,56 @@ def recalc_pos(position: tuple[float, float], sa: float, ca: float) -> tuple[flo
         sumy += y2
         sumx += 1280
     return sumx / 2, sumy / 2
+
+
+def clamp_to_screen(pos: tuple[float, float], margin: float = 1.0) -> tuple[float, float]:
+    x, y = pos
+    return min(max(x, margin), 1280 - margin), min(max(y, margin), 720 - margin)
+
+
+def note_state(line, note, ms: float, time_shift: float = 0.0) -> tuple[tuple[float, float], float, float]:
+    """音符在ms毫秒时(随判定线移动/旋转后)的位置, 以及该时刻判定线角度的sin/cos。
+    time_shift: 额外的时间偏移(谱面时间单位)"""
+    t = line.time(ms / 1000) + time_shift
+    alpha = -line.angle(t) * math.pi / 180
+    return line.pos_of(note, t), math.sin(alpha), math.cos(alpha)
+
+
+def note_point(line, note, ms: float, time_shift: float = 0.0) -> tuple[float, float]:
+    """音符在ms毫秒时的可点击位置(屏幕外时用该时刻的角度映射回屏幕内)"""
+    pos, sa, ca = note_state(line, note, ms, time_shift)
+    return recalc_pos(pos, sa, ca)
+
+
+def flick_time_shift(line, note, console=None) -> float:
+    """flick在判定时刻位于屏幕外时, 在±3个时间单位内寻找判定点位于屏幕内的时刻(见algo1中的说明)"""
+    pos, _, _ = note_state(line, note, line.seconds(note.time) * 1000)
+    if in_screen(pos):
+        return 0.0
+    for dt in range(-3, 4):
+        new_pos = line.pos_of(note, note.time + dt)
+        if in_screen(new_pos):
+            if console is not None:
+                console.print(f'[red]微调判定时间：flick(pos={pos}, time={note.time}) => flick(pos={new_pos}, time={note.time + dt})[/red]')
+            return float(dt)
+    return 0.0
+
+
+def flick_path(line, note, center_ms: int, start: int, end: int, radius: float,
+               time_shift: float = 0.0) -> list[tuple[float, float]]:
+    """flick的滑动轨迹: 返回 center_ms+start ... center_ms+end 每毫秒的位置。
+
+    每一毫秒都按该时刻判定线的实际位置/角度计算(判定线在移动或旋转时手指跟着走),
+    并沿垂直于判定线的方向滑过 2*radius 的距离(不改变在判定线方向上的投影)。
+    """
+    path = []
+    duration = end - start
+    for offset in range(start, end + 1):
+        (x, y), sa, ca = note_state(line, note, center_ms + offset, time_shift)
+        bx, by = recalc_pos((x, y), sa, ca)
+        rate = 1 - 2 * (offset - start) / duration
+        path.append(clamp_to_screen((bx - sa * radius * rate, by + ca * radius * rate)))
+    return path
 
 
 class TouchAction(Enum):
@@ -119,4 +179,6 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
     }
 
 
-__all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen']
+__all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
+           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
+           'clamp_to_screen']

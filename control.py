@@ -7,6 +7,7 @@ import random
 import os
 
 from algo.algo_base import TouchAction
+from server_patch import prepare_server, SCRCPY_MAX_POINTERS
 
 # phisap 使用的 scrcpy-server 版本（协议与版本严格对应，server 会校验版本号）
 # v4.1 支持 Android 5 ~ Android 16；旧的 v2.0 在 Android 14/15 上会因 SurfaceControl.createDisplay 被移除而崩溃
@@ -42,8 +43,21 @@ def _skip_exact(skt: socket.socket, n: int) -> None:
         n -= len(chunk)
 
 
+def server_file_path(server_dir: str = '.') -> str:
+    return os.path.join(server_dir, SCRCPY_SERVER_FILE)
+
+
+def max_touch_points(server_dir: str = '.') -> int:
+    '''本机可用的最大同时触点数: 16(补丁版scrcpy-server, Android上限) 或 10(官方原版)'''
+    server_file = server_file_path(server_dir)
+    if not os.path.isfile(server_file):
+        return SCRCPY_MAX_POINTERS
+    return prepare_server(server_file)[1]
+
+
 class DeviceController:
     serial: str | None
+    max_pointers: int
     session_id: str
     video_socket: socket.socket
     control_socket: socket.socket
@@ -58,7 +72,7 @@ class DeviceController:
         self.serial = serial
         adb = ('adb',) if serial is None else ('adb', '-s', serial)
         self.session_id = format(random.randint(0, 0x7FFFFFFF), '08x')
-        server_file = os.path.join(server_dir, SCRCPY_SERVER_FILE)
+        server_file = server_file_path(server_dir)
         if not os.path.isfile(server_file) or os.path.getsize(server_file) == 0:
             raise FileNotFoundError(
                 f'未找到 {SCRCPY_SERVER_FILE}（phisap 需要与之严格对应的 scrcpy {SCRCPY_VERSION} 服务端）。\n'
@@ -75,8 +89,11 @@ class DeviceController:
                     hint = '\n\n设备未连接或已离线，请检查USB调试/模拟器adb连接后点"刷新"。'
                 raise RuntimeError(f'adb 命令执行失败: adb {" ".join(args)}\n{detail}{hint}')
 
+        # 推送16触点补丁版(补丁失败时自动退回官方原版/10触点)
+        push_file, self.max_pointers = prepare_server(server_file)
+        print('[client]', f'scrcpy-server: {os.path.basename(push_file)}, 最多同时 {self.max_pointers} 个触点')
         if push_server:
-            adb_run('push', server_file, '/data/local/tmp/scrcpy-server.jar')
+            adb_run('push', push_file, '/data/local/tmp/scrcpy-server.jar')
         adb_run('reverse', f'localabstract:scrcpy_{self.session_id}', f'tcp:{port}')
         skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

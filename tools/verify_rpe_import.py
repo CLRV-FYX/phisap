@@ -44,7 +44,7 @@ def main():
     for w in warns:
         print(f'  [warn] {w}')
 
-    if chart_off.offset != chart_rpe.offset:
+    if abs(chart_off.offset - chart_rpe.offset) > 1e-6:
         fail(f'offset不一致: {chart_off.offset} vs {chart_rpe.offset}')
 
     matched = total = 0

@@ -86,7 +86,8 @@ def main():
         fail(f'判定线数量不一致: v3={len(v3_lines)}, rpe={len(rpe_lines)}')
     print(f'判定线数量: v3={len(v3_lines)}, rpe={len(rpe_lines)}')
 
-    if abs(v3.get('offset', 0.0) - rpe.get('META', {}).get('offset', 0.0)) > 1e-6:
+    # 官谱offset单位为秒, RPE的META.offset单位为毫秒
+    if abs(v3.get('offset', 0.0) * 1000 - rpe.get('META', {}).get('offset', 0.0)) > 1e-3:
         fail(f'offset不一致: v3={v3.get("offset")}, rpe={rpe.get("META", {}).get("offset")}')
     else:
         print(f'offset一致: {v3.get("offset")}')
@@ -186,7 +187,8 @@ def main():
             px, py = jl.pos(t)
             if abs(px - (rx * 1280 / RPE_CANVAS_W + 640)) > 0.05:
                 ev_bad += 1
-            if abs(py - (ry * 720 / RPE_CANVAS_H + 360)) > 0.05:
+            # 官谱y分量以底部为0(解析后屏幕y向下), RPE的y向上为正
+            if abs(py - (360 - ry * 720 / RPE_CANVAS_H)) > 0.05:
                 ev_bad += 1
             if rr is not None and abs(jl.angle(t) + rr) > 1e-3:
                 ev_bad += 1

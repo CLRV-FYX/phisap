@@ -23,6 +23,6 @@ python3 tools/verify_rpe_import.py        # RPE导入转换往返验证: RPE→v
 ## 已逆向出的 v3 格式要点（相对 v2）
 
 1. `speedEvents` 移除 `floorPosition`：floor 从 0 按 `1.875*value/bpm` 逐段累积推导（同 v1）
-2. 判定线移动事件的 y 分量改为标准屏幕坐标（0 在顶部），v2 为 0 在底部
+2. ~~判定线移动事件的 y 分量改为标准屏幕坐标（0 在顶部）~~ **更正**：y 分量与旧格式相同，均为 0 在底部、向上为正（Phira `pgr.rs` 与谱面格式文档均如此）。RPE 的 y 也是向上为正，因此 `RPE_y = (frac - 0.5) * 900` 的对应关系本身就说明 frac 以底部为 0
 3. 谱面文件名带 ` #<id>` 后缀（如 `Chart_AT #4159.json`），phisap 提取时自动规范化
 4. 其余（音符类型编号 1tap/2drag/3hold/4flick、x=72px 单位、time=1/32 拍、旋转/透明度事件、每线 bpm）与 v2 一致

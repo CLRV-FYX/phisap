@@ -6,7 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 
-from .algo_base import TouchAction, VirtualTouchEvent, distance_of, recalc_pos, in_screen
+from .algo_base import (TouchAction, VirtualTouchEvent, distance_of, recalc_pos,
+                        MAX_POINTERS, note_point, flick_path, flick_time_shift)
 from chart import Chart
 from note import NoteType
 
@@ -50,7 +51,10 @@ class PointerManager:
     unused_now: dict[int, Pointer]
     mark_as_released: list[int]
 
-    def __init__(self, begin: int, delta: int = 1) -> None:
+    def __init__(self, begin: int, delta: int = 1, max_pointers: int = MAX_POINTERS) -> None:
+        self.max_pointers = max_pointers
+        self.forced = []          # 为腾出触点而提前抬起的指针: (pid, 抬起时刻, 位置)
+        self.overflow = []        # 超出上限的时刻(无法腾出触点)
         self.begin = begin
         self.max_pointer_id = begin
         self.pointers = {}
@@ -95,9 +99,23 @@ class PointerManager:
                 ptr.occupied = 0
                 self.pointers[event_id] = ptr
                 return ptr.pid, False
+        self._make_room()
         pid = self._new()
         self.pointers[event_id] = Pointer(pid, event.point, self.now)
         return pid, True
+
+    def _on_screen(self) -> int:
+        return len(self.pointers) + len(self.unused) + len(self.unused_now) - len(self.mark_as_released)
+
+    def _make_room(self) -> None:
+        """即将按下新指针: 触点已满时, 先抬起最久未使用的闲置指针(而不是让新触点被丢弃)"""
+        while self._on_screen() >= self.max_pointers and self.unused:
+            pid = min(self.unused, key=lambda k: self.unused[k].timestamp)
+            ptr = self.unused.pop(pid)
+            # 不立即回收pid(避免同一毫秒内同一pid先按下后抬起), 在recycle中回收
+            self.forced.append((ptr.pid, min(ptr.timestamp + 1, self.now), ptr.pos))
+        if self._on_screen() >= self.max_pointers:
+            self.overflow.append(self.now)
 
     def release(self, event: FrameEvent) -> None:
         event_id = event.id
@@ -107,6 +125,10 @@ class PointerManager:
             self.mark_as_released.append(event_id)
 
     def recycle(self, is_keyframe: bool):
+        for pid, ts, pos in self.forced:
+            yield pid, ts, pos
+            self._del(pid)
+        self.forced = []
         marked = []
         for event_id in self.mark_as_released:
             del self.pointers[event_id]
@@ -123,10 +145,12 @@ class PointerManager:
         self.unused |= self.unused_now
         self.unused_now = {}
 
-        if len(self.unused) + len(self.pointers) > 10:
-            raise RuntimeError(
-                f'unused: {len(self.unused)} & pointers: {len(self.pointers)} are on screen @ {self.now}'
-            )
+        # 仍超出上限时(全部是正在使用的指针)只能提前抬起闲置指针, 无法更多
+        while len(self.unused) + len(self.pointers) > self.max_pointers and self.unused:
+            pid = min(self.unused, key=lambda k: self.unused[k].timestamp)
+            ptr = self.unused.pop(pid)
+            yield ptr.pid, ptr.timestamp + 1, ptr.pos
+            self._del(ptr.pid)
 
     def finish(self):
         for ptr in self.unused.values():
@@ -137,10 +161,9 @@ class PointerManager:
             yield ptr.pid, ptr.timestamp + 1, ptr.pos
 
 
-def solve(chart: Chart, console: Console) -> dict[int, list[VirtualTouchEvent]]:
+def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> dict[int, list[VirtualTouchEvent]]:
     FLICK_START = -30
     FLICK_END = 30
-    FLICK_DURATION = FLICK_END - FLICK_START
     FLICK_RADIUS = 30
 
     frames: defaultdict[int, list[FrameEvent]] = defaultdict(list)
@@ -149,10 +172,6 @@ def solve(chart: Chart, console: Console) -> dict[int, list[VirtualTouchEvent]]:
         frames[milliseconds].append(FrameEvent(action, point, id))
 
     current_event_id = 0
-
-    def flick_pos(px: float, py: float, offset: int, sina: float, cosa: float) -> tuple[float, float]:
-        rate = 1 - 2 * (offset - FLICK_START) / FLICK_DURATION
-        return (px - sina * FLICK_RADIUS * rate, py + cosa * FLICK_RADIUS * rate)
 
     console.print('开始规划')
 
@@ -173,89 +192,40 @@ def solve(chart: Chart, console: Console) -> dict[int, list[VirtualTouchEvent]]:
                 case NoteType.DRAG:
                     add_frame_event(ms, FrameEventAction.DRAG, recalc_pos((px, py), sa, ca), current_event_id)
                 case NoteType.FLICK:
-                    if not in_screen((px, py)):
-                        # 给DESTRUCTION 3,2,1打个补丁
-                        # 这首歌的IN难度的最后一个flick是在屏幕外判定的，你敢信？
-                        # 这个flick的触发时刻为26752，然而它所在的判定线在26752时刻时的位置在(w/2, -h/2)
-                        # 然而人类是可以正常触发这个flick的判定的
-                        # 这是因为这个flick在(w/2, h/2)的位置闪了几下
-                        # 根据Phigros的判定机制，相当于这个flick可以同时在(w/2, h/2)和(w/2, -h/2)判定
-                        # 然而(w/2, -h/2)的位置不可能达到，所以相当于是在(w/2, h/2)判定了
-                        # 但是phisap是不知道这个机制的
-                        # 它遇到了(w/2, -h/2)这个flick，只会尝试使用recalc_pos在屏幕内找一个判定点
-                        # 然而这是不可能做到的，因为这个flick的偏转角度是90度，也就是说是平行于屏幕宽边的
-                        # 因此recalc_pos的算法便失效了，因为不可能计算出一个屏幕内的判定点
-                        # 为了应对这种情况，我们需要微调flick触发时间
-                        # 尝试在稍靠前或稍靠后的时间戳中找到一个判定点在屏幕内的时间戳
-                        # 对于DESTRUCTION 3,2,1，在之后的一个时间戳(26753)，判定点的位置便是(w/2, h/2)
-                        # 也就是在屏幕的中心
-                        found = False
-                        for dt in range(-3, 4):  # 查找的范围为[event.time - 3, event.time + 3]
-                            new_time = event.time + dt
-                            xx, yy = line.pos(new_time)
-                            new_alpha = -line.angle(new_time) * math.pi / 180
-                            new_sa = math.sin(new_alpha)
-                            new_ca = math.cos(new_alpha)
-                            pxx, pyy = xx + off_x * new_ca, yy + off_x * new_sa
-                            if in_screen((pxx, pyy)):
-                                found = True
-                                console.print(f'[red]微调判定时间：flick(pos=({px, py}), time={event.time}) => flick(pos=({pxx}, {pyy}), time={new_time})[/red]')
-                                x, y = xx, yy
-                                alpha = new_alpha
-                                sa, ca = new_sa, new_ca
-                                px, py = pxx, pyy
-                                break
-
-                        if not found:
-                            # 对于另外一些情况，我们没有找到这个时间戳
-                            # 这是我们假设此处使用了垂直判定机制，使用recalc_pos找到一个屏幕内的可行判定点
-                            px, py = recalc_pos((px, py), sa, ca)
-
-                    add_frame_event(
-                        ms + FLICK_START,
-                        FrameEventAction.FLICK_START,
-                        recalc_pos(flick_pos(px, py, FLICK_START, sa, ca), sa, ca),
-                        current_event_id,
-                    )
+                    # flick在判定时刻位于屏幕外时的时间微调(给DESTRUCTION 3,2,1打的补丁):
+                    # 这首歌IN难度的最后一个flick在屏幕外判定(26752时刻判定线位于(w/2, -h/2)),
+                    # 但它在(w/2, h/2)闪了几下, 按Phigros的判定机制可以在那里判定。
+                    # 因此在±3个时间单位内寻找判定点位于屏幕内的时刻; 找不到时用recalc_pos映射。
+                    shift = flick_time_shift(line, event, console)
+                    # 滑动轨迹逐毫秒跟随判定线的移动/旋转(旧版本整个滑动过程固定在判定时刻的位置)
+                    path = flick_path(line, event, ms, FLICK_START, FLICK_END, FLICK_RADIUS, shift)
+                    add_frame_event(ms + FLICK_START, FrameEventAction.FLICK_START, path[0], current_event_id)
                     for offset in range(FLICK_START + 1, FLICK_END):
-                        add_frame_event(
-                            ms + offset,
-                            FrameEventAction.FLICK,
-                            recalc_pos(flick_pos(px, py, offset, sa, ca), sa, ca),
-                            current_event_id,
-                        )
-                    add_frame_event(
-                        ms + FLICK_END,
-                        FrameEventAction.FLICK_END,
-                        recalc_pos(flick_pos(px, py, FLICK_END, sa, ca), sa, ca),
-                        current_event_id,
-                    )
+                        add_frame_event(ms + offset, FrameEventAction.FLICK, path[offset - FLICK_START], current_event_id)
+                    add_frame_event(ms + FLICK_END, FrameEventAction.FLICK_END, path[-1], current_event_id)
                 case NoteType.HOLD:
                     hold_ms = math.ceil(line.seconds(event.hold) * 1000)
                     add_frame_event(ms, FrameEventAction.HOLD_START, recalc_pos((px, py), sa, ca), current_event_id)
+                    # 按住期间每毫秒跟随判定线(屏幕外映射时使用该时刻的角度, 而不是按下时的角度)
                     for offset in range(1, hold_ms):
-                        add_frame_event(
-                            ms + offset,
-                            FrameEventAction.HOLD,
-                            recalc_pos(line.pos_of(event, line.time((ms + offset) / 1000)), sa, ca),
-                            current_event_id,
-                        )
-                    add_frame_event(
-                        ms + hold_ms,
-                        FrameEventAction.HOLD_END,
-                        recalc_pos(line.pos_of(event, line.time((ms + hold_ms) / 1000)), sa, ca),
-                        current_event_id,
-                    )
+                        add_frame_event(ms + offset, FrameEventAction.HOLD, note_point(line, event, ms + offset),
+                                        current_event_id)
+                    add_frame_event(ms + hold_ms, FrameEventAction.HOLD_END, note_point(line, event, ms + hold_ms),
+                                    current_event_id)
             current_event_id += 1
 
     console.print(f'统计完毕，当前谱面共计{len(frames)}帧')
 
-    pointers = PointerManager(1000)
+    pointers = PointerManager(1000, max_pointers=max_pointers)
 
     result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
 
     def add_touch_event(milliseconds: int, pos: tuple[float, float], action: TouchAction, pointer_id: int):
-        result[milliseconds].append(VirtualTouchEvent(pos, action, pointer_id))
+        if action == TouchAction.UP:
+            # 同一毫秒内先抬起再按下, 避免瞬间超出触点上限
+            result[milliseconds].insert(0, VirtualTouchEvent(pos, action, pointer_id))
+        else:
+            result[milliseconds].append(VirtualTouchEvent(pos, action, pointer_id))
 
     for ms, frame in track(sorted(frames.items()), description='正在规划触控事件...', console=console):
         pointers.now = ms
@@ -290,5 +260,8 @@ def solve(chart: Chart, console: Console) -> dict[int, list[VirtualTouchEvent]]:
 
     for pid, ts, pos in pointers.finish():
         add_touch_event(ts, pos, TouchAction.UP, pid)
+    if pointers.overflow:
+        console.print(f'[yellow]警告: 有{len(pointers.overflow)}个时刻需要同时按下超过{max_pointers}个触点'
+                      f'(首次出现在{pointers.overflow[0]}ms), 超出部分可能漏判[/yellow]')
     console.print('规划完毕.')
     return result

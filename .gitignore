@@ -3,6 +3,9 @@ build/
 .gradle/
 .idea/
 server.jar
+# 运行时自动生成的16触点补丁版scrcpy-server
+scrcpy-server-v*-16pt
+scrcpy-server-v*-16pt.tmp
 cache
 phisap_error.log
 .old_version/
