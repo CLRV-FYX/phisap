@@ -14,11 +14,22 @@ if errorlevel 1 (
     exit /b 1
 )
 echo [OK] 检测到 Python，正在安装/更新依赖...
+findstr /i /c:"av==10" /c:"numpy==1.25" requirements.txt >nul 2>nul
+if not errorlevel 1 (
+    echo [错误] 当前目录的 requirements.txt 是旧版本（含 av==10.0.0 / numpy==1.25.0），
+    echo        这两个版本没有 Python 3.12+ 的预编译包，必然安装失败。
+    echo        请用仓库最新的 requirements.txt 替换，内容应为:
+    echo            av^>=12.3.0
+    echo            rich^>=13.3.4
+    pause
+    exit /b 1
+)
 python -m pip install --upgrade pip
-python -m pip install --prefer-binary --only-binary=av -r requirements.txt
+rem 只安装预编译包，绝不在本地编译（本地编译需要 C 编译器，且旧版本与新 Python 不兼容）
+python -m pip install --only-binary=:all: -r requirements.txt
 if errorlevel 1 (
     echo [错误] 依赖安装失败，请检查网络后重新运行本脚本。
-    echo        如果提示找不到 av 的可用版本，说明当前 Python 版本过新/过旧，
+    echo        如果提示 "No matching distribution"，说明当前 Python 版本不受支持，
     echo        请安装 Python 3.11 或更高版本（64 位）后重试。
     pause
     exit /b 1
