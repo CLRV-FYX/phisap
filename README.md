@@ -70,6 +70,8 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
 3. 请准备Phigros的游戏安装包/通用数据包。目前支持的游戏版本为2.0.0至3.20.0
     + 3.20.0起官方谱面改用`formatVersion: 3`的新格式，phisap已支持解析
         + 新格式的谱面文件名带有` #<id>`后缀（如`Chart_AT #4159.json`），提取时会自动规范化为`Chart_AT.json`，无需额外处理
+    + 3.20.0起的新版安装包（Unity 2022资源包、新版catalog.json格式）也已支持直接解包，无需手动转换
+        + 解析新版安装包需要`UnityPy`（已包含在`requirements.txt`中，会随依赖一起安装）
     + 如果你的phigros是taptap版，那么只需要游戏安装包即可
         + 如果你使用*nix系统(如Linux或Mac OS)，则你可以使用如下的`bash shell`命令从安卓设备上提取安装包
             ```bash
@@ -91,12 +93,18 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
         cd phisap  # 定位到phisap的根目录下
         wget https://github.com/Genymobile/scrcpy/releases/download/v2.0/scrcpy-server-v2.0
         ```
+    + **Windows用户**: 直接双击`start.cmd`即可，它会自动安装依赖、检查/下载`scrcpy-server-v2.0`并启动phisap（前提是已安装Python 3.11并加入了PATH）
 
 ### 运行
+**Windows**: 双击`start.cmd`（首次运行会自动安装依赖并下载`scrcpy-server-v2.0`）
+
+*nix/手动方式*:
 ```bash
 cd phisap # 将CWD(Current Working Directory，当前工作目录)设置为phisap的根目录，以便phisap查找服务端文件
 python main.py
 ```
+
+**屏幕尺寸**: phisap会将Phigros的`1280×720`逻辑画布按16:9居中适配(contain)到实际屏幕，非16:9屏幕（如`2400×1080`）自动留边。屏幕尺寸默认自动检测，如果检测不准，可以在程序界面的"屏幕尺寸"一栏选择常见预设（如`1920×1080`），也可以直接手动输入`宽×高`（如`1290×2712`），设置会被记住
 
 ## 工作原理
 + 读取并缓存游戏安装包中的所有谱面文件
@@ -189,6 +197,14 @@ phisap并没有对课题模式做特殊的支持，将来也许会有
     + 新格式谱面文件名带` #<id>`后缀（如`Chart_AT #4159.json`），提取时自动规范化为`Chart_AT.json`
     + 其余字段（音符类型编号、坐标单位、时间单位、旋转/透明度事件等）与v2格式一致，未做改动
     + 新增`tests/test_chart.py`（v1/v2/v3解析单元测试）和`tools/verify_v3.py`（v3官谱与RPE转换谱的交叉验证工具）
++ 支持3.20.0起的新版安装包直接解包
+    + 自动识别新版`catalog.json`格式（`catalog.py`新增`CatalogV3`），新旧版本安装包均可直接解包，无需手动转换
+    + 新版安装包（Unity 2022资源包）在旧解析器无法处理时自动回退到`UnityPy`解析（`requirements.txt`已加入依赖）
++ 屏幕尺寸适配
+    + 逻辑画布`1280×720`改为按contain方式居中适配到实际屏幕尺寸，修复非16:9屏幕（如`2400×1080`、`1080×2400`）下坐标偏移错误的问题
+    + 界面新增"屏幕尺寸"选项：默认自动检测，也可选择常见预设（如`1920×1080`）或手动输入`宽×高`，设置自动保存
++ 新增Windows一键启动脚本`start.cmd`：自动检查Python、安装依赖、检查/下载`scrcpy-server-v2.0`、提示adb缺失，并启动phisap
++ 新增`tests/test_catalog.py`（catalog格式识别与新版解析单元测试）
 ### (2023/08/02)
 + 最近的更新导致了一些问题，比如在部分设备上，原本可以AP的曲目全部AP失败
 + 因此，现将2023/06/28之后的所有提交移动到开发分支上，不推荐普通用户使用

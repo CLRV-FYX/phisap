@@ -8,7 +8,7 @@ from typing import Iterator
 from algo.algo_base import TouchEvent
 from threading import Thread
 
-from catalog import Catalog
+from catalog import load_catalog
 from chart import Chart
 from control import DeviceController
 from extract import AssetsManager, TextAsset
@@ -18,34 +18,8 @@ from rich.console import Console
 from rich.progress import track
 
 
-def extract_apk(console: Console):
-    apk_path = filedialog.askopenfilename(filetypes=[('安装包', '.apk'), ('通用数据包', '.obb')], title='请选择要解包的游戏安装包或通用数据包')
-    if not apk_path:
-        return
-    popup = Toplevel()
-    popup.title('正在解包，请稍候...')
-    popup.minsize(300, 60)
-    popup.resizable(False, False)
-    popup.pack_slaves()
-    popup.update()
-
-    console.print('正在读取...')
-    apk_file = zipfile.ZipFile(apk_path)
-    console.print('正在解析catalog.json...')
-    catalog = None
-
-    try:
-        catalog = Catalog(apk_file.open('assets/aa/catalog.json'))
-    except KeyError:
-        messagebox.showerror('解包失败',
-                             '未在包内找到catalog.json\n'
-                             '这可能是由于安装包损坏，或者你的安装包是Google Play版本的\n'
-                             '如果是后者，请提取对应的obb文件，并解包该文件\n'
-                             '详见phisap的README说明')
-
-    if not catalog:
-        return
-
+def _extract_with_legacy(apk_file: zipfile.ZipFile, catalog, console: Console, popup):
+    """旧版解析器：适用于3.14及以前的安装包（自定义UnityFS解析）"""
     manager = AssetsManager()
     for file in track(apk_file.namelist(), description='正在加载文件...', console=console):
         if not file.startswith('assets/aa/Android'):
@@ -55,7 +29,6 @@ def extract_apk(console: Console):
     popup.title('已加载')
     popup.update()
     manager.read_assets(console)
-
 
     popup.title('正在解包，请稍候...')
     popup.update()
@@ -76,6 +49,83 @@ def extract_apk(console: Console):
                 with open(normalize_chart_name(asset_name), 'w') as out:
                     out.write(obj.text)
 
+
+def _extract_with_unitypy(apk_file: zipfile.ZipFile, catalog, console: Console, popup):
+    """UnityPy解析器：适用于3.20.0起的新版安装包（Unity 2022资源包）"""
+    try:
+        import UnityPy
+    except ImportError as e:
+        raise e
+    console.print('正在用UnityPy加载资源（3.20.0+新版安装包）...')
+    envs = {}
+    for name in track(apk_file.namelist(), description='正在加载文件...', console=console):
+        if not name.startswith('assets/aa/Android'):
+            continue
+        try:
+            envs[name] = UnityPy.load(apk_file.read(name))
+        except Exception as e:
+            console.print(f'警告: 加载{name}失败({e.__class__.__name__})，已跳过')
+    popup.title('正在解包，请稍候...')
+    popup.update()
+    for name, env in track(envs.items(), description='正在写入文件...', console=console):
+        bundle_name = os.path.basename(name)
+        if bundle_name not in catalog.fname_map:
+            continue
+        asset_name = catalog.fname_map[bundle_name]
+        if not asset_name.startswith('Assets/'):
+            continue
+        basedir = os.path.dirname(asset_name)
+        if basedir and not os.path.exists(basedir):
+            os.makedirs(basedir)
+        for obj in env.objects:
+            if obj.type.name != 'TextAsset':
+                continue
+            with open(normalize_chart_name(asset_name), 'w') as out:
+                script = obj.read().m_Script
+                out.write(script.decode('utf-8') if isinstance(script, (bytes, bytearray)) else script)
+
+
+def extract_apk(console: Console):
+    apk_path = filedialog.askopenfilename(filetypes=[('安装包', '.apk'), ('通用数据包', '.obb')], title='请选择要解包的游戏安装包或通用数据包')
+    if not apk_path:
+        return
+    popup = Toplevel()
+    popup.title('正在解包，请稍候...')
+    popup.minsize(300, 60)
+    popup.resizable(False, False)
+    popup.pack_slaves()
+    popup.update()
+
+    console.print('正在读取...')
+    apk_file = zipfile.ZipFile(apk_path)
+    console.print('正在解析catalog.json...')
+    catalog = None
+
+    try:
+        with apk_file.open('assets/aa/catalog.json') as f:
+            catalog = load_catalog(json.load(f))
+    except KeyError:
+        messagebox.showerror('解包失败',
+                             '未在包内找到catalog.json\n'
+                             '这可能是由于安装包损坏，或者你的安装包是Google Play版本的\n'
+                             '如果是后者，请提取对应的obb文件，并解包该文件\n'
+                             '详见phisap的README说明')
+
+    if not catalog:
+        popup.destroy()
+        return
+
+    try:
+        _extract_with_legacy(apk_file, catalog, console, popup)
+    except Exception as e:
+        # 3.20.0起（Unity 2022）的安装包旧解析器无法处理，回退到UnityPy
+        console.print(f'旧解析器失败({e.__class__.__name__}: {e})，改用UnityPy重试...')
+        try:
+            _extract_with_unitypy(apk_file, catalog, console, popup)
+        except ImportError as e2:
+            messagebox.showerror('解包失败',
+                                 f'新版安装包(3.20.0+)需要UnityPy才能解析：\n{e2}\n'
+                                 '请先运行 pip install -r requirements.txt 安装依赖后重试')
     popup.destroy()
 
 
@@ -141,6 +191,16 @@ def has_ans_cache(songid: str, difficulty: str) -> bool:
         return False
 
 
+# 屏幕尺寸预设：常见手机分辨率（横屏/竖屏），用户也可以手动输入任意"宽×高"
+SCREEN_PRESETS = [
+    '自动',
+    '1080×1920', '1080×2340', '1080×2400', '1260×2720', '1440×3120',
+    '1920×1080', '2340×1080', '2400×1080', '2560×1440',
+]
+
+_SCREEN_SIZE_RE = re.compile(r'^\s*(\d+)\s*[×xX: ]*\s*(\d+)\s*$')
+
+
 class App(ttk.Frame):
     SYNC_MODE_DELAY = 0
     SYNC_MODE_MANUAL = 1
@@ -181,6 +241,18 @@ class App(ttk.Frame):
         self.serial_select.bind('<<ComboboxSelected>>', self.adb_serial_selected)
         self.serial_refresh_btn = ttk.Button(frm, text='刷新', command=self.detect_adb_devices)
         self.serial_refresh_btn.grid(column=2, row=0)
+
+        ttk.Separator(orient='horizontal').pack(fill=X)
+
+        frm = ttk.Frame()
+        frm.pack()
+
+        ttk.Label(frm, text='屏幕尺寸: ').grid(column=0, row=0)
+        self.screen_size = StringVar()
+        self.screen_size.set('自动')
+        self.screen_select = ttk.Combobox(frm, values=SCREEN_PRESETS, textvariable=self.screen_size, width=16)
+        self.screen_select.grid(column=1, row=0)
+        ttk.Label(frm, text='（自动=设备实际尺寸；也可手动输入 宽×高，如 1920×1080）').grid(column=2, row=0)
 
         ttk.Separator(orient='horizontal').pack(fill=X)
 
@@ -318,6 +390,11 @@ class App(ttk.Frame):
         except configparser.NoOptionError:
             cache.set('cache', 'offset', '1.95')
 
+        try:
+            self.screen_size.set(cache.get('cache', 'screen'))
+        except configparser.NoOptionError:
+            cache.set('cache', 'screen', '自动')
+
         self.cache = cache
 
         return self
@@ -325,6 +402,22 @@ class App(ttk.Frame):
     def detect_adb_devices(self):
         self.serial_select['values'] = DeviceController.get_devices()
         return self
+
+    def resolve_screen_size(self, device_width: int, device_height: int) -> tuple[int, int]:
+        """返回实际设备像素尺寸。
+
+        "自动"时取设备实际尺寸（scrcpy探测），否则按用户输入的"宽×高"解析。
+        """
+        text = (self.screen_size.get() or '').strip()
+        if not text or text == '自动':
+            if device_width and device_height:
+                return int(device_width), int(device_height)
+            # 设备尺寸尚未探测到时，退化为16:9标准画布
+            return 1280, 720
+        m = _SCREEN_SIZE_RE.match(text)
+        if not m:
+            raise ValueError(f'无法识别的屏幕尺寸"{text}"，请输入 宽×高 的形式，例如 1920×1080')
+        return int(m.group(1)), int(m.group(2))
 
     def adb_serial_selected(self, event):
         serial = event.widget.get()
@@ -352,6 +445,7 @@ class App(ttk.Frame):
             self.cache.set('cache', 'songid', self.song_id.get())
             self.cache.set('cache', 'difficulty', self.difficulty.get())
             self.cache.set('cache', 'offset', str(self.delay.get()))
+            self.cache.set('cache', 'screen', self.screen_size.get())
             self.cache.write(open(self.cache_path, 'w'))
 
             algo_method = self.algo.get()
@@ -384,11 +478,14 @@ class App(ttk.Frame):
             device_width = self.controller.device_width
             device_height = self.controller.device_height
 
-            height = device_height
-            width = height * 16 // 9
-            xoffset = (device_width - width) >> 1
-            yoffset = (device_height - height) >> 1
-            scale_factor = height / 720
+            width, height = self.resolve_screen_size(device_width, device_height)
+
+            # Phigros逻辑画布为1280×720：按contain方式居中适配到实际屏幕，
+            # 非16:9屏幕（如20:9的2400×1080）时留边而非拉伸
+            scale_factor = min(width / 1280, height / 720)
+            xoffset = (width - 1280 * scale_factor) / 2
+            yoffset = (height - 720 * scale_factor) / 2
+            print('[client]', f'屏幕尺寸: {width}x{height}, 缩放: {scale_factor:.4f}, 偏移: ({xoffset:.1f},{yoffset:.1f})')
 
             adapted_ans = [
                 (timestamp, [ev.map_to(xoffset, yoffset, scale_factor, scale_factor) for ev in ans[timestamp]])
