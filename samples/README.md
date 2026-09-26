@@ -1,17 +1,27 @@
 # 3.20.0 新官谱格式样例目录
 
-本目录用于存放 Phigros **3.20.0** 新格式官谱的样例文件，供逆向新格式使用。
+本目录用于存放 Phigros **3.20.0** 新格式官谱的样例文件，供逆向新格式与回归验证使用。
 
-请把文件**直接上传/覆盖**到下面对应的路径（占位文件会直接替换掉）：
+**样例文件（`chart_at_*.json` / `rpe_chart_at_*.json`）属于游戏版权素材，已通过 `.gitignore` 排除在仓库之外**，仅保存在本地开发环境。如需补充新样例，直接覆盖同名文件即可：
 
-| 文件 | 内容 | 必填 |
-| --- | --- | --- |
-| `chart_at_4159.json` | **纯官谱**：3.20.0 未经转换的原始官谱（就是你手里那个 `Chart_AT #4159.json`，文件名无所谓，内容一致即可） | ✅ 必填 |
-| `rpe_chart_at_4159.json` | 同一张谱**转换后的 RPE JSON**（用来做逐音符一致性校验） | 建议提供 |
-| `catalog_320.json` | 3.20.0 解包产物中的 `catalog.json`（如果存储/命名方式变了，这个对改提取管线很关键） | 建议提供 |
-| `siblings_listing.txt` | 同一首歌/同一 bundle 旁边的**文件清单**（比如同歌的 EZ/HD/IN 谱面文件名、`.song` 等元数据文件名，一行一个） | 建议提供 |
+| 文件 | 内容 |
+| --- | --- |
+| `chart_at_4159.json` | **纯官谱**：3.20.0 未经转换的原始官谱（formatVersion 3） |
+| `rpe_chart_at_4159.json` | 同一张谱转换后的 RPE JSON（用于交叉验证） |
+| `catalog_320.json` | （可选）3.20.0 的 `catalog.json` 原样内容 |
+| `siblings_listing.txt` | （可选）同歌/同 bundle 旁边的文件清单 |
+| `extra_notes.md` | （可选）其他文件的说明 |
 
-如果还有其他相关文件（比如 OBB 里某个 bundle 的原始文件），也可以新建任意文件名放进去，然后在 `extra_notes.md` 里注明它是什么、从哪来的。
+验证方式：
 
-> 注意：占位文件内容是 `PLACEHOLDER`，上传后我会检查是否已替换。
-> 这些样例仅用于本仓库的开发验证，请勿把无关版权素材放进其他公开位置。
+```bash
+python3 -m unittest tests.test_chart      # v1/v2/v3 解析单元测试
+python3 tools/verify_v3.py                # v3官谱 vs RPE转换谱交叉验证(默认读取上面两个样例)
+```
+
+## 已逆向出的 v3 格式要点（相对 v2）
+
+1. `speedEvents` 移除 `floorPosition`：floor 从 0 按 `1.875*value/bpm` 逐段累积推导（同 v1）
+2. 判定线移动事件的 y 分量改为标准屏幕坐标（0 在顶部），v2 为 0 在底部
+3. 谱面文件名带 ` #<id>` 后缀（如 `Chart_AT #4159.json`），phisap 提取时自动规范化
+4. 其余（音符类型编号 1tap/2drag/3hold/4flick、x=72px 单位、time=1/32 拍、旋转/透明度事件、每线 bpm）与 v2 一致

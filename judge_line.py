@@ -65,6 +65,7 @@ class JudgeLine:
     disappear_events: list[NormalEvent]
     move_events: list[NormalEvent]
     rotate_events: list[NormalEvent]
+    flip_y: bool
 
     def __init__(
         self,
@@ -75,6 +76,7 @@ class JudgeLine:
         disappear_events: list[NormalEvent],
         move_events: list[NormalEvent],
         rotate_events: list[NormalEvent],
+        flip_y: bool = True,
     ) -> None:
         self.notes_above = notes_above
         self.notes_below = notes_below
@@ -83,9 +85,12 @@ class JudgeLine:
         self.disappear_events = disappear_events
         self.move_events = move_events
         self.rotate_events = rotate_events
+        # v1/v2的move事件y分量为"0在屏幕底部"，需要翻转；v3(3.20.0+)改为标准屏幕坐标(0在顶部)
+        self.flip_y = flip_y
 
     @classmethod
     def from_dict(cls, d: dict):
+        # v2(Phigros 2.x~3.1.x官谱): speedEvents显式携带floorPosition，move事件y分量为"0在底部"
         return cls(
             [*map(Note.load, d['notesAbove'])],
             [*map(Note.load, d['notesBelow'])],
@@ -94,6 +99,29 @@ class JudgeLine:
             [*map(NormalEvent.from_dict, d['judgeLineDisappearEvents'])],
             [*map(NormalEvent.from_dict, d['judgeLineMoveEvents'])],
             [*map(NormalEvent.from_dict, d['judgeLineRotateEvents'])],
+            flip_y=True,
+        )
+
+    @classmethod
+    def from_dict_v3(cls, d: dict) -> Self:
+        # v3(Phigros 3.20.0+)相对v2的区别:
+        # 1. speedEvents移除了floorPosition，需从0开始按 1.875*value/bpm 逐段累积推导(推导方式同v1)
+        # 2. move事件的y分量改为标准屏幕坐标(0在顶部)，不再翻转
+        speed_events = d['speedEvents']
+        current_floor = 0.0
+        for ev in speed_events:
+            if 'floorPosition' not in ev:
+                ev['floorPosition'] = current_floor
+                current_floor += 1.875 * (ev['endTime'] - ev['startTime']) * ev['value'] / d['bpm']
+        return cls(
+            [*map(Note.load, d['notesAbove'])],
+            [*map(Note.load, d['notesBelow'])],
+            d['bpm'],
+            [*map(SpeedEvent.from_dict, speed_events)],
+            [*map(NormalEvent.from_dict, d['judgeLineDisappearEvents'])],
+            [*map(NormalEvent.from_dict, d['judgeLineMoveEvents'])],
+            [*map(NormalEvent.from_dict, d['judgeLineRotateEvents'])],
+            flip_y=False,
         )
 
     @classmethod
@@ -119,6 +147,11 @@ class JudgeLine:
         for e in self.speed_events:
             if e.start_time <= t <= e.end_time:
                 return self.seconds((t - e.start_time) * e.value) + e.floor
+        # t超出最后一段speed事件的范围时(个别谱面末尾没有延伸到1e9)，
+        # 按最后一段事件的速率继续外推(与Phira的解析行为一致)
+        last = self.speed_events[-1]
+        if t >= last.start_time:
+            return self.seconds((t - last.start_time) * last.value) + last.floor
         raise RuntimeError(f'floorPosition not found: time = {t}')
 
     def seconds(self, t: float) -> float:
@@ -136,10 +169,9 @@ class JudgeLine:
     def pos(self, t: float) -> tuple[float, float]:
         for e in self.move_events:
             if e.start_time <= t <= e.end_time:
-                return (
-                    (e.start + (e.end - e.start) * (t - e.start_time) / (e.end_time - e.start_time)) * 1280,
-                    720 - (e.start2 + (e.end2 - e.start2) * (t - e.start_time) / (e.end_time - e.start_time)) * 720,
-                )
+                x = (e.start + (e.end - e.start) * (t - e.start_time) / (e.end_time - e.start_time)) * 1280
+                y_frac = e.start2 + (e.end2 - e.start2) * (t - e.start_time) / (e.end_time - e.start_time)
+                return x, (720 - y_frac * 720) if self.flip_y else y_frac * 720
         return 0, 0
 
     def angle(self, t: float) -> float:

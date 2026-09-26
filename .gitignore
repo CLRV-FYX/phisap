@@ -6,3 +6,9 @@ server.jar
 cache
 scrcpy-server-*
 __pycache__/
+
+# 官谱样例数据(游戏版权素材，不入库，仅本地开发验证用)
+
+# 官谱样例数据(游戏版权素材，不入库，仅本地开发验证用)
+samples/chart_at_*.json
+samples/rpe_chart_at_*.json

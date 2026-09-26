@@ -1,6 +1,7 @@
 import configparser
 import json
 import os
+import re
 import zipfile
 from tkinter import ttk, messagebox, Tk, X, IntVar, StringVar, DoubleVar, filedialog, Toplevel
 from typing import Iterator
@@ -72,7 +73,7 @@ def extract_apk(console: Console):
 
         for obj in file.objects:
             if isinstance(obj, TextAsset):
-                with open(asset_name, 'w') as out:
+                with open(normalize_chart_name(asset_name), 'w') as out:
                     out.write(obj.text)
 
     popup.destroy()
@@ -83,6 +84,61 @@ def agreement():
         return
     if not messagebox.askyesno(title='用户协定', message='您因使用或修改本程序发生的一切后果将由您自己承担而与程序原作者无关。\n' '您是否同意？'):
         exit(1)
+
+
+# 3.20.0+的官谱文件名带" #<id>"后缀(如Chart_AT #4159.json)，统一规范化为Chart_AT.json
+_CHART_DIFF_RE = re.compile(r'^Chart_(.+?)(?:\s+#.*)?\.json$')
+_CHART_SUFFIX_RE = re.compile(r'^(Chart_.+?)(?:\s+#.+)\.json$')
+
+
+def chart_difficulty(filename: str) -> str | None:
+    """从谱面文件名中提取难度(兼容带" #<id>"后缀的新版命名)，无法识别时返回None"""
+    m = _CHART_DIFF_RE.match(os.path.basename(filename))
+    return m.group(1) if m else None
+
+
+def normalize_chart_name(asset_name: str) -> str:
+    """把Chart_XX #<id>.json规范化为Chart_XX.json，其余名称原样返回"""
+    base = os.path.basename(asset_name)
+    m = _CHART_SUFFIX_RE.match(base)
+    if m:
+        return os.path.join(os.path.dirname(asset_name), m.group(1) + '.json')
+    return asset_name
+
+
+def list_difficulties(songid: str) -> list[str]:
+    try:
+        files = os.listdir(os.path.join('./Assets/Tracks', songid))
+    except FileNotFoundError:
+        return []
+    return sorted({
+        diff for f in files
+        if 'ans' not in f and (diff := chart_difficulty(f))
+    })
+
+
+def find_chart_path(songid: str, difficulty: str) -> str:
+    """定位谱面文件：优先Chart_<难度>.json，其次任意命名但该难度的谱面(如手动放入的新版命名文件)"""
+    tracks_dir = os.path.join('./Assets/Tracks', songid)
+    direct = os.path.join(tracks_dir, f'Chart_{difficulty}.json')
+    if os.path.exists(direct):
+        return direct
+    for f in sorted(os.listdir(tracks_dir)):
+        if 'ans' not in f and chart_difficulty(f) == difficulty:
+            return os.path.join(tracks_dir, f)
+    raise FileNotFoundError(f'未找到谱面文件: {songid} / {difficulty}')
+
+
+def has_ans_cache(songid: str, difficulty: str) -> bool:
+    """该难度是否已有规划缓存"""
+    tracks_dir = os.path.join('./Assets/Tracks', songid)
+    direct = os.path.join(tracks_dir, f'Chart_{difficulty}.json')
+    if os.path.exists(direct + '.ans.json'):
+        return True
+    try:
+        return os.path.exists(find_chart_path(songid, difficulty) + '.ans.json')
+    except FileNotFoundError:
+        return False
 
 
 class App(ttk.Frame):
@@ -242,13 +298,8 @@ class App(ttk.Frame):
 
         try:
             self.song_id.set(cache.get('cache', 'songid'))
-            difficulties = [
-                file[6:-5]
-                for file in os.listdir(os.path.join('./Assets/Tracks', self.song_id.get()))
-                if 'ans' not in file
-            ]
-            self.difficulties_select['values'] = difficulties
-        except (configparser.NoOptionError, FileNotFoundError) :
+            self.difficulties_select['values'] = list_difficulties(self.song_id.get())
+        except configparser.NoOptionError:
             cache.set('cache', 'songid', '')
             self.song_id.set('')
             self.difficulties_select['values'] = []
@@ -280,14 +331,11 @@ class App(ttk.Frame):
         print(serial)
 
     def song_selected(self, event):
-        songid = event.widget.get()
-        difficulties = [file[6:-5] for file in os.listdir(os.path.join('./Assets/Tracks', songid)) if 'ans' not in file]
-        self.difficulties_select['values'] = difficulties
+        self.difficulties_select['values'] = list_difficulties(event.widget.get())
 
     def difficulty_selected(self, event):
-        difficulty = event.widget.get()
         algos = ['algo1', 'algo2']
-        if os.path.exists(f'./Assets/Tracks/{self.song_id.get()}/Chart_{difficulty}.json.ans.json'):
+        if has_ans_cache(self.song_id.get(), event.widget.get()):
             algos.insert(0, '不规划(使用缓存)')
         self.algo_select['values'] = algos
 
@@ -295,7 +343,7 @@ class App(ttk.Frame):
         try:
             import time
 
-            chart_path = f'./Assets/Tracks/{self.song_id.get()}/Chart_{self.difficulty.get()}.json'
+            chart_path = find_chart_path(self.song_id.get(), self.difficulty.get())
 
             chart = Chart.from_dict(json.load(open(chart_path)))
 
