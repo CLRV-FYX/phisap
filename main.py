@@ -381,6 +381,22 @@ class App(ttk.Frame):
             raise ValueError(f'无法识别的屏幕尺寸"{text}"，请输入 宽×高 的形式，例如 1920×1080')
         return int(m.group(1)), int(m.group(2))
 
+    def resolve_serial(self) -> str:
+        """确定要连接的设备：优先使用界面中选择的设备；未选择时仅在只有一台设备时自动选中"""
+        serial = (self.serial.get() or '').strip()
+        devices = DeviceController.get_devices()
+        self.serial_select['values'] = devices
+        if serial:
+            if serial not in devices:
+                raise RuntimeError(f'所选设备 {serial} 当前未连接（已连接: {devices or "无"}）\n请检查连接后点"刷新"重新选择。')
+            return serial
+        if not devices:
+            raise RuntimeError('未检测到任何设备，请连接手机（开启USB调试）或启动模拟器后点"刷新"。')
+        if len(devices) > 1:
+            raise RuntimeError(f'检测到多个设备: {", ".join(devices)}\n请先在"设备Serial"中选择要使用的设备。')
+        self.serial.set(devices[0])
+        return devices[0]
+
     def adb_serial_selected(self, event):
         serial = event.widget.get()
         print(serial)
@@ -397,6 +413,9 @@ class App(ttk.Frame):
     def run(self):
         try:
             import time
+
+            # 先确定设备再规划，避免规划完才发现设备有问题
+            serial = self.resolve_serial()
 
             chart_path = find_chart_path(self.song_id.get(), self.difficulty.get())
 
@@ -433,8 +452,14 @@ class App(ttk.Frame):
             else:
                 raise RuntimeError(f'unknown algo_method: {algo_method}')
 
+            if self.controller is not None and self.controller.serial != serial:
+                # 用户切换了设备：断开旧连接
+                self.controller.close()
+                self.controller = None
+
             if self.controller is None:
-                self.controller = DeviceController()
+                print('[client]', f'正在连接设备: {serial}')
+                self.controller = DeviceController(serial)
 
                 # 在初次连接设备时等待三秒钟，确保获取到正确的视频尺寸
                 # 或许可以用一个线程锁？不过暂时没必要搞得这么复杂
@@ -594,8 +619,9 @@ class App(ttk.Frame):
 
                 self.go['command'] = go_now
                 self.update()
-        except Exception:
-            self.console.print_exception(show_locals=True)
+        except Exception as e:
+            self.console.print_exception()
+            messagebox.showerror('phisap', f'{e.__class__.__name__}: {e}')
 
 
 def _report_crash(exc_type, exc_value, exc_tb) -> None:

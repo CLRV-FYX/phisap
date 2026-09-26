@@ -37,9 +37,20 @@ class DeviceController:
             )
         server_file = os.path.join(server_dir, 'scrcpy-server-v2.0')
         server_version = '2.0'
+        def adb_run(*args: str) -> None:
+            r = subprocess.run([*adb, *args], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout or '').strip()
+                hint = ''
+                if 'more than one device' in detail:
+                    hint = '\n\n检测到多个设备/模拟器，请先在界面的"设备Serial"中选择要使用的设备。'
+                elif 'not found' in detail or 'offline' in detail or 'no devices' in detail:
+                    hint = '\n\n设备未连接或已离线，请检查USB调试/模拟器adb连接后点"刷新"。'
+                raise RuntimeError(f'adb 命令执行失败: adb {" ".join(args)}\n{detail}{hint}')
+
         if push_server:
-            subprocess.run([*adb, 'push', server_file, '/data/local/tmp/scrcpy-server.jar'])
-        subprocess.run([*adb, 'reverse', f'localabstract:scrcpy_{self.session_id}', f'tcp:{port}'])
+            adb_run('push', server_file, '/data/local/tmp/scrcpy-server.jar')
+        adb_run('reverse', f'localabstract:scrcpy_{self.session_id}', f'tcp:{port}')
         skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         skt.bind(('localhost', port))
@@ -60,10 +71,24 @@ class DeviceController:
         self.server_process = subprocess.Popen(command_line)
         # 由于我们指定了audio=false，所以这只有两个socket
         # 其实本来audio streaming可以用于对齐时钟，不过可惜只支持Android 11及以上
-        self.video_socket, _ = skt.accept()
-        self.control_socket, _ = skt.accept()
+        # 设置超时：scrcpy-server启动失败时不再无限等待（否则界面会卡死）
+        skt.settimeout(15)
+        try:
+            self.video_socket, _ = skt.accept()
+            self.control_socket, _ = skt.accept()
+        except socket.timeout:
+            self.server_process.kill()
+            subprocess.run([*adb, 'reverse', '--remove', f'localabstract:scrcpy_{self.session_id}'], capture_output=True)
+            raise RuntimeError(
+                '等待设备端scrcpy-server连接超时(15秒)。\n'
+                '请查看控制台中scrcpy-server的输出信息，并确认设备已解锁、已开启USB调试。'
+            )
+        finally:
+            skt.close()
+        self.video_socket.settimeout(None)
+        self.control_socket.settimeout(None)
         subprocess.run(
-            [*adb, 'reverse', '--remove', f'localabstract:scrcpy_{self.session_id}']
+            [*adb, 'reverse', '--remove', f'localabstract:scrcpy_{self.session_id}'], capture_output=True
         )  # 移除创建的adb tunnel，我们不再需要它了
 
         self.collector_running = True
@@ -86,7 +111,8 @@ class DeviceController:
                             break
                         break
             except Exception as e:
-                print(e.with_traceback(None))
+                if self.collector_running:  # 主动close()时不打印
+                    print(e.with_traceback(None))
                 self.collector_running = False
 
         def ctrlmsg_receiver():
@@ -99,7 +125,8 @@ class DeviceController:
                     size = int.from_bytes(self.control_socket.recv(4), 'big')
                     self.control_socket.recv(size)
             except Exception as e:
-                print(e.with_traceback(None))
+                if self.collector_running:  # 主动close()时不打印
+                    print(e.with_traceback(None))
                 self.collector_running = False
 
         _device_name = self.video_socket.recv(64)  # sendDeviceMeta
@@ -138,6 +165,19 @@ class DeviceController:
         self.touch(x, y, TouchAction.DOWN, pointer_id)
         time.sleep(delay)
         self.touch(x, y, TouchAction.UP, pointer_id)
+
+    def close(self) -> None:
+        '''断开与设备的连接（切换设备时使用）'''
+        self.collector_running = False
+        for skt in (getattr(self, 'video_socket', None), getattr(self, 'control_socket', None)):
+            try:
+                skt and skt.close()
+            except OSError:
+                pass
+        try:
+            self.server_process.kill()
+        except Exception:
+            pass
 
     @staticmethod
     def get_devices() -> list[str]:
