@@ -87,13 +87,14 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
         + 大小约为1.3GB
         + 使用`adb pull`或者文件管理器直接复制出来即可
     + 当然，如果你不想手动提取，也可以直接去网上下载一个phigros的安装包或数据包，注意版本对应即可
-4. 准备服务端。请去[scrcpy的releases页面](https://github.com/Genymobile/scrcpy/releases) 下载`scrcpy-server-v2.0`，不要下载成别的版本。下载完成后，请将文件直接放置在phisap的根目录（与`main.py`之类的文件在同一文件夹即可），不要更改文件的名称（比如添加后缀），否则phisap将无法识别。
-    + 如果你使用*nix系统，且安装有wget，那么下面这段命令与上面描述的操作等效:
+4. 准备服务端。`scrcpy-server-v2.0` 已随本仓库提供（与`main.py`同目录），**无需单独下载**。
+    + 请确认你使用的scrcpy-server版本为`v2.0`——phisap的协议实现与2.0对应，使用其他版本（包括v4.x）将无法连接
+    + 如果该文件缺失（比如你从别处复制了不完整的目录），可以用下面的命令补全:
         ```bash
         cd phisap  # 定位到phisap的根目录下
         wget https://github.com/Genymobile/scrcpy/releases/download/v2.0/scrcpy-server-v2.0
         ```
-    + **Windows用户**: 直接双击`start.cmd`即可，它会自动安装依赖、检查/下载`scrcpy-server-v2.0`并启动phisap（前提是已安装Python 3.11并加入了PATH）
+        Windows用户直接双击`start.cmd`，它会在文件缺失时自动下载
 
 ### 运行
 **Windows**: 双击`start.cmd`（首次运行会自动安装依赖并下载`scrcpy-server-v2.0`）
@@ -203,7 +204,8 @@ phisap并没有对课题模式做特殊的支持，将来也许会有
 + 屏幕尺寸适配
     + 逻辑画布`1280×720`改为按contain方式居中适配到实际屏幕尺寸，修复非16:9屏幕（如`2400×1080`、`1080×2400`）下坐标偏移错误的问题
     + 界面新增"屏幕尺寸"选项：默认自动检测，也可选择常见预设（如`1920×1080`）或手动输入`宽×高`，设置自动保存
-+ 新增Windows一键启动脚本`start.cmd`：自动检查Python、安装依赖、检查/下载`scrcpy-server-v2.0`、提示adb缺失，并启动phisap
++ 新增Windows一键启动脚本`start.cmd`：自动检查Python、安装依赖、检查/补全`scrcpy-server-v2.0`、提示adb缺失，并启动phisap
++ 官方`scrcpy-server-v2.0`已直接提交进仓库，开箱即用（phisap仅支持scrcpy 2.0协议，`control.py`现已严格锁定v2.0，目录中混有其他版本时也不会误用）
 + 新增`tests/test_catalog.py`（catalog格式识别与新版解析单元测试）
 ### (2023/08/02)
 + 最近的更新导致了一些问题，比如在部分设备上，原本可以AP的曲目全部AP失败

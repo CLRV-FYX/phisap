@@ -27,9 +27,16 @@ class DeviceController:
         self.serial = serial
         adb = ('adb',) if serial is None else ('adb', '-s', serial)
         self.session_id = format(random.randint(0, 0x7FFFFFFF), '08x')
-        server_file = next(filter(lambda p: p.startswith('scrcpy-server-v'), os.listdir(server_dir)))
-        server_file = os.path.join(server_dir, server_file)
-        server_version = server_file.split('v')[-1]
+        # phisap的协议实现仅与scrcpy 2.0兼容，严格选择v2.0（目录中可能同时存在其他版本）
+        candidates = [p for p in os.listdir(server_dir) if p.startswith('scrcpy-server-v')]
+        if 'scrcpy-server-v2.0' not in candidates:
+            raise FileNotFoundError(
+                f'未找到scrcpy-server-v2.0（phisap目前仅支持scrcpy 2.0协议）。\n'
+                f'当前目录中的scrcpy-server文件: {candidates or "无"}\n'
+                f'请从 https://github.com/Genymobile/scrcpy/releases/tag/v2.0 下载'
+            )
+        server_file = os.path.join(server_dir, 'scrcpy-server-v2.0')
+        server_version = '2.0'
         if push_server:
             subprocess.run([*adb, 'push', server_file, '/data/local/tmp/scrcpy-server.jar'])
         subprocess.run([*adb, 'reverse', f'localabstract:scrcpy_{self.session_id}', f'tcp:{port}'])

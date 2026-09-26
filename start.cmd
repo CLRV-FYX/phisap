@@ -23,7 +23,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/4] 检查 scrcpy-server...
+echo [2/4] 检查 scrcpy-server（已随仓库提供，缺失时自动下载）...
 if exist scrcpy-server-v2.0 (
     for %%F in (scrcpy-server-v2.0) do if %%~zF==0 del scrcpy-server-v2.0
 )
