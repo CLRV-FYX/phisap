@@ -452,8 +452,8 @@ class App(ttk.Frame):
             else:
                 raise RuntimeError(f'unknown algo_method: {algo_method}')
 
-            if self.controller is not None and self.controller.serial != serial:
-                # 用户切换了设备：断开旧连接
+            if self.controller is not None and (self.controller.serial != serial or not self.controller.collector_running):
+                # 用户切换了设备，或上次的连接已中断：断开旧连接后重连
                 self.controller.close()
                 self.controller = None
 
@@ -461,14 +461,15 @@ class App(ttk.Frame):
                 print('[client]', f'正在连接设备: {serial}')
                 self.controller = DeviceController(serial)
 
-                # 在初次连接设备时等待三秒钟，确保获取到正确的视频尺寸
-                # 或许可以用一个线程锁？不过暂时没必要搞得这么复杂
-                print('[client]', '正在确认设备尺寸，请稍候')
-                time.sleep(3)
-                print('[client]', f'设备尺寸: {self.controller.device_width}x{self.controller.device_height}')
-
+            # 视频尺寸由 scrcpy-server 在连接时直接告知，触控坐标以此为坐标系
             device_width = self.controller.device_width
             device_height = self.controller.device_height
+            if device_height > device_width and not messagebox.askyesno(
+                    '设备为竖屏',
+                    f'设备当前为竖屏({device_width}x{device_height})。\n'
+                    'Phigros 是横屏游戏，请先在设备上打开 Phigros 并进入选曲/游戏界面，再点"开始"，'
+                    '否则触控坐标会错位。\n\n仍然继续吗？'):
+                return
 
             width, height = self.resolve_screen_size(device_width, device_height)
 
@@ -479,8 +480,12 @@ class App(ttk.Frame):
             yoffset = (height - 720 * scale_factor) / 2
             print('[client]', f'屏幕尺寸: {width}x{height}, 缩放: {scale_factor:.4f}, 偏移: ({xoffset:.1f},{yoffset:.1f})')
 
+            # 手动指定屏幕尺寸时，换算到 scrcpy 视频坐标系（两者一致时 sx=sy=1）
+            sx, sy = device_width / width, device_height / height
+            if (width, height) != (device_width, device_height):
+                print('[client]', f'视频尺寸 {device_width}x{device_height} 与屏幕尺寸不同，坐标按 {sx:.4f}x{sy:.4f} 换算')
             adapted_ans = [
-                (timestamp, [ev.map_to(xoffset, yoffset, scale_factor, scale_factor) for ev in ans[timestamp]])
+                (timestamp, [ev.map_to(xoffset * sx, yoffset * sy, scale_factor * sx, scale_factor * sy) for ev in ans[timestamp]])
                 for timestamp in sorted(ans.keys())
             ]
 

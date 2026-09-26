@@ -78,12 +78,13 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
         + 点击程序左上角"导入谱面"按钮，选择一个或多个json文件，按提示输入曲目ID（谱面将保存为`./Assets/Tracks/<曲目ID>/Chart_<难度>.json`）
         + 直接把json文件放入`./Assets/Tracks/<曲目ID>/`目录（可点"打开谱面目录"按钮定位），文件名需含难度（如`Chart_AT.json`）
     + 谱面json请使用你自己的渠道获取（如PEConverter等工具导出）。phisap本身不附带、不传播任何版权谱面数据
-4. 准备服务端。`scrcpy-server-v2.0` 已随本仓库提供（与`main.py`同目录），**无需单独下载**。
-    + 请确认你使用的scrcpy-server版本为`v2.0`——phisap的协议实现与2.0对应，使用其他版本（包括v4.x）将无法连接
+4. 准备服务端。`scrcpy-server-v4.1` 已随本仓库提供（与`main.py`同目录），**无需单独下载**。
+    + phisap的协议实现与scrcpy `v4.1`严格对应（server会校验版本号），请勿替换为其他版本
+    + v4.1支持Android 5 ~ 16（旧版phisap使用的v2.0在Android 14/15上会崩溃，如MuMu模拟器的Android 15镜像）
     + 如果该文件缺失（比如你从别处复制了不完整的目录），可以用下面的命令补全:
         ```bash
         cd phisap  # 定位到phisap的根目录下
-        wget https://github.com/Genymobile/scrcpy/releases/download/v2.0/scrcpy-server-v2.0
+        wget https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1
         ```
         Windows用户直接双击`start.cmd`，它会在文件缺失时自动下载
 
@@ -96,7 +97,7 @@ cd phisap # 将CWD(Current Working Directory，当前工作目录)设置为phisa
 python main.py
 ```
 
-**屏幕尺寸**: phisap会将Phigros的`1280×720`逻辑画布按16:9居中适配(contain)到实际屏幕，非16:9屏幕（如`2400×1080`）自动留边。屏幕尺寸默认自动检测，如果检测不准，可以在程序界面的"屏幕尺寸"一栏选择常见预设（如`1920×1080`），也可以直接手动输入`宽×高`（如`1290×2712`），设置会被记住
+**屏幕尺寸**: 连接设备后phisap会从scrcpy获取当前屏幕尺寸，**请先在设备上打开Phigros（横屏）再点"开始"**。phisap会将Phigros的`1280×720`逻辑画布按16:9居中适配(contain)到实际屏幕，非16:9屏幕（如`2400×1080`）自动留边。屏幕尺寸默认自动检测，如果检测不准，可以在程序界面的"屏幕尺寸"一栏选择常见预设（如`1920×1080`），也可以直接手动输入`宽×高`（如`1290×2712`），设置会被记住
 
 ## 工作原理
 + 读取谱面库（`./Assets/Tracks/<曲目ID>/`）中的谱面文件；RPE谱面在导入时已转换为v3格式
@@ -202,6 +203,7 @@ phisap并没有对课题模式做特殊的支持，将来也许会有
     + 界面新增"屏幕尺寸"选项：默认自动检测，也可选择常见预设（如`1920×1080`）或手动输入`宽×高`，设置自动保存
 + 新增Windows一键启动脚本`start.cmd`：自动检查Python、安装依赖、检查/补全`scrcpy-server-v2.0`、提示adb缺失，并启动phisap
 + 官方`scrcpy-server-v2.0`已直接提交进仓库，开箱即用（phisap仅支持scrcpy 2.0协议，`control.py`现已严格锁定v2.0，目录中混有其他版本时也不会误用）
++ 服务端升级为`scrcpy-server-v4.1`，支持Android 14/15/16（v2.0在这些版本上崩溃）；屏幕尺寸改为读取scrcpy v4协议的会话包，不再解码视频，移除了`av`(PyAV)依赖
 + 新增`tests/test_catalog.py`（catalog格式识别与新版解析单元测试）
 ### (2023/08/02)
 + 最近的更新导致了一些问题，比如在部分设备上，原本可以AP的曲目全部AP失败

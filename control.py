@@ -6,9 +6,40 @@ import time
 import random
 import os
 
-import av
-
 from algo.algo_base import TouchAction
+
+# phisap 使用的 scrcpy-server 版本（协议与版本严格对应，server 会校验版本号）
+# v4.1 支持 Android 5 ~ Android 16；旧的 v2.0 在 Android 14/15 上会因 SurfaceControl.createDisplay 被移除而崩溃
+SCRCPY_VERSION = '4.1'
+SCRCPY_SERVER_FILE = f'scrcpy-server-v{SCRCPY_VERSION}'
+SCRCPY_SERVER_URL = f'https://github.com/Genymobile/scrcpy/releases/download/v{SCRCPY_VERSION}/{SCRCPY_SERVER_FILE}'
+
+# 视频流帧头/会话包标志位（scrcpy v4 协议，见 scrcpy doc/develop.md "Video and audio"）
+_PACKET_FLAG_SESSION = 1 << 63
+
+
+class ServerDisconnected(ConnectionError):
+    pass
+
+
+def _recv_exact(skt: socket.socket, n: int) -> bytes:
+    '''读满n字节；对端关闭时抛出ServerDisconnected（socket.recv可能只返回部分数据）'''
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = skt.recv(n - len(buf))
+        if not chunk:
+            raise ServerDisconnected('scrcpy-server 已断开连接')
+        buf += chunk
+    return bytes(buf)
+
+
+def _skip_exact(skt: socket.socket, n: int) -> None:
+    '''丢弃n字节'''
+    while n > 0:
+        chunk = skt.recv(min(n, 65536))
+        if not chunk:
+            raise ServerDisconnected('scrcpy-server 已断开连接')
+        n -= len(chunk)
 
 
 class DeviceController:
@@ -27,16 +58,12 @@ class DeviceController:
         self.serial = serial
         adb = ('adb',) if serial is None else ('adb', '-s', serial)
         self.session_id = format(random.randint(0, 0x7FFFFFFF), '08x')
-        # phisap的协议实现仅与scrcpy 2.0兼容，严格选择v2.0（目录中可能同时存在其他版本）
-        candidates = [p for p in os.listdir(server_dir) if p.startswith('scrcpy-server-v')]
-        if 'scrcpy-server-v2.0' not in candidates:
+        server_file = os.path.join(server_dir, SCRCPY_SERVER_FILE)
+        if not os.path.isfile(server_file) or os.path.getsize(server_file) == 0:
             raise FileNotFoundError(
-                f'未找到scrcpy-server-v2.0（phisap目前仅支持scrcpy 2.0协议）。\n'
-                f'当前目录中的scrcpy-server文件: {candidates or "无"}\n'
-                f'请从 https://github.com/Genymobile/scrcpy/releases/tag/v2.0 下载'
+                f'未找到 {SCRCPY_SERVER_FILE}（phisap 需要与之严格对应的 scrcpy {SCRCPY_VERSION} 服务端）。\n'
+                f'请运行 start.cmd 自动下载，或手动下载后放到 main.py 同目录:\n{SCRCPY_SERVER_URL}'
             )
-        server_file = os.path.join(server_dir, 'scrcpy-server-v2.0')
-        server_version = '2.0'
         def adb_run(*args: str) -> None:
             r = subprocess.run([*adb, *args], capture_output=True, text=True, encoding='utf-8', errors='replace')
             if r.returncode != 0:
@@ -62,11 +89,15 @@ class DeviceController:
             'app_process',
             '/',
             'com.genymobile.scrcpy.Server',
-            server_version,
+            SCRCPY_VERSION,
             f'scid={self.session_id}',
             'log_level=info',
             'audio=false',
             'clipboard_autosync=false',
+            # phisap 只需要视频流中的屏幕尺寸信息，不需要画面：
+            # 降低帧率和码率以减轻设备/模拟器的编码负担，避免影响打歌时序
+            'max_fps=5',
+            'video_bit_rate=500000',
         ]
         self.server_process = subprocess.Popen(command_line)
         # 由于我们指定了audio=false，所以这只有两个socket
@@ -92,67 +123,93 @@ class DeviceController:
         )  # 移除创建的adb tunnel，我们不再需要它了
 
         self.collector_running = True
+        self.device_width = 0
+        self.device_height = 0
+        self._size_changed = threading.Event()
 
-        def streaming_decoder():
-            '''解码手机端传回的视频数据，得到视频的尺寸'''
-            codec = av.CodecContext.create('h264', 'r')
+        def server_error_hint() -> str:
+            time.sleep(0.5)
+            code = self.server_process.poll()
+            state = f'(scrcpy-server 进程已退出，返回值 {code})' if code is not None else ''
+            return (
+                f'与设备端 scrcpy-server 的连接中断{state}。\n'
+                '请查看控制台中以 [server] 开头的报错信息。\n'
+                '常见原因: 设备/模拟器的 Android 版本不受支持、设备锁屏、或同时运行了其他 scrcpy 实例。'
+            )
+
+        # ---- 握手：device meta(64字节设备名) + codec id(4字节) + 首个会话包(视频尺寸) ----
+        self.video_socket.settimeout(15)
+        try:
+            device_name = _recv_exact(self.video_socket, 64).rstrip(b'\0').decode('utf-8', 'replace')
+            codec_id = _recv_exact(self.video_socket, 4).lstrip(b'\0').decode('ascii', 'replace')
+            while True:
+                header = _recv_exact(self.video_socket, 12)
+                flags = int.from_bytes(header[:8], 'big')
+                if flags & _PACKET_FLAG_SESSION:
+                    self.device_width = int.from_bytes(header[4:8], 'big')
+                    self.device_height = int.from_bytes(header[8:12], 'big')
+                    break
+                _skip_exact(self.video_socket, int.from_bytes(header[8:12], 'big'))  # 会话包之前的数据包，丢弃
+        except (ServerDisconnected, OSError) as e:
+            self.close()
+            raise RuntimeError(server_error_hint()) from e
+        self.video_socket.settimeout(None)
+
+        if not (self.device_width > 0 and self.device_height > 0):
+            self.close()
+            raise RuntimeError(f'从 scrcpy-server 获取到的屏幕尺寸无效: {self.device_width}x{self.device_height}')
+
+        print('[client]', f'设备: {device_name}, 视频尺寸 = {self.device_width}x{self.device_height}, codec = {codec_id}')
+
+        def video_receiver():
+            '''持续读取视频流（必须读走，否则设备端会阻塞），只解析会话包中的尺寸，画面数据直接丢弃。
+            设备旋转时会收到新的会话包。'''
             try:
                 while self.collector_running:
-                    _pts = self.video_socket.recv(8)  # unused
-                    size = int.from_bytes(self.video_socket.recv(4), 'big')
-                    packets = codec.parse(self.video_socket.recv(size))
-                    for packet in packets:
-                        frames = codec.decode(packet)
-                        for frame in frames:
-                            if self.device_width != frame.width or self.device_height != frame.height:
-                                print('[client]', f'device_size: {self.device_width}x{self.device_height} -> {frame.width}x{frame.height}')
-                                self.device_width = frame.width
-                                self.device_height = frame.height
-                            break
-                        break
+                    header = _recv_exact(self.video_socket, 12)
+                    flags = int.from_bytes(header[:8], 'big')
+                    if flags & _PACKET_FLAG_SESSION:
+                        w = int.from_bytes(header[4:8], 'big')
+                        h = int.from_bytes(header[8:12], 'big')
+                        if (w, h) != (self.device_width, self.device_height):
+                            print('[client]', f'视频尺寸变化(设备旋转?): {self.device_width}x{self.device_height} -> {w}x{h}')
+                            self.device_width, self.device_height = w, h
+                            self._size_changed.set()
+                    else:
+                        _skip_exact(self.video_socket, int.from_bytes(header[8:12], 'big'))
             except Exception as e:
                 if self.collector_running:  # 主动close()时不打印
-                    print(e.with_traceback(None))
+                    print('[client]', f'视频流中断: {e}')
                 self.collector_running = False
 
         def ctrlmsg_receiver():
-            '''另一个垃圾收集器
-            收集的是scrcpy-server传来的控制事件的信息，
-            比如屏幕旋转事件等'''
+            '''读走 scrcpy-server 通过控制通道发来的消息（剪贴板等），phisap 不需要，直接丢弃'''
             try:
                 while self.collector_running:
-                    _msg_type = self.control_socket.recv(1)
-                    size = int.from_bytes(self.control_socket.recv(4), 'big')
-                    self.control_socket.recv(size)
+                    if not self.control_socket.recv(4096):
+                        break
             except Exception as e:
-                if self.collector_running:  # 主动close()时不打印
-                    print(e.with_traceback(None))
-                self.collector_running = False
+                if self.collector_running:
+                    print('[client]', f'控制通道中断: {e}')
+            self.collector_running = False
 
-        _device_name = self.video_socket.recv(64)  # sendDeviceMeta
-
-        # streamer.writeVideoHeader(device.getScreenInfo().getVideoSize())
-        codec_id = self.video_socket.recv(4).decode()
-        self.device_width = int.from_bytes(self.video_socket.recv(4), 'big')
-        self.device_height = int.from_bytes(self.video_socket.recv(4), 'big')
-
-        print('[client]', f'device_size = {self.device_width}x{self.device_height}, codec_id = {codec_id}')
-
-        self.streaming_collector = threading.Thread(target=streaming_decoder, daemon=True)
+        self.streaming_collector = threading.Thread(target=video_receiver, daemon=True)
         self.streaming_collector.start()
 
         self.control_collector = threading.Thread(target=ctrlmsg_receiver, daemon=True)
         self.control_collector.start()
 
-    def touch(self, x: int, y: int, action: TouchAction, pointer_id: int) -> None:
-        self.control_socket.send(
+    def touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> None:
+        # 坐标系为当前视频尺寸(device_width x device_height)，scrcpy-server 会映射到实际屏幕；
+        # 尺寸与 server 当前视频尺寸不一致的事件会被 server 丢弃
+        self.control_socket.sendall(
             struct.pack(
                 '!bbQiiHHHII',
                 2,  # type: SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
                 action.value,
                 pointer_id,
-                x,
-                y,
+                int(round(x)),
+                int(round(y)),
                 self.device_width,
                 self.device_height,
                 0xFFFF,  # pressure
