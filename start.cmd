@@ -63,10 +63,13 @@ if errorlevel 1 (
 
 echo.
 echo [4/4] 启动 phisap...
-where pythonw >nul 2>nul
+echo      运行日志和报错信息会显示在本窗口中，请不要关闭本窗口（关闭会同时退出 phisap）。
+echo.
+python main.py
 if errorlevel 1 (
-    start "" python main.py
-) else (
-    start "" pythonw main.py
+    echo.
+    echo [错误] phisap 异常退出，请查看上面的报错信息（也已保存到 phisap_error.log）。
+    pause
+    exit /b 1
 )
 exit /b 0

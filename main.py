@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
-from tkinter import ttk, messagebox, Tk, X, IntVar, StringVar, DoubleVar, filedialog, simpledialog
+from tkinter import ttk, messagebox, Tk, W, X, IntVar, StringVar, DoubleVar, filedialog, simpledialog
 from typing import Iterator
 from algo.algo_base import TouchEvent
 from threading import Thread
@@ -22,7 +22,7 @@ def agreement():
     if os.path.exists('./cache'):
         return
     if not messagebox.askyesno(title='用户协定', message='您因使用或修改本程序发生的一切后果将由您自己承担而与程序原作者无关。\n' '您是否同意？'):
-        exit(1)
+        sys.exit(0)
 
 
 # 从谱面文件名识别难度。兼容: Chart_AT.json / Chart_AT #4159.json / chart_at_4159.json /
@@ -584,7 +584,39 @@ class App(ttk.Frame):
             self.console.print_exception(show_locals=True)
 
 
+def _report_crash(exc_type, exc_value, exc_tb) -> None:
+    '''未捕获异常处理：写入 phisap_error.log 并弹窗提示
+    （使用 pythonw 启动时没有控制台，否则程序会无声无息地退出）'''
+    import traceback
+
+    text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        sys.__stderr__ and sys.__stderr__.write(text)
+    except Exception:
+        pass
+    log_path = os.path.abspath('phisap_error.log')
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except OSError:
+        log_path = '(日志写入失败)'
+    try:
+        messagebox.showerror('phisap 出错了', f'{exc_type.__name__}: {exc_value}\n\n完整错误信息已保存到:\n{log_path}')
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
-    tk = Tk()
-    tk.title('phisap')
-    App(tk).load_songs().load_cache('./cache').detect_adb_devices().mainloop()
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    sys.excepthook = _report_crash
+    try:
+        tk = Tk()
+        tk.title('phisap')
+        # Tk 回调（按钮等）中的异常默认只打印到 stderr，pythonw 下不可见
+        tk.report_callback_exception = _report_crash
+        App(tk).load_songs().load_cache('./cache').detect_adb_devices().mainloop()
+    except SystemExit:
+        raise
+    except BaseException:
+        _report_crash(*sys.exc_info())
+        sys.exit(1)
