@@ -111,6 +111,7 @@ def import_charts(app: 'App') -> None:
     if not paths:
         return
     results: list[str] = []
+    last_imported: tuple[str, str] | None = None
     last_songid = app.song_id.get()
     top = app.winfo_toplevel()
 
@@ -165,6 +166,7 @@ def import_charts(app: 'App') -> None:
                 shutil.copyfile(path, target)
                 note = f'官谱v{data["formatVersion"]}原样保存'
             results.append(f'✓ {name} → {target} ({note})')
+            last_imported = (songid, diff)
         except Exception as e:
             results.append(f'✗ {name}: 写入失败({e.__class__.__name__}: {e})')
             continue
@@ -172,6 +174,10 @@ def import_charts(app: 'App') -> None:
             results.append(f'    [warn] {w}')
 
     app.refresh_songs()
+    if last_imported:
+        app.song_id.set(last_imported[0])
+        app.difficulty.set(last_imported[1])
+        app.refresh_difficulties()
     messagebox.showinfo('导入完成', '\n'.join(results), parent=top)
 
 
@@ -330,22 +336,16 @@ class App(ttk.Frame):
         if not cache.has_section('cache'):
             cache.add_section('cache')
 
-        try:
-            self.song_id.set(cache.get('cache', 'songid'))
-            self.difficulties_select['values'] = list_difficulties(self.song_id.get())
-        except configparser.NoOptionError:
-            cache.set('cache', 'songid', '')
-            self.song_id.set('')
-            self.difficulties_select['values'] = []
-
-        try:
-            self.difficulty.set(difficulty := cache.get('cache', 'difficulty'))
-            algos = ['algo1', 'algo2']
-            if os.path.exists(f'./Assets/Tracks/{self.song_id.get()}/Chart_{difficulty}.json.ans.json'):
-                algos.insert(0, '不规划(使用缓存)')
-            self.algo_select['values'] = algos
-        except configparser.NoOptionError:
-            cache.set('cache', 'difficulty', '')
+        for key in ('songid', 'difficulty', 'algo'):
+            if not cache.has_option('cache', key):
+                cache.set('cache', key, '')
+        songid = cache.get('cache', 'songid')
+        # 曲目可能已被删除：只恢复仍存在于谱面库中的曲目
+        songs = [str(v) for v in (self.songs_select['values'] or ())]
+        self.song_id.set(songid if songid in songs else '')
+        self.difficulty.set(cache.get('cache', 'difficulty'))
+        self.algo.set(cache.get('cache', 'algo'))
+        self.refresh_difficulties()
 
         try:
             self.delay.set(cache.getfloat('cache', 'offset'))
@@ -401,20 +401,44 @@ class App(ttk.Frame):
         serial = event.widget.get()
         print(serial)
 
+    ALGO_CACHED = '不规划(使用缓存)'
+
+    def refresh_difficulties(self):
+        """根据当前曲目刷新难度列表；当前难度无效时自动选中第一个难度，并刷新算法列表"""
+        songid = self.song_id.get()
+        diffs = list_difficulties(songid) if songid else []
+        self.difficulties_select['values'] = diffs
+        if self.difficulty.get() not in diffs:
+            self.difficulty.set(diffs[0] if diffs else '')
+        self.refresh_algos()
+
+    def refresh_algos(self):
+        """根据当前曲目/难度刷新算法列表；当前算法无效时自动选择默认算法（有规划缓存时默认使用缓存）"""
+        songid, diff = self.song_id.get(), self.difficulty.get()
+        algos = ['algo1', 'algo2']
+        if songid and diff and has_ans_cache(songid, diff):
+            algos.insert(0, self.ALGO_CACHED)
+        self.algo_select['values'] = algos
+        if self.algo.get() not in algos:
+            self.algo.set(algos[0])
+
     def song_selected(self, event):
-        self.difficulties_select['values'] = list_difficulties(event.widget.get())
+        self.refresh_difficulties()
 
     def difficulty_selected(self, event):
-        algos = ['algo1', 'algo2']
-        if has_ans_cache(self.song_id.get(), event.widget.get()):
-            algos.insert(0, '不规划(使用缓存)')
-        self.algo_select['values'] = algos
+        self.refresh_algos()
 
     def run(self):
         try:
             import time
 
-            # 先确定设备再规划，避免规划完才发现设备有问题
+            # 先检查选项和设备再规划，避免规划完才发现问题
+            if not self.song_id.get():
+                raise RuntimeError('请先选择曲目（谱面库为空时请先点击"导入谱面"）')
+            if not self.difficulty.get():
+                raise RuntimeError('请先选择难度')
+            if not self.algo.get():
+                self.refresh_algos()
             serial = self.resolve_serial()
 
             chart_path = find_chart_path(self.song_id.get(), self.difficulty.get())
@@ -428,13 +452,14 @@ class App(ttk.Frame):
             self.cache.set('cache', 'difficulty', self.difficulty.get())
             self.cache.set('cache', 'offset', str(self.delay.get()))
             self.cache.set('cache', 'screen', self.screen_size.get())
+            self.cache.set('cache', 'algo', self.algo.get())
             with open(self.cache_path, 'w', encoding='utf-8') as f:
                 self.cache.write(f)
 
             algo_method = self.algo.get()
             ans: dict
             ans_file = chart_path + '.ans.json'
-            if algo_method == '不规划(使用缓存)':
+            if algo_method == self.ALGO_CACHED:
                 with open(ans_file, encoding='utf-8') as f:
                     ans = load_from_json(f)
             elif algo_method == 'algo1':
@@ -450,7 +475,8 @@ class App(ttk.Frame):
                 with open(ans_file, 'w', encoding='utf-8') as f:
                     export_to_json(ans, f)
             else:
-                raise RuntimeError(f'unknown algo_method: {algo_method}')
+                raise RuntimeError(f'未知的规划算法: "{algo_method}"，请在"规划算法"中重新选择')
+            self.refresh_algos()
 
             if self.controller is not None and (self.controller.serial != serial or not self.controller.collector_running):
                 # 用户切换了设备，或上次的连接已中断：断开旧连接后重连
