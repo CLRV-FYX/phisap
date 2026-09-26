@@ -62,10 +62,10 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
 ## 如何使用
 
 ### 准备
-0. **请安装Python 3.11**
+0. **请安装Python 3.11或更高版本（3.12/3.13等均可）**
     + 请使用正式版，不要使用开发者预览(early developer preview)版
         + 如果你非要用，请使用`3.11.0a5`及以后的版本，否则你可能会遇到一些问题，见issue#71
-1. 使用`pip install -r requirements.txt`安装依赖
+1. 使用`pip install --prefer-binary -r requirements.txt`安装依赖（依赖`av`会直接下载预编译包，无需本地编译）
 2. 请安装`Android Debug Bridge`，**要求版本号至少为`1.0.41`**，并确保相应的环境变量已经配置好。
 3. 准备谱面文件（JSON）。**phisap当前为"谱面导入"模式：不解析游戏安装包，只需提供谱面json**
     + 支持**各版本官方谱面**（`formatVersion` 1/2/3，覆盖Phigros 2.x至3.20.0+，如`Chart_SP.json`、`Chart_AT #4159.json`），原样保存

@@ -8,16 +8,18 @@ echo [1/4] 检查 Python...
 where python >nul 2>nul
 if errorlevel 1 (
     echo [错误] 未检测到 Python。
-    echo        请先安装 Python 3.11 ，网址: https://www.python.org/downloads/
+    echo        请先安装 Python 3.11 或更高版本（64 位），网址: https://www.python.org/downloads/
     echo        安装时务必勾选 "Add Python to PATH"。
     pause
     exit /b 1
 )
 echo [OK] 检测到 Python，正在安装/更新依赖...
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install --prefer-binary --only-binary=av -r requirements.txt
 if errorlevel 1 (
     echo [错误] 依赖安装失败，请检查网络后重新运行本脚本。
+    echo        如果提示找不到 av 的可用版本，说明当前 Python 版本过新/过旧，
+    echo        请安装 Python 3.11 或更高版本（64 位）后重试。
     pause
     exit /b 1
 )
