@@ -1,12 +1,12 @@
 # 扫屏算法: 专用触点在屏幕上不停地高速来回扫动, drag(黄键)不再逐个规划;
-# flick(红键)由几个"滑键触点"负责: 它们提前按下(按下的时间/位置避开所有tap/hold), 之后不再抬起,
+# flick(红键)由几个"滑键触点"负责: 它们在第一个音符之前按下(避开所有tap/hold), 直到最后一个音符之后才抬起,
 # 只是滑到每个flick的位置快速划一下, 再滑到下一个; 其余触点按algo2的方式处理tap(蓝键)和hold。
 #
 # 为什么flick不能只靠扫屏: Phigros中"一根手指向一个方向滑动仅能判定一次"(见萌娘百科/sim-phi),
 # 触点必须先减速或换方向才能判定下一个flick。扫屏触点每次单程(约0.1秒)最多接一个flick,
 # 扫得再快也接不住成批的flick; 而游戏每帧只读一次触点位置, 扫得太快反而会跳过音符。
 # 滑键触点每划一个flick都换一次方向(滑向下一个flick的方向与上一次划的方向错开), 保证每次都是"新的一划"。
-# 滑键触点在整段flick期间一直按着, 不会重新按下, 所以不会误触附近的tap/hold。
+# 滑键触点全曲只按下一次, flick完全靠滑动判定, 不会重新按下(也就不会误触附近的tap/hold)。
 #
 # 两种布局:
 # + algo3 : 4个(10触点时3个)触点分别在不同高度的"行"上左右扫, 只在drag/flick前后扫
@@ -222,10 +222,12 @@ def plan_sweepers(chart: Chart, sweepers: list[Sweeper], intervals: list[list[in
 
 
 FLICK_FINGER_BASE = 2200
-FLICK_GROUP_GAP = 1500   # 相邻flick间隔小于此值时滑键触点保持按下
+FLICK_GROUP_GAP = 1500   # 相邻flick间隔小于此值时算作同一段(只用于统计)
 GLIDE_MS = 24            # 滑到下一个flick起点所用的时间(ms)
 FLICK_UPDATE_MS = 4      # 滑键触点的位置更新间隔(ms)
 FLICK_RELEASE_AFTER = 40
+WHOLE_SONG_BEFORE = 1000   # 滑键触点在第一个音符之前多久按下(ms)
+WHOLE_SONG_AFTER = 500     # 最后一个音符(含hold尾)之后多久抬起(ms)
 
 
 def flick_finger_count(max_pointers: int, sweepers: int = 0) -> int:
@@ -282,25 +284,29 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
             groups.append([it])
 
     unassigned = unsafe = 0
-    for group in groups:
-        fingers = [_Finger(FLICK_FINGER_BASE + k) for k in range(count)]
-        first_start = group[0][0] + FLICK_START - GLIDE_MS - SETTLE_MS
-        taken: list[tuple[float, float]] = []
-        for k, f in enumerate(fingers):
-            # 按下: 在第一个flick之前寻找不会误触tap/hold的时间和位置(各触点错开位置)
-            down_t, pos, safe = first_start, _GRID[(k * 37) % len(_GRID)], False
-            for dt in range(0, DOWN_SEARCH + 1, 10):
-                pts = [p for p in _safe_points(heads, first_start - dt, _GRID) if p not in taken]
-                if pts:
-                    down_t = first_start - dt
-                    pos = min(pts, key=lambda p: math.hypot(p[0] - 640, p[1] - 360) + 97 * k * (p[0] < 640))
-                    safe = True
-                    break
-            unsafe += not safe
-            taken.append(pos)
-            f.pos, f.free, f.down = pos, down_t + SETTLE_MS, True
-            events[down_t].append(VirtualTouchEvent(pos, TouchAction.DOWN, f.pid))
+    if not groups:
+        return events, 0
+    # 滑键触点全曲只按下一次: 第一个音符之前按下, 最后一个音符之后才抬起, 中间只滑动不抬起
+    times = _note_times(chart)
+    first_start = min(times[0][0] - WHOLE_SONG_BEFORE, groups[0][0][0] + FLICK_START - GLIDE_MS - SETTLE_MS)
+    fingers = [_Finger(FLICK_FINGER_BASE + k) for k in range(count)]
+    taken: list[tuple[float, float]] = []
+    for k, f in enumerate(fingers):
+        # 在不会误触tap/hold的时间和位置按下(各触点错开位置)
+        down_t, pos, safe = first_start, _GRID[(k * 37) % len(_GRID)], False
+        for dt in range(0, DOWN_SEARCH + 1, 10):
+            pts = [p for p in _safe_points(heads, first_start - dt, _GRID) if p not in taken]
+            if pts:
+                down_t = first_start - dt
+                pos = min(pts, key=lambda p: math.hypot(p[0] - 640, p[1] - 360) + 97 * k * (p[0] < 640))
+                safe = True
+                break
+        unsafe += not safe
+        taken.append(pos)
+        f.pos, f.free, f.down = pos, down_t + SETTLE_MS, True
+        events[down_t].append(VirtualTouchEvent(pos, TouchAction.DOWN, f.pid))
 
+    for group in groups:
         for t_ms, line, note in group:
             shift = flick_time_shift(line, note)
             s0 = t_ms + FLICK_START
@@ -335,9 +341,9 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
                 events[s0 + i].append(VirtualTouchEvent(path[i], TouchAction.MOVE, f.pid))
             f.pos, f.free, f.last_dir = path[-1], s0 + len(path), direction
 
-        end = max(f.free for f in fingers) + FLICK_RELEASE_AFTER
-        for f in fingers:
-            events[end].append(VirtualTouchEvent(f.pos, TouchAction.UP, f.pid))
+    end = max(max(f.free for f in fingers) + FLICK_RELEASE_AFTER, max(e for _, e in times) + WHOLE_SONG_AFTER)
+    for f in fingers:
+        events[end].append(VirtualTouchEvent(f.pos, TouchAction.UP, f.pid))
 
     if console is not None:
         console.print(f'滑键触点: {count}个, {len(groups)}段, 共{len(items)}个flick')

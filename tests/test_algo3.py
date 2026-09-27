@@ -292,6 +292,10 @@ class TestFlickBurst(unittest.TestCase):
                     t *= 1000   # 秒 -> 毫秒
                     last_down = max(d for d in downs[pid] if d <= t)
                     self.assertGreater(t - last_down, 60)
+            # 滑键触点全曲只按下一次
+            fingers = {p: d for p, d in downs.items() if p >= algo.algo3.FLICK_FINGER_BASE}
+            self.assertTrue(fingers)
+            self.assertTrue(all(len(d) == 1 for d in fingers.values()), fingers)
 
     def test_flick_path_fast_and_on_screen_near_edge(self):
         from algo.algo_base import FLICK_END, FLICK_RADIUS, FLICK_START, flick_path

@@ -15,7 +15,7 @@ MAX_POINTERS = 16
 # v2: 修正官谱/RPE转换谱的y方向、RPE缓动/多层/父线、长按与滑键跟随判定线、16触点
 # v3: 精简长按的MOVE事件; 新增algo3(扫屏)
 # v4: flick滑动加快到3像素/毫秒; algo3/algo3f的flick改为单独规划
-PLAN_CACHE_SUFFIX = '.ans.v5.json'
+PLAN_CACHE_SUFFIX = '.ans.v6.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
