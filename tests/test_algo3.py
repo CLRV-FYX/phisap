@@ -49,6 +49,10 @@ def drag_flick_chart():
     return chart_of(rot, ver, flat)
 
 
+def is_sweeper(pointer):
+    return 2000 <= pointer < algo.algo3.FLICK_FINGER_BASE
+
+
 class TestSweeper(unittest.TestCase):
     def test_drag_and_flick_on_any_angle(self):
         chart = drag_flick_chart()
@@ -86,7 +90,7 @@ class TestSweeper(unittest.TestCase):
     def test_sweepers_only_when_needed(self):
         chart = chart_of(line_dict([note(t, 0.0, 1) for t in range(0, 64, 8)] + [note(640, 0.0, 2)]))
         ans = algo.algo3.solve(chart, quiet(), 16)
-        sweep = sorted(ms for ms, evs in ans.items() for e in evs if e.pointer >= 2000)
+        sweep = sorted(ms for ms, evs in ans.items() for e in evs if is_sweeper(e.pointer))
         self.assertTrue(sweep)
         # drag在10秒: 扫屏只在它前后一小段时间内
         self.assertGreater(sweep[0], 10000 - 1000 - 2100)
@@ -100,7 +104,7 @@ class TestSweeper(unittest.TestCase):
                 tl = Timeline(ans)
                 self.assertEqual(tl.errors, [])
                 self.assertLessEqual(tl.max_active, mp)
-                ys = {e.pos[1] for evs in ans.values() for e in evs if e.pointer >= 2000}
+                ys = {e.pos[1] for evs in ans.values() for e in evs if is_sweeper(e.pointer)}
                 self.assertEqual(len(ys), rows)
                 # 行距小于判定宽度(302像素), 且覆盖到屏幕上下边缘附近
                 ys = sorted(ys)
@@ -144,7 +148,7 @@ class TestAxisSweeper(unittest.TestCase):
         out = {}
         for ms in sorted(ans):
             for e in ans[ms]:
-                if e.pointer >= 2000:
+                if is_sweeper(e.pointer):
                     out.setdefault(e.pointer, []).append((ms, e.action, e.pos))
         return out
 
@@ -260,13 +264,34 @@ class TestFlickBurst(unittest.TestCase):
 
     def test_bursts_with_strict_rule(self):
         chart = flick_burst_chart()
-        for name, solve in (('algo1', algo.algo1.solve), ('algo2', algo.algo2.solve), ('algo3', algo.algo3.solve),
-                            ('algo3f', algo.algo3f.solve)):
+        for name, solve in (('algo3', algo.algo3.solve), ('algo3f', algo.algo3f.solve)):
+            for mp in (16, 10):
+                ans = solve(chart, quiet(), mp)
+                self.assertLessEqual(Timeline(ans).max_active, mp)
+                for fps in (60, 30):
+                    for seed in range(3):
+                        with self.subTest(algo=name, max_pointers=mp, fps=fps, seed=seed):
+                            self.assertEqual(non_perfect(simulate(chart, ans, fps=fps, seed=seed, phigros=True)), {})
+
+    def test_flicks_never_by_fresh_press(self):
+        # flick只能靠滑动判定: 判定flick的触点必须早已按下, flick附近不能有新的按下
+        chart = flick_burst_chart()
+        for name, solve in (('algo3', algo.algo3.solve), ('algo3f', algo.algo3f.solve)):
             ans = solve(chart, quiet(), 16)
-            for fps in (60, 30):
-                for seed in range(3):
-                    with self.subTest(algo=name, fps=fps, seed=seed):
-                        self.assertEqual(non_perfect(simulate(chart, ans, fps=fps, seed=seed, strict_flick=True)), {})
+            downs = {}
+            for ms, evs in ans.items():
+                for e in evs:
+                    if e.action == TouchAction.DOWN:
+                        downs.setdefault(e.pointer, []).append(ms)
+            st = simulate(chart, ans, seed=0, phigros=True)
+            for n in st['notes']:
+                if n.kind != 'flick':
+                    continue
+                with self.subTest(algo=name, flick=n.t):
+                    pid, t = n.by
+                    t *= 1000   # 秒 -> 毫秒
+                    last_down = max(d for d in downs[pid] if d <= t)
+                    self.assertGreater(t - last_down, 60)
 
     def test_flick_path_fast_and_on_screen_near_edge(self):
         from algo.algo_base import FLICK_END, FLICK_RADIUS, FLICK_START, flick_path

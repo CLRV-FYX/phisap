@@ -15,7 +15,7 @@ MAX_POINTERS = 16
 # v2: 修正官谱/RPE转换谱的y方向、RPE缓动/多层/父线、长按与滑键跟随判定线、16触点
 # v3: 精简长按的MOVE事件; 新增algo3(扫屏)
 # v4: flick滑动加快到3像素/毫秒; algo3/algo3f的flick改为单独规划
-PLAN_CACHE_SUFFIX = '.ans.v4.json'
+PLAN_CACHE_SUFFIX = '.ans.v5.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -108,9 +108,9 @@ def flick_time_shift(line, note, console=None) -> float:
     return 0.0
 
 
-# flick的滑动: 判定时刻前后各30ms, 沿垂直于判定线的方向滑过 2*FLICK_RADIUS 像素(1280x720)。
-# 速度 3像素/毫秒(1080p屏幕上4.5像素/毫秒)。之前是1像素/毫秒, 刚好卡在"甩动"判定的速度门槛附近,
-# 按"一次滑动只能判定一个flick"的规则(sim-phi)模拟时大量漏判。
+# flick的滑动: 判定时刻前后各50ms, 沿垂直于判定线的方向滑过 2*FLICK_RADIUS 像素(1280x720)。
+# 速度 2像素/毫秒(1080p屏幕上3像素/毫秒)。之前是60ms滑60像素(1像素/毫秒), 刚好卡在"甩动"判定的
+# 速度门槛附近, 按"一次滑动只能判定一个flick"的规则(sim-phi)模拟时大量漏判。
 FLICK_START = -50
 FLICK_END = 50
 FLICK_RADIUS = 100
@@ -130,12 +130,13 @@ def _perpendicular_room(bx: float, by: float, nx: float, ny: float) -> tuple[flo
 
 
 def flick_path(line, note, center_ms: int, start: int, end: int, radius: float,
-               time_shift: float = 0.0) -> list[tuple[float, float]]:
+               time_shift: float = 0.0, reverse: bool = False) -> list[tuple[float, float]]:
     """flick的滑动轨迹: 返回 center_ms+start ... center_ms+end 每毫秒的位置。
 
     每一毫秒都按该时刻判定线的实际位置/角度计算(判定线在移动或旋转时手指跟着走),
     并沿垂直于判定线的方向滑过 2*radius 的距离(不改变在判定线方向上的投影, 所以不影响判定)。
     靠近屏幕边缘时, 整段轨迹沿垂直方向平移到屏幕内(而不是被截断在边缘上导致滑不动)。
+    reverse: 反方向滑动
     """
     path = []
     duration = end - start
@@ -147,7 +148,7 @@ def flick_path(line, note, center_ms: int, start: int, end: int, radius: float,
         lo, hi = lo + 1, hi - 1
         r = min(radius, max(0.0, (hi - lo) / 2))
         c = min(max(0.0, lo + r), hi - r) if hi - lo >= 2 * r else (lo + hi) / 2
-        s = c + r * (1 - 2 * (offset - start) / duration)
+        s = c + r * (1 - 2 * (offset - start) / duration) * (-1 if reverse else 1)
         path.append(clamp_to_screen((bx + nx * s, by + ny * s)))
     return path
 

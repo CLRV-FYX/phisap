@@ -13,6 +13,7 @@ from threading import Thread
 
 from chart import Chart
 from control import DeviceController, max_touch_points
+from player import run_player
 from rpe import detect_kind, rpe_to_official_v3
 from algo.algo_base import load_from_json, export_to_json, PLAN_CACHE_SUFFIX, first_note_ms, manual_start_plan
 
@@ -554,27 +555,29 @@ class App(ttk.Frame):
                 # perf_counter: Windows上Python 3.12的time.time()精度只有约15.6ms
                 self.start_time = time.perf_counter() + offset
 
-                begin = False
                 self.running = True
                 self.console.print('正在等待')
 
-                timestamp, events = next(ans_iter)
+                controller = self.controller
+                sent_any = [False]
+
+                def send(events):
+                    if not sent_any[0]:
+                        self.info_label['text'] = '开始操作'
+                        self.console.print('开始操作')
+                        sent_any[0] = True
+                    controller.touch_many(events)
+
+                stats = None
                 try:
-                    while self.running:
-                        self.update()
-                        now = round((time.perf_counter() - self.start_time) * 1000)
-                        if now >= timestamp:
-                            if not begin:
-                                self.info_label['text'] = '开始操作'
-                                self.console.print('开始操作')
-                                begin = True
-                            for event in events:
-                                self.controller.touch(*event.pos, event.action, pointer_id=event.pointer)
-                            timestamp, events = next(ans_iter)
+                    stats = run_player(send, ans_iter, lambda: self.start_time, lambda: self.running, idle=self.update)
                 except Exception:
-                    pass
+                    self.console.print_exception()
                 finally:
                     self.console.print('操作结束')
+                    if stats is not None:
+                        for line in stats.summary(first_note_ms(chart) or 0):
+                            self.console.print(line)
 
                 self.go['command'] = pre_command
                 self.go['text'] = pre_text
@@ -595,20 +598,20 @@ class App(ttk.Frame):
                 def player_worker(ans_iter: Iterator[tuple[int, list[TouchEvent]]]) -> None:
                     """打歌线程"""
                     if self.controller:
-                        timestamp, events = next(ans_iter)
-                        self.start_time = time.perf_counter() - timestamp / 1000 - 0.01  # 0.01 for the delay time
+                        first = next(ans_iter)
+                        self.start_time = time.perf_counter() - first[0] / 1000 - 0.01  # 0.01 for the delay time
 
+                        stats = None
                         try:
-                            while self.running:
-                                now = round((time.perf_counter() - self.start_time) * 1000)
-                                if now >= timestamp:
-                                    for event in events:
-                                        self.controller.touch(*event.pos, event.action, pointer_id=event.pointer)
-                                    timestamp, events = next(ans_iter)
-                        except StopIteration:
-                            pass
+                            stats = run_player(self.controller.touch_many, ans_iter, lambda: self.start_time,
+                                               lambda: self.running, first_event=first)
+                        except Exception:
+                            self.console.print_exception()
                         finally:
                             self.console.print('操作结束')
+                            if stats is not None:
+                                for line in stats.summary(first_note_ms(chart) or 0):
+                                    self.console.print(line)
                     else:
                         self.console.print('self.controller == None')
 

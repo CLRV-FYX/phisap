@@ -243,9 +243,9 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                     pointers.release(event)
                     # is_keyframe = True
                 case FrameEventAction.FLICK_START:
-                    # flick总是用新按下的触点: 复用旧触点时它会先"瞬移"到起点, 这一下会被当成一次滑动,
-                    # 按"一次滑动只能判定一个flick"的规则要多等一两帧才能再次判定
-                    add_touch_event(ms, event.point, TouchAction.DOWN, pointers.acquire(event)[0])
+                    pid, new = pointers.acquire(event, new=False)
+                    act = TouchAction.DOWN if new else TouchAction.MOVE
+                    add_touch_event(ms, event.point, act, pid)
                 case FrameEventAction.FLICK | FrameEventAction.HOLD:
                     add_touch_event(ms, event.point, TouchAction.MOVE, pointers.acquire(event)[0])
                 case FrameEventAction.FLICK_END | FrameEventAction.HOLD_END:

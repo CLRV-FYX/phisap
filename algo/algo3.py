@@ -1,25 +1,28 @@
 # 扫屏算法: 专用触点在屏幕上不停地高速来回扫动, drag(黄键)不再逐个规划;
-# 其余触点按algo2的方式处理tap(蓝键)、hold和flick(红键)。
+# flick(红键)由几个"滑键触点"负责: 它们提前按下(按下的时间/位置避开所有tap/hold), 之后不再抬起,
+# 只是滑到每个flick的位置快速划一下, 再滑到下一个; 其余触点按algo2的方式处理tap(蓝键)和hold。
 #
-# flick为什么还要单独规划: 按sim-phi(以及很可能真实的Phigros)的规则, 一次滑动只能判定一个flick,
-# 触点必须先减速/反向才能判定下一个。扫屏触点每次单程(约0.1秒)只能接一个flick, 成批出现的flick
-# 基本接不住; 所以每个flick仍然由一个触点单独快速滑一下(扫屏触点碰巧接到的也算)。
+# 为什么flick不能只靠扫屏: Phigros中"一根手指向一个方向滑动仅能判定一次"(见萌娘百科/sim-phi),
+# 触点必须先减速或换方向才能判定下一个flick。扫屏触点每次单程(约0.1秒)最多接一个flick,
+# 扫得再快也接不住成批的flick; 而游戏每帧只读一次触点位置, 扫得太快反而会跳过音符。
+# 滑键触点每划一个flick都换一次方向(滑向下一个flick的方向与上一次划的方向错开), 保证每次都是"新的一划"。
+# 滑键触点在整段flick期间一直按着, 不会重新按下, 所以不会误触附近的tap/hold。
 #
 # 两种布局:
 # + algo3 : 4个(10触点时3个)触点分别在不同高度的"行"上左右扫, 只在drag/flick前后扫
 # + algo3f: 像坐标轴一样, 1个触点在屏幕高度正中左右扫(横轴), 1个触点在屏幕宽度正中上下扫(纵轴),
 #           从第一个音符之前一直扫到最后一个音符之后(见 algo3f.py)
 #
-# 原理(以Phira复刻的判定为准, 见 tools/judge_sim.py):
+# 原理(见 tools/judge_sim.py):
 # + 判定只看触点在判定线方向上的投影, 范围约 ±151 像素(1280x720)。
-# + drag: 判定时间 ±220ms 内任意一帧有任意触点在范围内即可(不需要按下)。
-# + flick: 判定时间附近任意一帧有"正在快速移动"的触点在范围内即可; 每个触点每帧最多判定一个flick。
+# + drag: 判定时间附近任意一帧有任意触点在范围内即可(不需要按下)。
+# + flick: 判定时间附近任意一帧有"正在快速滑动"的触点在范围内即可; 一次滑动只能判定一个。
 # + 游戏每帧只采样一次触点位置, 所以扫动速度不能太快: 相邻两帧(60fps)之间扫过的距离要小于判定宽度。
 # + 只沿x方向扫动时, 竖直的判定线(投影方向是y)无法覆盖, 所以需要多行或者再加一个上下扫的触点。
 # + 各触点的周期互不相同且与帧率不成整数比, 避免每帧都采样到同样的几个位置。
 #
-# 风险: 扫屏触点按下的瞬间会被当成一次点击, 可能抢走附近的tap/hold判定;
-# 所以按下的时间和位置会避开前后 300ms 内的所有tap/hold, 并在按下后先静止 SETTLE_MS 再开始扫动。
+# 风险: 扫屏/滑键触点按下的瞬间会被当成一次点击, 可能抢走附近的tap/hold判定;
+# 所以按下的时间和位置会避开前后 300ms 内的所有tap/hold, 并在按下后先静止 SETTLE_MS 再开始移动。
 
 import copy
 import math
@@ -31,7 +34,8 @@ from rich.console import Console
 from chart import Chart
 from note import NoteType
 from . import algo2
-from .algo_base import MAX_POINTERS, SWEEP_POINTER_BASE_MIN, TouchAction, VirtualTouchEvent
+from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, MAX_POINTERS, SWEEP_POINTER_BASE_MIN, TouchAction,
+                        VirtualTouchEvent, flick_path, flick_time_shift)
 
 SWEEP_X_MIN = 20.0
 SWEEP_X_MAX = 1260.0
@@ -168,11 +172,11 @@ def _choose_down(heads, start: int, sw: Sweeper, preferred: float) -> tuple[int,
     return start, preferred, False
 
 
-POINTER_NOTE_TYPES = (NoteType.TAP, NoteType.HOLD, NoteType.FLICK)
+POINTER_NOTE_TYPES = (NoteType.TAP, NoteType.HOLD)
 
 
 def _without_sweep_notes(chart: Chart) -> Chart:
-    """复制一份去掉drag的谱面(tap/hold/flick), 交给algo2规划"""
+    """复制一份只保留tap/hold的谱面, 交给algo2规划"""
     lines = []
     for line in chart.judge_lines:
         new_line = copy.copy(line)
@@ -217,11 +221,142 @@ def plan_sweepers(chart: Chart, sweepers: list[Sweeper], intervals: list[list[in
     return events
 
 
+FLICK_FINGER_BASE = 2200
+FLICK_GROUP_GAP = 1500   # 相邻flick间隔小于此值时滑键触点保持按下
+GLIDE_MS = 24            # 滑到下一个flick起点所用的时间(ms)
+FLICK_UPDATE_MS = 4      # 滑键触点的位置更新间隔(ms)
+FLICK_RELEASE_AFTER = 40
+
+
+def flick_finger_count(max_pointers: int, sweepers: int = 0) -> int:
+    """滑键触点个数: 16触点时4个; 10触点时尽量3个, 但至少给tap/hold留5个"""
+    if max_pointers >= 16:
+        return 4
+    return max(2, min(3, max_pointers - sweepers - 5))
+
+
+def _safe_points(heads, t: int, candidates: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """t时刻按下(并静止SETTLE_MS)时不会误触任何tap/hold的位置"""
+    near = [h for h in heads if t - DOWN_GUARD <= h[0] <= t + SETTLE_MS + DOWN_GUARD]
+    frames = []
+    for _, line, note in near:
+        for tt in range(t, t + SETTLE_MS + 1, 10):
+            lt = line.time(tt / 1000)
+            cx, cy = line.pos(lt)
+            a = -line.angle(lt) * math.pi / 180
+            frames.append((cx, cy, math.cos(a), math.sin(a), note.x * 72))
+    return [(x, y) for x, y in candidates
+            if not (x < PAUSE_BUTTON_BOX[0] and y < PAUSE_BUTTON_BOX[1])
+            and all(abs((x - cx) * ca + (y - cy) * sa - nx) > JUDGE_HALF_WIDTH + SAFE_MARGIN
+                    for cx, cy, ca, sa, nx in frames)]
+
+
+_GRID = [(80.0 + 1120.0 * i / 14, 60.0 + 600.0 * j / 6) for i in range(15) for j in range(7)]
+
+
+class _Finger:
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.pos: tuple[float, float] = (640.0, 360.0)
+        self.free = -math.inf           # 从这个时刻起可以开始滑向下一个flick
+        self.last_dir: tuple[float, float] | None = None
+        self.down = False
+
+
+def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
+                       ) -> tuple[defaultdict[int, list[VirtualTouchEvent]], int]:
+    """滑键触点: 返回 (事件, 没有分配到滑键触点的flick数)"""
+    events: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
+    heads = _heads(chart)
+    items = []
+    for line in chart.judge_lines:
+        for note in line.notes:
+            if note.type == NoteType.FLICK:
+                items.append((round(line.seconds(note.time) * 1000), line, note))
+    items.sort(key=lambda it: it[0])
+    groups: list[list] = []
+    for it in items:
+        if groups and it[0] - groups[-1][-1][0] < FLICK_GROUP_GAP:
+            groups[-1].append(it)
+        else:
+            groups.append([it])
+
+    unassigned = unsafe = 0
+    for group in groups:
+        fingers = [_Finger(FLICK_FINGER_BASE + k) for k in range(count)]
+        first_start = group[0][0] + FLICK_START - GLIDE_MS - SETTLE_MS
+        taken: list[tuple[float, float]] = []
+        for k, f in enumerate(fingers):
+            # 按下: 在第一个flick之前寻找不会误触tap/hold的时间和位置(各触点错开位置)
+            down_t, pos, safe = first_start, _GRID[(k * 37) % len(_GRID)], False
+            for dt in range(0, DOWN_SEARCH + 1, 10):
+                pts = [p for p in _safe_points(heads, first_start - dt, _GRID) if p not in taken]
+                if pts:
+                    down_t = first_start - dt
+                    pos = min(pts, key=lambda p: math.hypot(p[0] - 640, p[1] - 360) + 97 * k * (p[0] < 640))
+                    safe = True
+                    break
+            unsafe += not safe
+            taken.append(pos)
+            f.pos, f.free, f.down = pos, down_t + SETTLE_MS, True
+            events[down_t].append(VirtualTouchEvent(pos, TouchAction.DOWN, f.pid))
+
+        for t_ms, line, note in group:
+            shift = flick_time_shift(line, note)
+            s0 = t_ms + FLICK_START
+            ready = [f for f in fingers if f.free <= s0 - 8]
+            if not ready:
+                unassigned += 1
+                continue
+            best = None
+            for f in ready:
+                for rev in (False, True):
+                    path = flick_path(line, note, t_ms, FLICK_START, FLICK_END, FLICK_RADIUS, shift, reverse=rev)
+                    gx, gy = path[0][0] - f.pos[0], path[0][1] - f.pos[1]
+                    dx, dy = path[-1][0] - path[0][0], path[-1][1] - path[0][1]
+                    dist = math.hypot(gx, gy)
+                    ref = (gx / dist, gy / dist) if dist > 20 else f.last_dir
+                    dn = math.hypot(dx, dy) or 1.0
+                    # 这一划的方向要和之前的移动方向错开(点积<=0), 才算"新的一划"
+                    turn = 0.0 if ref is None else (ref[0] * dx + ref[1] * dy) / dn
+                    score = (turn > 0.1, dist)
+                    if best is None or score < best[0]:
+                        best = (score, f, path, (dx / dn, dy / dn))
+            _, f, path, direction = best
+            # 滑向起点
+            g0 = max(f.free, s0 - GLIDE_MS)
+            x0, y0 = f.pos
+            for t in range(g0 + FLICK_UPDATE_MS, s0, FLICK_UPDATE_MS):
+                r = (t - g0) / (s0 - g0)
+                events[t].append(VirtualTouchEvent((x0 + (path[0][0] - x0) * r, y0 + (path[0][1] - y0) * r),
+                                                   TouchAction.MOVE, f.pid))
+            # 快速划过
+            for i in list(range(0, len(path) - 1, FLICK_UPDATE_MS)) + [len(path) - 1]:
+                events[s0 + i].append(VirtualTouchEvent(path[i], TouchAction.MOVE, f.pid))
+            f.pos, f.free, f.last_dir = path[-1], s0 + len(path), direction
+
+        end = max(f.free for f in fingers) + FLICK_RELEASE_AFTER
+        for f in fingers:
+            events[end].append(VirtualTouchEvent(f.pos, TouchAction.UP, f.pid))
+
+    if console is not None:
+        console.print(f'滑键触点: {count}个, {len(groups)}段, 共{len(items)}个flick')
+        if unassigned:
+            console.print(f'[yellow]警告: 有{unassigned}个flick同时出现得太密, 没有空闲的滑键触点(扫屏触点可能接到)[/yellow]')
+        if unsafe:
+            console.print(f'[yellow]警告: 有{unsafe}次滑键触点按下时无法完全避开附近的tap/hold[/yellow]')
+    return events, unassigned
+
+
 def solve_with(chart: Chart, console: Console, max_pointers: int, sweepers: list[Sweeper],
                intervals: list[list[int]]) -> defaultdict[int, list[VirtualTouchEvent]]:
-    console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {max_pointers - len(sweepers)}个触点处理tap/hold/flick')
-    ans = algo2.solve(_without_sweep_notes(chart), console, max_pointers - len(sweepers))
+    fingers = flick_finger_count(max_pointers, len(sweepers))
+    rest = max_pointers - len(sweepers) - fingers
+    console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {fingers}个滑键触点(flick), {rest}个触点处理tap/hold')
+    ans = algo2.solve(_without_sweep_notes(chart), console, rest)
     for ms, evs in plan_sweepers(chart, sweepers, intervals, console).items():
+        ans[ms].extend(evs)
+    for ms, evs in plan_flick_fingers(chart, fingers, console)[0].items():
         ans[ms].extend(evs)
     return ans
 
@@ -230,5 +365,5 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
     return solve_with(chart, console, max_pointers, row_sweepers(max_pointers), _active_intervals(chart))
 
 
-__all__ = ['solve', 'solve_with', 'plan_sweepers', 'sweep_rows', 'row_sweepers', 'triangle', 'Sweeper',
+__all__ = ['solve', 'solve_with', 'plan_sweepers', 'plan_flick_fingers', 'flick_finger_count', 'sweep_rows', 'row_sweepers', 'triangle', 'Sweeper',
            'whole_song_interval', 'SWEEP_POINTER_BASE']

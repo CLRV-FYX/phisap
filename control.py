@@ -223,9 +223,17 @@ class DeviceController:
         self.control_collector.start()
 
     def touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> None:
+        self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
+
+    def touch_many(self, events) -> None:
+        '''同一时刻的多个事件(需有pos/action/pointer属性)合并成一次发送'''
+        if events:
+            self.control_socket.sendall(b''.join(self._pack_touch(*e.pos, e.action, e.pointer) for e in events))
+
+    def _pack_touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> bytes:
         # 坐标系为当前视频尺寸(device_width x device_height)，scrcpy-server 会映射到实际屏幕；
         # 尺寸与 server 当前视频尺寸不一致的事件会被 server 丢弃
-        self.control_socket.sendall(
+        return (
             struct.pack(
                 '!bbQiiHHHII',
                 2,  # type: SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT

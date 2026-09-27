@@ -10,7 +10,8 @@
 
 用法:
     python tools/judge_sim.py <谱面.json> [algo1|algo2|algo3|algo3f ...] [--fps 60] [--width 151] [--strict-flick]
-    --strict-flick: 一次滑动只能判定一个flick(sim-phi的规则, 可能更接近真实的Phigros)
+    --strict-flick: 一次滑动只能判定一个flick(sim-phi的规则)
+    --phigros: 在--strict-flick的基础上, 每次按下判定范围内最早的Tap/Hold(Phigros的规则)
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ LIMIT_BAD = 0.22
 UP_TOLERANCE = 0.05
 DIST_FACTOR = 0.2
 EARLY_OFFSET = 0.07
+PHIGROS_LATE = 0.16        # Phigros: Good ±160ms
+PHIGROS_TAP_EARLY = 0.18   # Phigros: Tap提前160~180ms为Bad
 NOTE_WIDTH_RATIO_BASE = 0.13175016
 X_DIFF_MAX = 0.21 / (16 / 9) * 2          # 归一化单位(半屏宽 = 1)
 FLICK_THRESHOLD = 0.8 * 275 / 386          # 归一化单位/秒
@@ -125,15 +128,19 @@ class SimNote:
 
 
 def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px: float | None = None,
-             seed: int = 0, quantize_ms: float = 0.0, jitter_ms: float = 0.0, strict_flick: bool = False) -> dict:
+             seed: int = 0, quantize_ms: float = 0.0, jitter_ms: float = 0.0, strict_flick: bool = False,
+             phigros: bool = False) -> dict:
     """回放规划结果, 返回 {'tap': {'perfect': n, ...}, ..., 'notes': [SimNote]}
 
     quantize_ms: 模拟发送端时钟精度(例如 Windows 上 Python 3.12 的 time.time() 精度约15.6ms,
                  事件会攒成一批一起发出)
     jitter_ms:   每批事件额外的随机延迟上限(模拟注入/传输延迟的抖动)
     strict_flick: 使用更严格的flick规则(一次滑动只能判定一个flick, 见StrictFlickTracker)
+    phigros:     按Phigros的规则(萌娘百科等资料): 一次滑动只能判定一个flick; 每次按下判定范围内
+                 "仍能判定的Tap/Hold中最早的一个"(而不是时间最接近的), Tap提前160~180ms为Bad
     """
     rng = random.Random(seed)
+    strict_flick = strict_flick or phigros
     xmax = X_DIFF_MAX if width_px is None else width_px / HALF_W
     notes = []
     for li, line in enumerate(chart.judge_lines):
@@ -226,11 +233,28 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
             flick = ph == 'moved' and pid in trackers and trackers[pid].can_flick()
             if not (click or flick):
                 continue
+            if click and phigros:
+                cand = [n for n in window if n.status == 'none' and n.kind in ('tap', 'hold')
+                        and -PHIGROS_LATE <= n.t - t <= (PHIGROS_TAP_EARLY if n.kind == 'tap' else PHIGROS_LATE)
+                        and abs(n.x - local_x(n.line, p, cache)) <= xmax]
+                if cand:
+                    n = min(cand, key=lambda n: n.t)
+                    adt = abs(n.t - t)
+                    n.by = (pid, t)
+                    if n.kind == 'tap':
+                        n.status = 'done'
+                        n.result = 'perfect' if adt <= LIMIT_PERFECT else 'good' if adt <= PHIGROS_LATE else 'bad'
+                    else:
+                        n.status, n.hold_perfect, n.up_time = 'hold', adt <= LIMIT_PERFECT, math.inf
+                continue
             best = (None, xmax, LIMIT_BAD, LIMIT_BAD + max(xmax / NOTE_WIDTH_RATIO_BASE - 1, 0) * DIST_FACTOR)
             for n in window:
                 if n.status not in ('none', 'pre'):
                     continue
                 if not click and n.kind in ('tap', 'hold'):
+                    continue
+                # sim-phi: 已经判定过的flick不会再被别的滑动"吃掉"(Phira会)
+                if strict_flick and not click and n.status == 'pre':
                     continue
                 dt = n.t - t
                 if dt >= best[3]:
@@ -347,6 +371,9 @@ def main():
     strict = '--strict-flick' in args
     if strict:
         args.remove('--strict-flick')
+    phigros = '--phigros' in args
+    if phigros:
+        args.remove('--phigros')
     if '--width' in args:
         i = args.index('--width'); width = float(args[i + 1]); del args[i:i + 2]
     path, algos = args[0], args[1:] or ['algo1', 'algo2', 'algo3', 'algo3f']
@@ -359,7 +386,7 @@ def main():
                'algo3f': algo.algo3f.solve}
     for name in algos:
         ans = solvers[name](chart, Console(file=io.StringIO()), 16)
-        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width, strict_flick=strict))}')
+        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width, strict_flick=strict, phigros=phigros))}')
 
 
 if __name__ == '__main__':

@@ -167,11 +167,10 @@ class PointerAllocator:
                 (x - (1 - 2 * d / FLICK_DURATION) * FLICK_RADIUS * sa, y + (1 - 2 * d / FLICK_DURATION) * FLICK_RADIUS * ca)
                 for d in range(FLICK_DURATION)
             )
-        # flick总是重新按下: 复用旧触点时它会先"瞬移"到起点, 这一下会被当成一次滑动,
-        # 按"一次滑动只能判定一个flick"的规则要多等一两帧才能再次判定
-        if pointer.note is not None:
-            self._insert(self.now - pointer.age + 1, VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
-        self._insert(self.now, VirtualTouchEvent(path[0], TouchAction.DOWN, pointer.id))
+        if pointer.note is None:
+            self._insert(self.now, VirtualTouchEvent(path[0], TouchAction.DOWN, pointer.id))
+        else:
+            self._insert(self.now, VirtualTouchEvent(path[0], TouchAction.MOVE, pointer.id))
         for delta, pos in enumerate(path):
             self._insert(self.now + delta, VirtualTouchEvent(pos, TouchAction.MOVE, pointer.id))
         pointer.note = note._replace(pos=path[-1])
