@@ -1,5 +1,9 @@
-# 扫屏算法: 专用触点在屏幕上不停地高速来回扫动, drag(黄键)和flick(红键)不再逐个规划;
-# 其余触点按algo2的方式处理tap(蓝键)和hold。
+# 扫屏算法: 专用触点在屏幕上不停地高速来回扫动, drag(黄键)不再逐个规划;
+# 其余触点按algo2的方式处理tap(蓝键)、hold和flick(红键)。
+#
+# flick为什么还要单独规划: 按sim-phi(以及很可能真实的Phigros)的规则, 一次滑动只能判定一个flick,
+# 触点必须先减速/反向才能判定下一个。扫屏触点每次单程(约0.1秒)只能接一个flick, 成批出现的flick
+# 基本接不住; 所以每个flick仍然由一个触点单独快速滑一下(扫屏触点碰巧接到的也算)。
 #
 # 两种布局:
 # + algo3 : 4个(10触点时3个)触点分别在不同高度的"行"上左右扫, 只在drag/flick前后扫
@@ -164,13 +168,16 @@ def _choose_down(heads, start: int, sw: Sweeper, preferred: float) -> tuple[int,
     return start, preferred, False
 
 
+POINTER_NOTE_TYPES = (NoteType.TAP, NoteType.HOLD, NoteType.FLICK)
+
+
 def _without_sweep_notes(chart: Chart) -> Chart:
-    """复制一份只保留tap/hold的谱面, 交给algo2规划"""
+    """复制一份去掉drag的谱面(tap/hold/flick), 交给algo2规划"""
     lines = []
     for line in chart.judge_lines:
         new_line = copy.copy(line)
-        new_line.notes_above = [n for n in line.notes_above if n.type in (NoteType.TAP, NoteType.HOLD)]
-        new_line.notes_below = [n for n in line.notes_below if n.type in (NoteType.TAP, NoteType.HOLD)]
+        new_line.notes_above = [n for n in line.notes_above if n.type in POINTER_NOTE_TYPES]
+        new_line.notes_below = [n for n in line.notes_below if n.type in POINTER_NOTE_TYPES]
         lines.append(new_line)
     new_chart = copy.copy(chart)
     new_chart.judge_lines = lines
@@ -212,7 +219,7 @@ def plan_sweepers(chart: Chart, sweepers: list[Sweeper], intervals: list[list[in
 
 def solve_with(chart: Chart, console: Console, max_pointers: int, sweepers: list[Sweeper],
                intervals: list[list[int]]) -> defaultdict[int, list[VirtualTouchEvent]]:
-    console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag/flick), {max_pointers - len(sweepers)}个触点处理tap/hold')
+    console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {max_pointers - len(sweepers)}个触点处理tap/hold/flick')
     ans = algo2.solve(_without_sweep_notes(chart), console, max_pointers - len(sweepers))
     for ms, evs in plan_sweepers(chart, sweepers, intervals, console).items():
         ans[ms].extend(evs)

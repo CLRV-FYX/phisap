@@ -238,6 +238,69 @@ class TestManualStart(unittest.TestCase):
         self.assertEqual(len(downs), 4)
 
 
+def flick_burst_chart():
+    """成批出现的flick: 0.5秒内12个, 分布在两条线上(一条水平, 一条旋转)"""
+    flat = line_dict([note(128 + 3 * i, (-7.0 + 1.3 * i) * (1 if i % 2 else -1), 4) for i in range(8)])
+    rot = rotating_line([note(t, x, 4) for t, x in ((100, -4.0), (104, 3.0), (108, -1.0), (112, 5.0))])
+    return chart_of(flat, rot)
+
+
+class TestFlickBurst(unittest.TestCase):
+    """一次滑动只能判定一个flick(sim-phi的规则): 扫屏触点接不住成批的flick, flick需要单独规划"""
+
+    def test_sweepers_alone_cannot_catch_bursts(self):
+        # 0.2秒内12个flick
+        chart = chart_of(line_dict([note(128 + i, (-7.0 + 1.3 * i) * (1 if i % 2 else -1), 4) for i in range(12)]))
+        ans = algo.algo3.plan_sweepers(chart, algo.algo3f.axis_sweepers(), algo.algo3.whole_song_interval(chart))
+        misses = [simulate(chart, ans, seed=seed, strict_flick=True)['flick']['miss'] for seed in range(5)]
+        self.assertGreaterEqual(min(misses), 2, misses)
+        # 单独规划的flick(algo3f)可以全部接住
+        full = algo.algo3f.solve(chart, quiet(), 16)
+        self.assertEqual(non_perfect(simulate(chart, full, seed=0, strict_flick=True)), {})
+
+    def test_bursts_with_strict_rule(self):
+        chart = flick_burst_chart()
+        for name, solve in (('algo1', algo.algo1.solve), ('algo2', algo.algo2.solve), ('algo3', algo.algo3.solve),
+                            ('algo3f', algo.algo3f.solve)):
+            ans = solve(chart, quiet(), 16)
+            for fps in (60, 30):
+                for seed in range(3):
+                    with self.subTest(algo=name, fps=fps, seed=seed):
+                        self.assertEqual(non_perfect(simulate(chart, ans, fps=fps, seed=seed, strict_flick=True)), {})
+
+    def test_flick_path_fast_and_on_screen_near_edge(self):
+        from algo.algo_base import FLICK_END, FLICK_RADIUS, FLICK_START, flick_path
+        for y_frac in (0.01, 0.5, 0.99):
+            chart = chart_of(line_dict([note(64, 2.0, 4)], move=[
+                {'startTime': -999999.0, 'endTime': TAIL, 'start': 0.5, 'end': 0.5, 'start2': y_frac, 'end2': y_frac}]))
+            line = chart.judge_lines[0]
+            path = flick_path(line, line.notes[0], 1000, FLICK_START, FLICK_END, FLICK_RADIUS)
+            with self.subTest(y=y_frac):
+                self.assertTrue(all(0 <= x <= 1280 and 0 <= y <= 720 for x, y in path))
+                self.assertTrue(all(abs(x - path[0][0]) < 1e-6 for x, _ in path))   # 投影不变
+                self.assertAlmostEqual(abs(path[-1][1] - path[0][1]), 2 * FLICK_RADIUS, delta=1)
+                steps = [abs(b[1] - a[1]) for a, b in zip(path, path[1:])]
+                self.assertGreater(min(steps), 1.5)   # 每毫秒都在快速移动(远高于1像素/毫秒的门槛)
+
+    def test_strict_tracker(self):
+        from judge_sim import StrictFlickTracker
+        tr = StrictFlickTracker(0, (0.0, 0.0))
+        x = 0.0
+        for _ in range(3):
+            x += 50
+            tr.frame_move((x, 0.0), 16.7)
+        self.assertTrue(tr.can_flick())
+        tr.consume()
+        for _ in range(5):   # 继续同方向快速移动: 不能再判定
+            x += 50
+            tr.frame_move((x, 0.0), 16.7)
+            self.assertFalse(tr.can_flick())
+        for _ in range(2):   # 反向: 重新进入甩动状态
+            x -= 50
+            tr.frame_move((x, 0.0), 16.7)
+        self.assertTrue(tr.can_flick())
+
+
 class TestThinPath(unittest.TestCase):
     def test_static_hold_sends_only_last(self):
         self.assertEqual(thin_path([(100.0, 200.0)] * 500), [499])

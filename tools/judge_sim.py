@@ -9,7 +9,8 @@
 + Hold: 头部同Tap, 之后每帧都需要有触点在范围内(允许断开50ms), 最后220ms自动判定
 
 用法:
-    python tools/judge_sim.py <谱面.json> [algo1|algo2|algo3|algo3f ...] [--fps 60] [--width 151]
+    python tools/judge_sim.py <谱面.json> [algo1|algo2|algo3|algo3f ...] [--fps 60] [--width 151] [--strict-flick]
+    --strict-flick: 一次滑动只能判定一个flick(sim-phi的规则, 可能更接近真实的Phigros)
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ KIND = {NoteType.TAP: 'tap', NoteType.DRAG: 'drag', NoteType.HOLD: 'hold', NoteT
 
 
 class FlickTracker:
+    """Phira的flick规则: 判定一个flick后, 下一次足够快的移动就能再判定下一个"""
+
     def __init__(self, t, p):
         self.last_point = p
         self.last_delta = None
@@ -62,6 +65,51 @@ class FlickTracker:
         self.last_delta = (dx / mag, dy / mag) if mag > 0 else self.last_delta
         self.last_time = t
 
+    def frame_move(self, p, dt_ms):
+        pass
+
+    def can_flick(self):
+        return self.flicked
+
+    def consume(self):
+        self.flicked = False
+
+
+class StrictFlickTracker:
+    """更严格的flick规则(与lchzh3473/sim-phi一致): 一次滑动只能判定一个flick。
+
+    触点速度(沿上一次移动方向的分量)超过 START 像素/毫秒时进入"甩动"状态, 判定一个flick之后
+    必须先减速到 STOP 以下(停下或者反向)才能再判定下一个。按帧更新(游戏每帧读取一次触点位置)。
+    """
+    START = 1.0   # 像素/毫秒(1280x720)
+    STOP = 0.5
+
+    def __init__(self, t, p):
+        self.pos = p
+        self.last = (0.0, 0.0)
+        self.now = (0.0, 0.0)
+        self.flicking = False
+        self.flicked = False
+
+    def frame_move(self, p, dt_ms):
+        self.last = self.now
+        self.now = (p[0] - self.pos[0], p[1] - self.pos[1])
+        self.pos = p
+        mag = math.hypot(*self.last)
+        if mag == 0 or dt_ms <= 0:
+            return
+        speed = (self.now[0] * self.last[0] + self.now[1] * self.last[1]) / mag / dt_ms
+        if self.flicking and speed < self.STOP:
+            self.flicking = self.flicked = False
+        elif not self.flicking and speed > self.START:
+            self.flicking = True
+
+    def can_flick(self):
+        return self.flicking and not self.flicked
+
+    def consume(self):
+        self.flicked = True
+
 
 class SimNote:
     __slots__ = ('line', 'kind', 't', 'end', 'x', 'status', 'result', 'hold_perfect', 'up_time', 'hold_pre', 'by')
@@ -77,12 +125,13 @@ class SimNote:
 
 
 def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px: float | None = None,
-             seed: int = 0, quantize_ms: float = 0.0, jitter_ms: float = 0.0) -> dict:
+             seed: int = 0, quantize_ms: float = 0.0, jitter_ms: float = 0.0, strict_flick: bool = False) -> dict:
     """回放规划结果, 返回 {'tap': {'perfect': n, ...}, ..., 'notes': [SimNote]}
 
     quantize_ms: 模拟发送端时钟精度(例如 Windows 上 Python 3.12 的 time.time() 精度约15.6ms,
                  事件会攒成一批一起发出)
     jitter_ms:   每批事件额外的随机延迟上限(模拟注入/传输延迟的抖动)
+    strict_flick: 使用更严格的flick规则(一次滑动只能判定一个flick, 见StrictFlickTracker)
     """
     rng = random.Random(seed)
     xmax = X_DIFF_MAX if width_px is None else width_px / HALF_W
@@ -114,7 +163,8 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
     t_end = max(n.end for n in notes) + 1.0
     ei = 0
     down: dict[int, tuple] = {}
-    trackers: dict[int, FlickTracker] = {}
+    trackers: dict = {}
+    Tracker = StrictFlickTracker if strict_flick else FlickTracker
     last_t = t - frame
 
     def line_frame(li, cache):
@@ -145,12 +195,12 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
             np_ = ((p[0] - 640) / HALF_W, (p[1] - 360) / HALF_W)
             if e.action == TouchAction.DOWN:
                 down[e.pointer] = p
-                trackers[e.pointer] = FlickTracker(et, np_)
+                trackers[e.pointer] = Tracker(et, p if strict_flick else np_)
                 touches[e.pointer] = [p, 'started']
             elif e.action == TouchAction.MOVE:
                 if e.pointer in down:
                     down[e.pointer] = p
-                    if e.pointer in trackers:
+                    if not strict_flick and e.pointer in trackers:
                         trackers[e.pointer].push(et, np_)
                     if e.pointer in touches:
                         touches[e.pointer][0] = p
@@ -159,6 +209,10 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
                 trackers.pop(e.pointer, None)
                 if e.pointer in touches and touches[e.pointer][1] != 'started':
                     touches[e.pointer][1] = 'ended'
+        if strict_flick:
+            for pid in {e.pointer for e in batch if e.action == TouchAction.MOVE}:
+                if pid in trackers and pid in down:
+                    trackers[pid].frame_move(down[pid], (t - last_t) * 1000)
         last_t = t
 
         cache: dict = {}
@@ -169,7 +223,7 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
         # ---- 1. 点击 & flick
         for pid, (p, ph) in touches.items():
             click = ph == 'started'
-            flick = ph == 'moved' and pid in trackers and trackers[pid].flicked
+            flick = ph == 'moved' and pid in trackers and trackers[pid].can_flick()
             if not (click or flick):
                 continue
             best = (None, xmax, LIMIT_BAD, LIMIT_BAD + max(xmax / NOTE_WIDTH_RATIO_BASE - 1, 0) * DIST_FACTOR)
@@ -208,7 +262,7 @@ def simulate(chart, ans, fps: float = 60.0, phase: float | None = None, width_px
                     n.status, n.result = 'pre', 'bad'
             else:
                 n.status = 'pre'
-                trackers[pid].flicked = False
+                trackers[pid].consume()
 
         # ---- 2. hold持续判定 / miss / drag
         for n in notes[bisect_left(note_times, t - 600):hi]:
@@ -290,6 +344,9 @@ def main():
     fps, width = 60.0, None
     if '--fps' in args:
         i = args.index('--fps'); fps = float(args[i + 1]); del args[i:i + 2]
+    strict = '--strict-flick' in args
+    if strict:
+        args.remove('--strict-flick')
     if '--width' in args:
         i = args.index('--width'); width = float(args[i + 1]); del args[i:i + 2]
     path, algos = args[0], args[1:] or ['algo1', 'algo2', 'algo3', 'algo3f']
@@ -302,7 +359,7 @@ def main():
                'algo3f': algo.algo3f.solve}
     for name in algos:
         ans = solvers[name](chart, Console(file=io.StringIO()), 16)
-        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width))}')
+        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width, strict_flick=strict))}')
 
 
 if __name__ == '__main__':
