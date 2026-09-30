@@ -55,19 +55,23 @@ class PlayStats:
 def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]], start_time: Callable[[], float],
                running: Callable[[], bool], idle: Callable[[], None] | None = None,
                clock: Callable[[], float] = time.perf_counter, sleep: Callable[[float], None] = time.sleep,
-               first_event: tuple[int, list] | None = None) -> PlayStats:
+               first_event: tuple[int, list] | None = None,
+               should_continue: Callable[[], bool] | None = None) -> PlayStats:
     '''按时间表发送事件, 直到ans_iter耗尽或running()为False。
 
-    send:       发送一批事件
-    start_time: 返回当前的起始时刻(秒, 与clock同一时基; 微调时会变化)
-    idle:       空闲时调用(延时模式下用于刷新界面, 只在离下一批事件还有8ms以上时调用)
+    send:            发送一批事件
+    start_time:      返回当前的起始时刻(秒, 与clock同一时基; 微调时会变化)
+    idle:            空闲时调用(延时模式下用于刷新界面, 只在离下一批事件还有8ms以上时调用)
+    should_continue: 额外退出条件, 为False时立刻停止发送。
+                      main.py 用它传"播放代际"检查: 用户点了停止或又重新开始时,
+                      上一个还没退干净的worker会立即闭嘴, 不会继续往设备上戳。
     '''
     stats = PlayStats()
     gc.collect()
     gc.freeze()
     try:
         timestamp, events = first_event if first_event is not None else next(ans_iter)
-        while running():
+        while running() and (should_continue is None or should_continue()):
             wait = timestamp - (clock() - start_time()) * 1000
             if wait > 0:
                 if idle is not None and wait > 8:
