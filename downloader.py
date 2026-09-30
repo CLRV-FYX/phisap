@@ -81,16 +81,23 @@ class Downloader:
         self._dir_index: dict[str, str] = {}
         self._all_dirs: list[str] = []
         self._loaded = False
+        # source      = 用户在界面上选的源(权威, 任何自动逻辑都不许改)
+        # source_used = 上一次实际把数据传过来的源(仅用于状态显示)
+        # _dirs_source= 上一次实际列出目录用的源(jsDelivr没有目录API, 要借github的)
+        self.source_used: str = self.source
+        self._dirs_source: str = self.source
 
     def has_cached_index(self) -> bool:
         return os.path.exists(INDEX_CACHE_FILE)
 
     def set_source(self, source: str) -> None:
-        if source in SOURCES:
+        if source in SOURCES and source != self.source:
             self.source = source
-            # 清空目录缓存,切源后重新拉
+            self.source_used = source
+            # 切源后重新拉: 目录缓存和"已加载"标记都清掉
             self._all_dirs = []
             self._dir_index = {}
+            self._loaded = False
 
     @property
     def src(self):
@@ -121,9 +128,12 @@ class Downloader:
             songs = data.get('Songs')
             if isinstance(songs, dict) and songs:
                 self.song_index = songs
+                # 注意: 这里**不能**改写 self.source。
+                # 缓存里记的只是"当初这份数据是谁给的", 而用户在界面上选的源才是权威,
+                # 之前的版本在这里把 source 覆盖成缓存里的值, 导致用户的源选择永远失效。
                 saved_src = data.get('source')
                 if saved_src in SOURCES:
-                    self.source = saved_src
+                    self.source_used = saved_src
                 self._loaded = True
                 return True
         except Exception:
@@ -136,6 +146,7 @@ class Downloader:
         self.song_index = {}
         self._all_dirs = []
         self._dir_index = {}
+        self.source_used = self.source
         try:
             if os.path.exists(INDEX_CACHE_FILE):
                 os.remove(INDEX_CACHE_FILE)
@@ -152,13 +163,12 @@ class Downloader:
         if not force and use_cache and self._load_index_cache():
             return
         last_err = None
-        tried = [self.source] + [s for s in SOURCES if s != self.source]
-        for sname in tried:
+        for sname in self._raw_candidates():
             url = SOURCES[sname]['raw_base'] + 'Chart_info.json'
             try:
                 r = self._get(url, timeout=20)
                 self.song_index = r.json().get('Songs', {})
-                self.source = sname
+                self.source_used = sname      # 只记录实际来源, 不改用户选择
                 self._loaded = True
                 self._save_index_cache()
                 return
@@ -170,13 +180,24 @@ class Downloader:
             return
         raise RuntimeError(f'所有镜像源都无法连接且无本地缓存: {last_err}')
 
+    def _raw_candidates(self) -> list[str]:
+        '''下载时的源尝试顺序: 用户选的源永远排第一, 其余按字典序兜底'''
+        return [self.source] + [s for s in SOURCES if s != self.source]
+
+    def _api_candidates(self) -> list[str]:
+        '''列目录时的API尝试顺序(jsDelivr/kkgithub没有目录API, 只能借github/ghproxy的)'''
+        return [self.source] + [s for s in SOURCES if s != self.source]
+
     def _load_dirs(self) -> None:
         if self._all_dirs:
             return
         last_err = None
-        # API 源优先,然后依次尝试各源
-        api_sources = [self.source] + [s for s in SOURCES if s != self.source]
-        for sname in api_sources:
+        # 注意: 这里也**不能**改 self.source。
+        # jsDelivr / kkgithub 没有目录列表API, 只能借 github / ghproxy 的 API 列目录,
+        # 但"列目录"和"下载谱面"是两件事: 目录列表是同一个仓库的内容, 与用哪个源无关,
+        # 而下载必须回到用户选的源。之前的版本在这里把 source 改成 github,
+        # 于是用户选了 jsDelivr 之后, 下载还是走 raw.githubusercontent.com。
+        for sname in self._api_candidates():
             api = SOURCES[sname].get('api_base')
             if not api:
                 continue
@@ -186,7 +207,7 @@ class Downloader:
                 dirs = [it['name'] for it in items if it.get('type') == 'dir']
                 if dirs:
                     self._all_dirs = dirs
-                    self.source = sname
+                    self._dirs_source = sname   # 仅记录, 不影响下载用的源
                     return
             except Exception as e:
                 last_err = e
@@ -295,19 +316,15 @@ class Downloader:
 
             data = None
             last_err = None
-            # 在当前源失败时,切换到其他源重试
-            sources_try = [self.source] + [s for s in SOURCES if s != self.source]
-            for sname in sources_try:
-                saved = self.source
+            # 用户选的源排第一; 失败才依次兜底。兜底只记 source_used, 不改用户选择。
+            for sname in self._raw_candidates():
                 try:
-                    self.source = sname
-                    url = self._raw_url(rel)
-                    r = self._try_raw_download(rel)
+                    url = SOURCES[sname]['raw_base'] + rel
+                    r = self._get(url, timeout=30)
                     data = r.content
-                    self.source = sname
+                    self.source_used = sname
                     break
                 except Exception as e:
-                    self.source = saved
                     last_err = e
                     continue
 

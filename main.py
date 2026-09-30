@@ -299,6 +299,21 @@ class MainPage(ScrollArea):
         self.dev_card.hBoxLayout.addSpacing(16)
         dev_group.addSettingCard(self.dev_card)
 
+        # ---- 触控后端: scrcpy / MaaTouch ----
+        # 人手点模拟器屏幕会打断自动演奏(InputDispatcher 发 ACTION_CANCEL),
+        # 两个后端在不同模拟器上表现不一样, 所以让用户自己选。
+        self.backend_box = ComboBox()
+        self.backend_box.addItems(['scrcpy (16触点, 支持视觉自动开始)',
+                                   'MaaTouch (10触点, 模拟器上可能不被打断)'])
+        self.backend_box.setMinimumWidth(320)
+        saved_backend = self._cache_get('touch_backend', 'scrcpy')
+        self.backend_box.setCurrentIndex(1 if saved_backend == 'maatouch' else 0)
+        self.backend_box.currentIndexChanged.connect(self._on_backend_changed)
+        self.backend_card = SettingCard(FIF.TILES, '触控后端', '切换后需重新连接设备')
+        self.backend_card.hBoxLayout.addWidget(self.backend_box, 0, Qt.AlignRight)
+        self.backend_card.hBoxLayout.addSpacing(16)
+        dev_group.addSettingCard(self.backend_card)
+
         self.dev_refresh_btn = PushButton(FIF.SYNC, '刷新设备')
         self.dev_refresh_btn.clicked.connect(self.detect_adb_devices)
         dev_row = QHBoxLayout()
@@ -536,7 +551,11 @@ class MainPage(ScrollArea):
         n = len(self.downloader.song_index)
         cached = self.downloader.has_cached_index()
         if n > 0:
-            self._dl_set_status(f'索引就绪,共 {n} 首（源: {self.downloader.src["label"]}）')
+            picked = self.downloader.src['label']
+            used = SOURCES.get(self.downloader.source_used, {}).get('label', picked)
+            # 实际来源和用户选的不一致时明确说出来, 避免"我明明选了jsDelivr却还是走github"
+            note = '' if self.downloader.source_used == self.downloader.source else f'（实际走: {used}）'
+            self._dl_set_status(f'索引就绪,共 {n} 首（所选源: {picked}{note}）')
         elif cached:
             self._dl_set_status('发现本地缓存,点击"更新索引"可重新下载')
         else:
@@ -741,6 +760,29 @@ class MainPage(ScrollArea):
         self.refresh_songs()
         InfoBar.success('导入完成', f'成功导入 {ok} 个谱面', parent=self.window(), duration=2500)
 
+    def _on_backend_changed(self, idx: int):
+        key = 'maatouch' if idx == 1 else 'scrcpy'
+        self._cache_set('touch_backend', key)
+        name = 'MaaTouch' if key == 'maatouch' else 'scrcpy'
+        if key == 'maatouch':
+            InfoBar.info('触控后端已切换',
+                         'MaaTouch 最多同时 10 个触点, 且不支持视觉自动开始。\n'
+                         '请点"刷新设备"重新连接后生效。',
+                         parent=self.window(), duration=5000, position=InfoBarPosition.TOP)
+        else:
+            InfoBar.success('触控后端已切换',
+                            'scrcpy: 最多 16 触点, 支持视觉自动开始。请点"刷新设备"重新连接。',
+                            parent=self.window(), duration=4000, position=InfoBarPosition.TOP)
+        self.log(f'触控后端已切换为 {name} (需重新连接设备)')
+
+    def _make_controller(self, serial: str | None):
+        '''按用户选择创建触控后端。'''
+        if self._cache_get('touch_backend', 'scrcpy') == 'maatouch':
+            from maatouch import MaaTouchController
+            self.log(f'使用 MaaTouch 后端连接 {serial or "默认设备"} ...')
+            return MaaTouchController(serial, server_dir='.')
+        return DeviceController(serial)
+
     def detect_adb_devices(self):
         self.controller = None
         self.devices_box.clear()
@@ -759,9 +801,10 @@ class MainPage(ScrollArea):
                                 parent=self.window(), position=InfoBarPosition.TOP, duration=3000)
                 return
             self.devices_box.addItems(devs)
-            self.controller = DeviceController(devs[0])
+            self.controller = self._make_controller(devs[0])
             self.dev_badge.setText(f'已连接 {devs[0]}')
-            self.log(f'设备已连接: {devs[0]} ({self.controller.device_width}x{self.controller.device_height})')
+            self.log(f'设备已连接: {devs[0]} ({self.controller.device_width}x{self.controller.device_height})'
+                     f', 触控后端: {"MaaTouch" if self._cache_get("touch_backend","scrcpy")=="maatouch" else "scrcpy"}')
             if self._raw_ans is not None:
                 self.go_btn.setEnabled(True)
         except FileNotFoundError:
@@ -781,7 +824,13 @@ class MainPage(ScrollArea):
         self.plan_btn.setEnabled(False)
         self.go_btn.setEnabled(False)
         self.log(f'开始生成规划 [{algo}] ...')
-        self._plan_t = PlanThread(path, algo, plan_path, max_touch_points())
+        # 触点数上限取决于当前后端: scrcpy补丁版16, MaaTouch只有10。
+        # 之前固定按16算, 用MaaTouch时多出来的手指会被服务端静默丢弃。
+        if self.controller is not None:
+            cap = getattr(self.controller, 'max_pointers', None) or max_touch_points()
+        else:
+            cap = max_touch_points()
+        self._plan_t = PlanThread(path, algo, plan_path, cap)
         self._plan_t.finished_ok.connect(self._plan_ok)
         self._plan_t.failed.connect(self._plan_fail)
         self._plan_t.log_line.connect(lambda s: self.log(s.rstrip()))
@@ -865,6 +914,13 @@ class MainPage(ScrollArea):
         这样不同歌曲(第一个音符在第几秒)都不需要你手动对齐。'''
         if not self.controller:
             InfoBar.warning('无设备', '请先连接 ADB 设备', parent=self.window(), duration=2500); return
+        if not getattr(self.controller, 'supports_visual_watch', True):
+            InfoBar.warning('当前后端不支持',
+                            'MaaTouch 没有视频流, 无法做视觉自动开始, 已回退到计时器同步。',
+                            parent=self.window(), duration=4000, position=InfoBarPosition.TOP)
+            self.log('视觉自动开始不可用(MaaTouch无视频流), 回退到计时器同步')
+            self.sync_ms()
+            return
         w, h = self.controller.device_width, self.controller.device_height
         try:
             self.controller.tap(w >> 1, h >> 1)
@@ -945,7 +1001,13 @@ class MainPage(ScrollArea):
         self._vauto_event = None
         self._vauto_fire_time = 0.0
 
-    PID_OFFSET = 20000  # 所有程序触点加此偏移,彻底避开人手触屏的PID(通常0开始)
+    # 注意: 这个偏移**对应用实际看到的 pointerId 没有任何作用**。
+    # scrcpy-server 和 MaaTouch 都会在注入前把我们给的 id 重映射成 0~N 的 localId
+    # (见 scrcpy PointersState.update / MaaTouch PointersState.update: props[i].id = localId),
+    # 所以想靠"错开PID"来避开人手触摸是行不通的——人手一点屏幕, InputDispatcher 依然会
+    # 给应用发 ACTION_CANCEL, 把程序按住的触点全部取消。要避免被打断只能换触控后端试。
+    # 这里保留偏移只是为了在日志/调试时能区分程序触点, 不影响实际行为。
+    PID_OFFSET = 20000
 
     def _start_playback(self, manual: bool, prestarted: bool = False):
         '''manual:      True=按下按钮的时刻即第一拍(插入扫屏DOWN触点)
@@ -1051,23 +1113,10 @@ class MainPage(ScrollArea):
             active = getattr(self, '_active_pids', set())
             if not active:
                 return
-            dw, dh = ctrl.device_width, ctrl.device_height
-            # 抬起位置用屏幕中心之外的"安全"点(中心,其实随便一个点都可以UP,Android按pointerId匹配)
-            import struct
-            pkts = []
-            for pid in list(active):
-                pkts.append(struct.pack(
-                    '!bbQiiHHHII',
-                    2,  # INJECT_TOUCH_EVENT
-                    TouchAction.UP.value,
-                    pid,
-                    dw >> 1, dh >> 1,
-                    dw, dh,
-                    0xFFFF, 1, 1,
-                ))
-            if pkts:
-                ctrl.control_socket.sendall(b''.join(pkts))
-                self.log(f'已释放 {len(pkts)} 个残余触点')
+            # 抬起位置用屏幕中心即可: Android 按 pointerId 匹配, 坐标不影响抬起语义。
+            # 具体怎么发(scrcpy 控制socket / MaaTouch 指令)由后端自己封装。
+            ctrl.release_pointers(list(active))
+            self.log(f'已释放 {len(active)} 个残余触点')
             self._active_pids = set()
         except Exception as e:
             self.log(f'释放残余触点失败(可忽略): {e}')

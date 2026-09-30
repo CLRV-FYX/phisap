@@ -57,17 +57,19 @@ def max_touch_points(server_dir: str = '.') -> int:
 
 
 class DeviceController:
-    serial: str | None
-    max_pointers: int
-    session_id: str
+    # 给标量属性类级默认值, 让两个触控后端(scrcpy / MaaTouch)在类层面就可互换:
+    # main.py 里 getattr(controller, 'max_pointers', None) 之类不依赖实例已初始化完成。
+    serial: str | None = None
+    max_pointers: int = 10
+    session_id: str = ''
+    device_width: int = 0
+    device_height: int = 0
+    collector_running: bool = False
     video_socket: socket.socket
     control_socket: socket.socket
     server_process: subprocess.Popen
     streaming_collector: threading.Thread
     control_collector: threading.Thread
-    device_width: int
-    device_height: int
-    collector_running: bool
 
     def __init__(self, serial: str | None = None, port: int = 27188, push_server: bool = True, server_dir: str = '.') -> None:
         self.serial = serial
@@ -292,6 +294,24 @@ class DeviceController:
                 1,  # buttons: AMOTION_EVENT_BUTTON_PRIMARY
             )
         )
+
+    def release_pointers(self, pointer_ids) -> None:
+        '''抬起指定的程序触点(停止演奏时用, 防止手指卡在屏幕上)。
+
+        抬起位置用屏幕中心即可: Android 按 pointerId 匹配, 坐标不影响抬起语义。'''
+        pids = [p for p in (pointer_ids or []) if p is not None]
+        if not pids:
+            return
+        dw, dh = self.device_width, self.device_height
+        pkts = [
+            self._pack_touch(dw >> 1, dh >> 1, TouchAction.UP, pid)
+            for pid in pids
+        ]
+        self.control_socket.sendall(b''.join(pkts))
+
+    def reset_all(self) -> None:
+        '''scrcpy 后端没有"重置所有触点"的原语, 由调用方维护 active 集合后调 release_pointers。'''
+        raise NotImplementedError('scrcpy 后端请使用 release_pointers(active_pids)')
 
     def tap(self, x: int, y: int, pointer_id: int = 1000, delay: float = 0.1) -> None:
         self.touch(x, y, TouchAction.DOWN, pointer_id)
