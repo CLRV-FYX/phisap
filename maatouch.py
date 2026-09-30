@@ -301,6 +301,21 @@ class MaaTouchController:
             return False
         return self._proc.poll() is None
 
+    def abort(self) -> None:
+        '''强制中断当前传输: 关掉stdin让阻塞中的 write/flush 立刻抛异常,
+        播放线程从而能走到 finally 里释放触点。之后想继续用要重新连接设备。'''
+        self._closed = True
+        try:
+            if self._stdin is not None:
+                self._stdin.close()
+        except Exception:
+            pass
+        try:
+            if self._proc is not None:
+                self._proc.kill()
+        except Exception:
+            pass
+
     def close(self) -> None:
         if self._closed:
             return

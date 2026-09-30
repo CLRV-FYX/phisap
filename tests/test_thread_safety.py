@@ -193,5 +193,70 @@ class LogThreadSafetyTest(unittest.TestCase):
         self.assertIn('_append_log', names, '缺少真正刷新控件的 _append_log 槽')
 
 
+def _refs(fn: ast.FunctionDef) -> set[str]:
+    '''收集函数体内出现的所有 self.xxx(不论调用还是仅引用)'''
+    out = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'self':
+            out.add(node.attr)
+    return out
+
+
+def _src_ctrl() -> str:
+    with io.open(os.path.join(os.path.dirname(MAIN), 'control.py'), encoding='utf-8') as f:
+        return f.read()
+
+
+class StopFullyStopsTest(unittest.TestCase):
+    '''"界面显示停止了但实际没停"的回归: 停止必须真正让触点离开屏幕'''
+
+    def test_stop_uses_background_thread_for_release(self):
+        '''_stop 不能在GUI线程直接发UP——必须等播放线程不再写socket之后再发,
+        否则两个线程同时写控制socket会把触控包撕碎, UP失效, 手指不松。'''
+        cls = _class_node('MainPage')
+        stop = _func(cls, '_stop')
+        calls = _calls(stop)
+        self.assertNotIn('_release_all_active', calls,
+                         '_stop 不能在GUI线程直接发UP, 会与播放线程的写交错')
+        self.assertIn('_stop_async', _refs(stop), '_stop 必须把释放触点放到后台线程')
+
+    def test_stop_async_joins_worker_first(self):
+        cls = _class_node('MainPage')
+        names = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+        self.assertIn('_stop_async', names)
+        fn = _func(cls, '_stop_async')
+        seg = ast.dump(fn)
+        self.assertIn('join', seg, '必须等播放线程退出后再发UP')
+        self.assertIn('abort', seg, '线程卡死时必须能强制断开传输')
+        self.assertIn('_release_all_active', seg)
+
+    def test_stop_bumps_generation(self):
+        cls = _class_node('MainPage')
+        stop = _func(cls, '_stop')
+        self.assertIn('_playback_gen', ast.dump(stop),
+                      '停止时必须让代际+1, 否则旧worker会继续发送')
+
+    def test_worker_checks_generation(self):
+        '''worker必须记住自己的代际并在每批前检查, 防止上一次没退干净的线程继续戳屏幕'''
+        cls = _class_node('MainPage')
+        start = _func(cls, '_start_playback')
+        seg = ast.dump(start)
+        self.assertIn('should_continue', seg, 'run_player 必须传 should_continue(代际检查)')
+
+    def test_both_backends_have_abort(self):
+        from control import DeviceController
+        from maatouch import MaaTouchController
+        self.assertTrue(hasattr(DeviceController, 'abort'), 'DeviceController 缺 abort')
+        self.assertTrue(hasattr(MaaTouchController, 'abort'), 'MaaTouchController 缺 abort')
+
+    def test_scrcpy_writes_are_locked(self):
+        '''所有写控制socket的地方都必须持锁, 否则和停止时的UP会字节交错'''
+        src = _src_ctrl()
+        for meth in ('def touch_many', 'def release_pointers', 'def touch('):
+            i = src.index(meth)
+            seg = src[i:i + 900]
+            self.assertIn('_send_lock', seg, f'{meth} 没有持 _send_lock')
+
+
 if __name__ == '__main__':
     unittest.main()

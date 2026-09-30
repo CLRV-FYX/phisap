@@ -158,6 +158,9 @@ class MainPage(ScrollArea):
         self._running = False
         self._player_thread: Thread | None = None
         self._start_time: float = 0.0
+        # 播放"代际": 每启动一次播放就+1。worker 记住自己属于哪一代,
+        # 发现代际变了就立刻停止发送——防止上一次没退干净的线程继续往设备上戳。
+        self._playback_gen = 0
 
         self._build()
         self._load_font_scale()
@@ -1035,6 +1038,8 @@ class MainPage(ScrollArea):
         '''manual:      True=按下按钮的时刻即第一拍(插入扫屏DOWN触点)
         prestarted: True=视觉自动开始已触发, 不再自己点屏幕, 直接播放'''
         assert self._raw_ans and self.controller
+        # 新的一轮播放: 代际+1, 让任何还没退干净的上一个worker立即停止发送
+        self._playback_gen += 1
         ans = self._raw_ans
         dw, dh = self.controller.device_width, self.controller.device_height
         w, h = dw, dh
@@ -1102,15 +1107,22 @@ class MainPage(ScrollArea):
         first = adapted[0]
         rest = iter(adapted[1:])
 
+        my_gen = self._playback_gen
+
         def worker():
+            # 代际过期(用户停止过/又重新开始过)就什么都不做
+            if my_gen != self._playback_gen:
+                return
             try:
                 if manual or prestarted:
                     stats = run_player(self.controller.touch_many, rest,
                                        lambda: self._start_time, lambda: self._running,
-                                       first_event=first)
+                                       first_event=first,
+                                       should_continue=lambda: my_gen == self._playback_gen)
                 else:
                     stats = run_player(self.controller.touch_many, iter(adapted),
-                                       lambda: self._start_time, lambda: self._running)
+                                       lambda: self._start_time, lambda: self._running,
+                                       should_continue=lambda: my_gen == self._playback_gen)
                 self.log('演奏结束')
                 if stats is not None:
                     for line in stats.summary(0):
@@ -1147,12 +1159,35 @@ class MainPage(ScrollArea):
         self._running = False
         self._vauto_waiting = False
         self._vauto_fire_time = 0.0
+        # 代际+1: 让当前worker立刻停止发送新事件(不等它自己发现_running变了)
+        self._playback_gen += 1
         self.log('正在停止...')
-        # 立即发UP释放所有触点,不等player线程自然结束(它可能因为sleep阻塞)
-        self._release_all_active()
-        # 立刻在GUI线程复位按钮。播放线程可能阻塞在 socket 发送上出不来,
-        # 那样它结束时发的 playback_finished 永远到不了, 界面就卡在"停止演奏"。
+        # 立刻在GUI线程复位按钮, 不等播放线程——它可能卡在发送上永远出不来。
         self._reset_go()
+        # 但"真正让手指离开屏幕"要另外做: 必须等播放线程不再写socket之后再发UP,
+        # 否则两个线程同时写控制socket会把触控包撕碎(见 DeviceController._send_lock),
+        # 表现为"界面显示停止了, 手指还按在屏幕上"。
+        Thread(target=self._stop_async, daemon=True).start()
+
+    def _stop_async(self):
+        '''(后台线程) 等播放线程退出, 然后释放所有触点。'''
+        t = self._player_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)
+            if t.is_alive():
+                # 0.5秒还没退出, 基本是阻塞在 socket/管道写入上(设备端不读了)。
+                # 强行断开传输让那个阻塞的write抛异常, 线程才能走到finally。
+                self.log('播放线程未在0.5秒内退出, 强制断开触控通道')
+                try:
+                    if self.controller is not None:
+                        self.controller.abort()
+                except Exception as e:
+                    self.log(f'强制断开失败(可忽略): {e}')
+                t.join(timeout=0.5)
+                if t.is_alive():
+                    self.log('播放线程仍未能退出, 触点可能残留, 建议重新连接设备')
+        # 线程已经不再写socket了, 现在发UP才是安全的
+        self._release_all_active()
 
     def _reset_go(self):
         '''复位演奏按钮。可能被调用多次(手动停止一次 + 播放线程结束信号一次),

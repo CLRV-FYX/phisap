@@ -19,6 +19,15 @@ SCRCPY_SERVER_URL = f'https://github.com/Genymobile/scrcpy/releases/download/v{S
 # 视频流帧头/会话包标志位（scrcpy v4 协议，见 scrcpy doc/develop.md "Video and audio"）
 _PACKET_FLAG_SESSION = 1 << 63
 
+# ---- 视频流参数：**不要调高** ----
+# phisap 只看视频流里的屏幕尺寸，画面是丢弃的。这两个值直接决定设备/模拟器的
+# H.264 编码负载，而 scrcpy-server 的编码线程和处理我们触控注入的控制socket
+# 是同一个进程：编码把 CPU 占满，触控事件的下发就会被拖慢，表现为"整体延迟1秒"。
+# 实测(用户确认)：5fps/500kbps 时序正常；调到 20fps/900kbps 后延迟约1秒。
+# 视觉自动开始只依赖"帧体积突变"，5fps(每帧100ms)足够触发，不需要更高帧率。
+VIDEO_MAX_FPS = 5
+VIDEO_BIT_RATE = 500000
+
 
 class ServerDisconnected(ConnectionError):
     pass
@@ -115,9 +124,10 @@ class DeviceController:
             'audio=false',
             'clipboard_autosync=false',
             # phisap 只需要视频流中的屏幕尺寸信息，不需要画面：
-            # 降低帧率和码率以减轻设备/模拟器的编码负担，避免影响打歌时序
-            'max_fps=20',
-            'video_bit_rate=900000',
+            # 低帧率+低码率是为了把编码负载压到最低，避免拖慢触控注入的时序。
+            # 想调高之前先看上面 VIDEO_MAX_FPS 处的注释(调高过, 延迟1秒, 已回退)。
+            f'max_fps={VIDEO_MAX_FPS}',
+            f'video_bit_rate={VIDEO_BIT_RATE}',
         ]
         self.server_process = subprocess.Popen(command_line)
         # 由于我们指定了audio=false，所以这只有两个socket
@@ -151,6 +161,11 @@ class DeviceController:
         self.collector_running = True
         self.device_width = 0
         self.device_height = 0
+        # 控制socket的写锁: 播放线程(发事件)和GUI线程(停止时发UP)会同时写它。
+        # socket.sendall 不保证原子——大缓冲区会被拆成多次 send() 系统调用,
+        # 两个线程交错写会把32字节的触控包撕碎, scrcpy-server 收到错位的数据,
+        # 于是"点了停止但手指没松开"。所有写控制socket的地方都必须持这把锁。
+        self._send_lock = threading.Lock()
         self._size_changed = threading.Event()
 
         def server_error_hint() -> str:
@@ -228,7 +243,9 @@ class DeviceController:
         self.control_collector.start()
 
     def touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> None:
-        self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
+        with self._send_lock:
+            if self.collector_running:
+                self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
 
     # ---- 屏幕活动度监视（视觉自动开始）：不看画面内容，只统计每帧字节数的突变 ----
     # Phigros 选曲/准备界面是静态 UI，H.264 编码后帧很小；进入演奏瞬间音符下落+背景流动，
@@ -274,7 +291,10 @@ class DeviceController:
     def touch_many(self, events) -> None:
         '''同一时刻的多个事件(需有pos/action/pointer属性)合并成一次发送'''
         if events:
-            self.control_socket.sendall(b''.join(self._pack_touch(*e.pos, e.action, e.pointer) for e in events))
+            data = b''.join(self._pack_touch(*e.pos, e.action, e.pointer) for e in events)
+            with self._send_lock:
+                if self.collector_running:
+                    self.control_socket.sendall(data)
 
     def _pack_touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> bytes:
         # 坐标系为当前视频尺寸(device_width x device_height)，scrcpy-server 会映射到实际屏幕；
@@ -307,7 +327,20 @@ class DeviceController:
             self._pack_touch(dw >> 1, dh >> 1, TouchAction.UP, pid)
             for pid in pids
         ]
-        self.control_socket.sendall(b''.join(pkts))
+        data = b''.join(pkts)
+        # 带超时: 停止时可能在GUI线程被调用, 不能无限阻塞(否则整个界面卡住)
+        with self._send_lock:
+            if not self.collector_running:
+                return
+            prev = self.control_socket.gettimeout()
+            try:
+                self.control_socket.settimeout(0.5)
+                self.control_socket.sendall(data)
+            finally:
+                try:
+                    self.control_socket.settimeout(prev)
+                except OSError:
+                    pass
 
     def reset_all(self) -> None:
         '''scrcpy 后端没有"重置所有触点"的原语, 由调用方维护 active 集合后调 release_pointers。'''
@@ -317,6 +350,19 @@ class DeviceController:
         self.touch(x, y, TouchAction.DOWN, pointer_id)
         time.sleep(delay)
         self.touch(x, y, TouchAction.UP, pointer_id)
+
+    def abort(self) -> None:
+        '''强制中断当前传输, 用于"点了停止但播放线程卡在发送上出不来"。
+
+        只关socket不动server进程: 关闭socket会让阻塞中的 sendall 立刻抛异常,
+        播放线程从而能走到 finally 里释放触点。之后想继续用要重新连接设备。
+        '''
+        self.collector_running = False
+        for skt in (getattr(self, 'control_socket', None), getattr(self, 'video_socket', None)):
+            try:
+                skt and skt.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         '''断开与设备的连接（切换设备时使用）'''
