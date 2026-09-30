@@ -132,9 +132,22 @@ class PlanThread(QThread):
 
 # ============== 主页面 ==============
 class MainPage(ScrollArea):
+    # ---- 跨线程通知GUI线程的信号 ----
+    # 播放线程/视觉等待线程都是普通 threading.Thread, 不能直接碰界面。
+    # 之前用 QMetaObject.invokeMethod(self, '_xxx', QueuedConnection) 是错的:
+    # 普通Python方法没注册进元对象, invokeMethod 找不到, 直接抛
+    # "No such method MainPage::_reset_go()", 导致播放结束后按钮永远停在"停止演奏"、
+    # _running 永远为True, 用户再也停不下来。pyqtSignal 才是跨线程调GUI的正确方式。
+    playback_finished = pyqtSignal()   # 播放结束/异常 -> _reset_go
+    vauto_abort = pyqtSignal()         # 视觉等待被取消 -> _vauto_abort
+    vauto_launch = pyqtSignal()        # 视觉检测到跳变 -> _vauto_launch
+    log_line = pyqtSignal(str)         # 任意线程写日志 -> 回GUI线程刷新PlainTextEdit
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('mainPage')
+        # 信号连接必须在 _build() 之前或之中做好(_build里创建的控件由下面这些槽操作)
+        self.log_line.connect(self._append_log)
         self.console = Console(highlight=False)
         self.downloader = Downloader(source=self._read_cached_source() or 'jsdelivr')
         self._dl_index_loaded = False
@@ -456,9 +469,21 @@ class MainPage(ScrollArea):
 
         outer.addStretch(1)
 
+        # ---- 跨线程信号 -> 槽 ----
+        self.playback_finished.connect(self._reset_go)
+        self.vauto_abort.connect(self._vauto_abort)
+        self.vauto_launch.connect(self._vauto_launch)
+
     # --- 辅助:给SettingCard右侧放自定义控件 ---
     # (直接操作 card.hBoxLayout,无需封装)
     def log(self, msg, level=None):
+        '''写日志。可能被播放线程等非GUI线程调用, 所以走信号回到GUI线程再刷新控件,
+        否则就是跨线程直接操作QPlainTextEdit(会触发 QTextCursor/QTextBlock
+        相关的 Qt 警告, 且严格来说是不安全的)。'''
+        self.log_line.emit(str(msg))
+
+    def _append_log(self, msg):
+        '''(GUI线程) 真正刷新日志控件'''
         self.log_view.appendPlainText(msg)
         self.log_view.moveCursor(QTextCursor.End)
 
@@ -951,8 +976,7 @@ class MainPage(ScrollArea):
             fired = ev.wait(timeout=120.0)
             self.controller.stop_activity_watch()
             if not self._vauto_waiting:
-                from PyQt5.QtCore import QMetaObject, Qt
-                QMetaObject.invokeMethod(self, '_vauto_abort', Qt.QueuedConnection)
+                self.vauto_abort.emit()
                 return
             if not fired:
                 self.log('视觉自动开始: 等待超时(120秒)仍未检测到界面跳变')
@@ -960,10 +984,8 @@ class MainPage(ScrollArea):
             # 真实跳变发生在 wait() 返回前的某一帧, 这里回退半帧(约25ms @20fps)补偿检测延迟
             self._vauto_fire_time = time.perf_counter() - 0.025
             self._start_time = self._vauto_fire_time
-            # 必须在GUI线程里启动播放(要改按钮文字/重连信号),
-            # 这里只提前算好坐标适配太重, 所以用QueuedConnection切回主线程
-            from PyQt5.QtCore import QMetaObject, Qt
-            QMetaObject.invokeMethod(self, '_vauto_launch', Qt.QueuedConnection)
+            # 必须在GUI线程里启动播放(要改按钮文字/重连信号), 用信号切回主线程
+            self.vauto_launch.emit()
 
         Thread(target=waiter, daemon=True).start()
 
@@ -1098,8 +1120,8 @@ class MainPage(ScrollArea):
             finally:
                 # 播放结束(无论正常/异常/手动停止)都释放残余触点,避免手指卡在屏幕上
                 self._release_all_active()
-                from PyQt5.QtCore import QMetaObject, Qt
-                QMetaObject.invokeMethod(self, '_reset_go', Qt.QueuedConnection)
+                # 通知GUI线程复位按钮。必须用信号: invokeMethod 找不到未注册的Python方法
+                self.playback_finished.emit()
 
         self._player_thread = Thread(target=worker, daemon=True)
         self._player_thread.start()
@@ -1128,17 +1150,26 @@ class MainPage(ScrollArea):
         self.log('正在停止...')
         # 立即发UP释放所有触点,不等player线程自然结束(它可能因为sleep阻塞)
         self._release_all_active()
+        # 立刻在GUI线程复位按钮。播放线程可能阻塞在 socket 发送上出不来,
+        # 那样它结束时发的 playback_finished 永远到不了, 界面就卡在"停止演奏"。
+        self._reset_go()
 
     def _reset_go(self):
+        '''复位演奏按钮。可能被调用多次(手动停止一次 + 播放线程结束信号一次),
+        所以先用按钮文字判断是否已复位, 否则 clicked 会被连上两份 run, 点一下开始两次。
+        注意: 早退时不能顺手 setEnabled(True) —— 没生成规划时按钮本来就该是禁用的,
+        那样会被错误启用。'''
+        already = self.go_btn.text() == '开始演奏'
         self._vauto_waiting = False
-        self.go_btn.setText('开始演奏')
-        self.go_btn.setIcon(FIF.PLAY)
-        try:
-            self.go_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.go_btn.clicked.connect(self.run)
-        self.go_btn.setEnabled(True)
+        if not already:
+            self.go_btn.setText('开始演奏')
+            self.go_btn.setIcon(FIF.PLAY)
+            try:
+                self.go_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.go_btn.clicked.connect(self.run)
+            self.go_btn.setEnabled(True)
         self.sync_btn.setEnabled(True)
 
     # --- 缓存 ---
