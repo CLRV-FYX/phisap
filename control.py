@@ -28,9 +28,22 @@ _PACKET_FLAG_SESSION = 1 << 63
 VIDEO_MAX_FPS = 5
 VIDEO_BIT_RATE = 500000
 
+# 控制socket的超时(秒)。phisap 只需要视频流里的屏幕尺寸, 画面是丢弃的,
+# 视频流断了不影响触控注入, 所以两个通道的健康状态必须分开记录。
+# 这个超时在连接时设一次就不再改 —— 绝不能在运行时 settimeout():
+# 另一个线程正阻塞在同一个socket的recv()上, 把socket切成非阻塞会让那个
+# recv 抛BlockingIOError, 接收线程于是退出并把通道判死, 之后所有触控
+# 注入被静默丢弃(症状: "停止演奏一次后, 再开始演奏完全无效")。
+CONTROL_SOCKET_TIMEOUT = 0.5
+
 
 class ServerDisconnected(ConnectionError):
     pass
+
+
+class ControlChannelDead(RuntimeError):
+    '''触控通道已断开。此时再发事件必然全部丢失, 必须明确报错而不是静默丢弃 ——
+    否则用户看到的就是"点了开始演奏, 屏幕上什么反应都没有"。'''
 
 
 def _recv_exact(skt: socket.socket, n: int) -> bytes:
@@ -73,7 +86,8 @@ class DeviceController:
     session_id: str = ''
     device_width: int = 0
     device_height: int = 0
-    collector_running: bool = False
+    collector_running: bool = False      # 视频流是否活着(只影响屏幕尺寸/视觉自动开始)
+    control_running: bool = False        # 控制通道是否活着(影响触控注入, 是打歌的命脉)
     video_socket: socket.socket
     control_socket: socket.socket
     server_process: subprocess.Popen
@@ -153,12 +167,15 @@ class DeviceController:
         except OSError:
             pass
         self.video_socket.settimeout(None)
-        self.control_socket.settimeout(None)
+        # 控制socket带超时: 万一设备端不再读, sendall 最多阻塞这么久就抛异常,
+        # 不会把播放线程/GUI线程永久挂住。设一次, 之后不再改动。
+        self.control_socket.settimeout(CONTROL_SOCKET_TIMEOUT)
         subprocess.run(
             [*adb, 'reverse', '--remove', f'localabstract:scrcpy_{self.session_id}'], capture_output=True
         )  # 移除创建的adb tunnel，我们不再需要它了
 
         self.collector_running = True
+        self.control_running = True
         self.device_width = 0
         self.device_height = 0
         # 控制socket的写锁: 播放线程(发事件)和GUI线程(停止时发UP)会同时写它。
@@ -222,19 +239,24 @@ class DeviceController:
                         _skip_exact(self.video_socket, plen)
             except Exception as e:
                 if self.collector_running:  # 主动close()时不打印
-                    print('[client]', f'视频流中断: {e}')
+                    print('[client]', f'视频流中断(不影响触控注入): {e}')
+                # 只标记视频通道。触控注入走的是另一个socket, 视频断了照样能打歌。
                 self.collector_running = False
 
         def ctrlmsg_receiver():
-            '''读走 scrcpy-server 通过控制通道发来的消息（剪贴板等），phisap 不需要，直接丢弃'''
+            '''读走 scrcpy-server 通过控制通道发来的消息（剪贴板等），phisap 不需要，直接丢弃。
+            注意socket带超时, 会周期性抛 socket.timeout, 那不是故障, 继续等就行。'''
             try:
-                while self.collector_running:
-                    if not self.control_socket.recv(4096):
-                        break
+                while self.control_running:
+                    try:
+                        if not self.control_socket.recv(4096):
+                            break
+                    except socket.timeout:
+                        continue
             except Exception as e:
-                if self.collector_running:
+                if self.control_running:
                     print('[client]', f'控制通道中断: {e}')
-            self.collector_running = False
+            self.control_running = False
 
         self.streaming_collector = threading.Thread(target=video_receiver, daemon=True)
         self.streaming_collector.start()
@@ -244,8 +266,9 @@ class DeviceController:
 
     def touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> None:
         with self._send_lock:
-            if self.collector_running:
-                self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
+            if not self.control_running:
+                raise ControlChannelDead('触控通道已断开, 无法注入事件。请重新连接设备。')
+            self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
 
     # ---- 屏幕活动度监视（视觉自动开始）：不看画面内容，只统计每帧字节数的突变 ----
     # Phigros 选曲/准备界面是静态 UI，H.264 编码后帧很小；进入演奏瞬间音符下落+背景流动，
@@ -293,8 +316,9 @@ class DeviceController:
         if events:
             data = b''.join(self._pack_touch(*e.pos, e.action, e.pointer) for e in events)
             with self._send_lock:
-                if self.collector_running:
-                    self.control_socket.sendall(data)
+                if not self.control_running:
+                    raise ControlChannelDead('触控通道已断开, 无法注入事件。请重新连接设备。')
+                self.control_socket.sendall(data)
 
     def _pack_touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> bytes:
         # 坐标系为当前视频尺寸(device_width x device_height)，scrcpy-server 会映射到实际屏幕；
@@ -328,19 +352,15 @@ class DeviceController:
             for pid in pids
         ]
         data = b''.join(pkts)
-        # 带超时: 停止时可能在GUI线程被调用, 不能无限阻塞(否则整个界面卡住)
+        # 不要在这里 settimeout()! 控制socket的超时在连接时就已经设好了
+        # (见 CONTROL_SOCKET_TIMEOUT)。运行时改超时会把socket切成非阻塞,
+        # 而另一个线程正阻塞在同一个socket的recv()上, 那个recv会立刻抛
+        # BlockingIOError 导致接收线程退出、通道被判死 —— 于是"停止演奏一次后,
+        # 之后再开始演奏完全无效"(所有事件被静默丢弃)。
         with self._send_lock:
-            if not self.collector_running:
+            if not self.control_running:
                 return
-            prev = self.control_socket.gettimeout()
-            try:
-                self.control_socket.settimeout(0.5)
-                self.control_socket.sendall(data)
-            finally:
-                try:
-                    self.control_socket.settimeout(prev)
-                except OSError:
-                    pass
+            self.control_socket.sendall(data)
 
     def reset_all(self) -> None:
         '''scrcpy 后端没有"重置所有触点"的原语, 由调用方维护 active 集合后调 release_pointers。'''
@@ -358,6 +378,7 @@ class DeviceController:
         播放线程从而能走到 finally 里释放触点。之后想继续用要重新连接设备。
         '''
         self.collector_running = False
+        self.control_running = False
         for skt in (getattr(self, 'control_socket', None), getattr(self, 'video_socket', None)):
             try:
                 skt and skt.close()
@@ -367,6 +388,7 @@ class DeviceController:
     def close(self) -> None:
         '''断开与设备的连接（切换设备时使用）'''
         self.collector_running = False
+        self.control_running = False
         for skt in (getattr(self, 'video_socket', None), getattr(self, 'control_socket', None)):
             try:
                 skt and skt.close()

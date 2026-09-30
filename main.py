@@ -158,6 +158,10 @@ class PlanThread(QThread):
 # 让第一批事件(按下按钮那一戳)落在游戏开始之前而不是之后。
 MANUAL_START_LEAD = 0.01
 
+# "偏移"可调范围(ms)。以前是±500, 用户反馈不够: 不同设备/模拟器的整体时序偏移
+# 能超过1秒, 500ms根本补偿不过来。放宽到±2秒。
+DELAY_OFFSET_LIMIT_MS = 2000
+
 
 def _active_pids_of(adapted) -> set[int]:
     '''从适配后的事件表算出"当前处于按下状态的触点集合", 停止时用来全部抬起。'''
@@ -306,9 +310,12 @@ class MainPage(ScrollArea):
         self.algo_card.hBoxLayout.addSpacing(16)
         plan_group.addSettingCard(self.algo_card)
 
-        self.delay_card = SettingCard(FIF.STOP_WATCH, '偏移 (ms)', '正值延后,负值提前')
+        self.delay_card = SettingCard(FIF.STOP_WATCH, '偏移 (ms)',
+                                      '正值延后,负值提前, 范围 ±2秒')
         self.delay_spin = DoubleSpinBox()
-        self.delay_spin.setRange(-500, 500)
+        # 以前上限只有±500ms, 用户反馈不够用(某些设备/模拟器整体偏移能到1秒以上)。
+        # 放宽到±2000ms; 步长跟着值的大小变, 大偏移时不用按几百下。
+        self.delay_spin.setRange(-DELAY_OFFSET_LIMIT_MS, DELAY_OFFSET_LIMIT_MS)
         self.delay_spin.setSingleStep(5)
         self.delay_spin.setDecimals(1)
         self.delay_spin.setValue(0)
@@ -1035,6 +1042,8 @@ class MainPage(ScrollArea):
         self.controller.tap(w >> 1, h >> 1)
         offset = self.delay_spin.value() / 1000.0
         self._start_time = time.perf_counter() + offset
+        if offset:
+            self.log(f'已应用偏移 {offset * 1000:+.1f} ms')
         self.log(f'同步完成,偏移 {offset*1000:.1f} ms')
         self._start_playback(manual=False)
 
@@ -1194,18 +1203,24 @@ class MainPage(ScrollArea):
                 if got is None:
                     return
                 adapted, active = got
+                offset = self.delay_spin.value() / 1000.0
                 if manual:
                     fnm = first_note_ms_from_path(self._find_chart_path())
                     adapted = manual_start_plan(adapted, fnm)
                     active = _active_pids_of(adapted)
-                    self._start_time = time.perf_counter() - adapted[0][0] / 1000 - MANUAL_START_LEAD
+                    # 偏移正负号与 sync_ms 一致: 正值=打歌时钟往后推=事件延后。
+                    # 手动开始以前完全不读这个偏移, 用户调了没反应, 等于没有补偿手段。
+                    self._start_time = (time.perf_counter() - adapted[0][0] / 1000
+                                        - MANUAL_START_LEAD + offset)
+                    if offset:
+                        self.log(f'已应用偏移 {offset * 1000:+.1f} ms')
                 elif prestarted:
                     # 视觉自动开始: 锚点不是"现在", 而是"检测到界面跳变的时刻"(_vauto_fire_time),
                     # 这样打歌时钟与Phigros内部时钟同源, 每首歌(不管第一音符在第几秒)都自动对齐。
                     fnm = first_note_ms_from_path(self._find_chart_path())
                     adapted = manual_start_plan(adapted, fnm)
                     active = _active_pids_of(adapted)
-                    self._start_time = self._vauto_fire_time - adapted[0][0] / 1000
+                    self._start_time = self._vauto_fire_time - adapted[0][0] / 1000 + offset
                 self._active_pids = active
                 if not adapted:
                     self.log('规划为空, 没有可发送的事件')
@@ -1225,8 +1240,13 @@ class MainPage(ScrollArea):
                 if stats is not None:
                     for line in stats.summary(0):
                         self.log(line)
-            except Exception:
-                self.log('演奏出错:\n' + traceback.format_exc())
+            except Exception as e:
+                # 触控通道断开时给出明确结论 —— 不要只说一句"演奏出错",
+                # 那看起来像bug, 而实际是连接断了, 重新连设备就能好。
+                if type(e).__name__ == 'ControlChannelDead':
+                    self.log(f'触控通道已断开, 无法继续注入: {e}\n请重新连接设备后再演奏。')
+                else:
+                    self.log('演奏出错:\n' + traceback.format_exc())
             finally:
                 # 播放结束(无论正常/异常/手动停止)都释放残余触点,避免手指卡在屏幕上
                 self._release_all_active()
@@ -1258,17 +1278,20 @@ class MainPage(ScrollArea):
         self._vauto_fire_time = 0.0
         # 代际+1: 让当前worker立刻停止发送新事件(不等它自己发现_running变了)
         self._playback_gen += 1
+        # 立刻抓住当前worker线程对象。必须现在就抓 —— 用户随时可能再点开始,
+        # 那时 self._player_thread 会被换成新线程, 旧的_stop_async就会join错人。
+        t = self._player_thread
         self.log('正在停止...')
         # 立刻在GUI线程复位按钮, 不等播放线程——它可能卡在发送上永远出不来。
         self._reset_go()
-        # 但"真正让手指离开屏幕"要另外做: 必须等播放线程不再写socket之后再发UP,
-        # 否则两个线程同时写控制socket会把触控包撕碎(见 DeviceController._send_lock),
-        # 表现为"界面显示停止了, 手指还按在屏幕上"。
-        Thread(target=self._stop_async, daemon=True).start()
+        # "真正让手指离开屏幕"由 worker 自己的 finally 完成: 只有它能保证一定发生在
+        # 自己最后一次写socket之后, 也不会误伤随后开始的新一轮播放(新一轮会覆盖
+        # _active_pids, 而旧线程此刻才发UP就会把新播放的手指也抬起来)。
+        # 这里只负责等它退出; 等不到才强制断开。
+        Thread(target=self._stop_async, args=(t,), daemon=True).start()
 
-    def _stop_async(self):
-        '''(后台线程) 等播放线程退出, 然后释放所有触点。'''
-        t = self._player_thread
+    def _stop_async(self, t):
+        '''(后台线程) 等播放线程真正退出。触点释放交给 worker 自己的 finally。'''
         if t is not None and t.is_alive():
             t.join(timeout=0.5)
             if t.is_alive():
@@ -1281,10 +1304,11 @@ class MainPage(ScrollArea):
                 except Exception as e:
                     self.log(f'强制断开失败(可忽略): {e}')
                 t.join(timeout=0.5)
-                if t.is_alive():
+                if t.is_alive() and self._player_thread is t:
+                    # 极端情况: finally都没跑到。兜底抬一下已知触点。
+                    # 加 self._player_thread is t 判断, 避免误抬新一轮播放的手指。
                     self.log('播放线程仍未能退出, 触点可能残留, 建议重新连接设备')
-        # 线程已经不再写socket了, 现在发UP才是安全的
-        self._release_all_active()
+                    self._release_all_active()
 
     def _reset_go(self):
         '''复位演奏按钮。可能被调用多次(手动停止一次 + 播放线程结束信号一次),
