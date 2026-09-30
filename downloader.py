@@ -247,15 +247,22 @@ class Downloader:
                     continue
         raise RuntimeError(f'在仓库中未找到 {song_id} 对应的目录')
 
-    def search(self, keyword: str) -> list[tuple[str, str, str, list[str]]]:
-        kw = keyword.strip().lower()
+    def search(self, keyword: str, case_sensitive: bool = False) -> list[tuple[str, str, str, list[str]]]:
+        kw = keyword.strip()
+        if not case_sensitive:
+            kw = kw.lower()
         results = []
         for sid, info in self.song_index.items():
             title = info.get('Name', '')
             composer = info.get('Composer', '')
             diffs = [d for d in _DIFFICULTIES if d in info]
-            if kw and kw not in sid.lower() and kw not in title.lower() and kw not in composer.lower():
-                continue
+            if kw:
+                if case_sensitive:
+                    if kw not in sid and kw not in title and kw not in composer:
+                        continue
+                else:
+                    if kw not in sid.lower() and kw not in title.lower() and kw not in composer.lower():
+                        continue
             results.append((sid, title, composer, diffs))
         results.sort(key=lambda x: x[1].lower())
         return results

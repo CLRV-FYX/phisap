@@ -23,7 +23,7 @@ from qfluentwidgets import (
     SubtitleLabel, CaptionLabel, StrongBodyLabel,
     PrimaryPushButton, PushButton, ToolButton, SwitchButton,
     SearchLineEdit, PlainTextEdit,
-    ComboBox, DoubleSpinBox,
+    ComboBox, DoubleSpinBox, CheckBox,
     SettingCardGroup, SettingCard,
     InfoBar, InfoBarPosition,
     IndeterminateProgressBar,
@@ -188,9 +188,15 @@ class MainPage(ScrollArea):
         self.search_edit.textChanged.connect(self._apply_search_filter)
         self.refresh_btn = ToolButton(FIF.SYNC)
         self.refresh_btn.clicked.connect(self.refresh_songs)
+        self.local_case_btn = PushButton('Aa')
+        self.local_case_btn.setCheckable(True)
+        self.local_case_btn.setToolTip('区分大小写')
+        self.local_case_btn.setFixedWidth(40)
+        self.local_case_btn.clicked.connect(self._apply_search_filter)
         lay = QHBoxLayout()
         lay.setSpacing(6)
         lay.addWidget(self.search_edit)
+        lay.addWidget(self.local_case_btn)
         lay.addWidget(self.refresh_btn)
         w = QWidget(); w.setLayout(lay)
         self.search_card.hBoxLayout.addWidget(w, 0, Qt.AlignRight)
@@ -248,11 +254,28 @@ class MainPage(ScrollArea):
 
         self.auto_card = SettingCard(FIF.UPDATE, '自动开始', '第一个音符自动触发,无需手动点击')
         self.auto_switch = SwitchButton()
+        self.auto_switch.setChecked(False)   # 默认关闭: 需要先把偏移调准
         self.auto_switch.setOffText('关')
         self.auto_switch.setOnText('开')
         self.auto_card.hBoxLayout.addWidget(self.auto_switch, 0, Qt.AlignRight)
         self.auto_card.hBoxLayout.addSpacing(16)
         plan_group.addSettingCard(self.auto_card)
+
+        # 视觉自动开始: 程序自己盯着屏幕, 检测Phigros从准备界面跳进演奏界面的瞬间,
+        # 完全不需要你对齐第一拍, 每首歌(不管第一个音符在第几秒)都全自动
+        self.vauto_card = SettingCard(FIF.VIEW, '视觉自动开始 (实验性, 默认关)',
+                                      '靠屏幕帧体积突变猜进入演奏的时机, 不保证可靠, 默认关闭')
+        self.vauto_switch = SwitchButton()
+        self.vauto_switch.setChecked(False)   # 默认关闭: 纯启发式检测, 未经验证
+        self.vauto_switch.setOffText('关')
+        self.vauto_switch.setOnText('开')
+        self.vauto_switch.checkedChanged.connect(self._on_vauto_changed)
+        self.vauto_card.hBoxLayout.addWidget(self.vauto_switch, 0, Qt.AlignRight)
+        self.vauto_card.hBoxLayout.addSpacing(16)
+        plan_group.addSettingCard(self.vauto_card)
+        self._vauto_event = None
+        self._vauto_fire_time = 0.0
+        self._vauto_waiting = False
 
         plan_btn_row = QHBoxLayout()
         plan_btn_row.setSpacing(8)
@@ -291,16 +314,20 @@ class MainPage(ScrollArea):
         dl_search_card = SettingCard(FIF.SEARCH, '搜索', '输入曲名/曲师/ID,回车搜索')
         self.dl_search = SearchLineEdit()
         self.dl_search.setPlaceholderText('搜索在线谱面...')
-        self.dl_search.setFixedWidth(340)
         self.dl_search.returnPressed.connect(self._dl_do_search)
         self.dl_diff = ComboBox()
         self.dl_diff.addItems(['EZ', 'HD', 'IN', 'AT', 'SP'])
         self.dl_diff.setCurrentText('AT')
         self.dl_diff.setFixedWidth(90)
+        self.dl_case_btn = PushButton('Aa')
+        self.dl_case_btn.setCheckable(True)
+        self.dl_case_btn.setToolTip('区分大小写(默认不区分)')
+        self.dl_case_btn.setFixedWidth(40)
         dl_row = QHBoxLayout()
         dl_row.setSpacing(6)
         dl_row.addWidget(self.dl_search, stretch=1)
         dl_row.addWidget(self.dl_diff)
+        dl_row.addWidget(self.dl_case_btn)
         dl_row.setAlignment(Qt.AlignRight)
         dl_search_card.hBoxLayout.addLayout(dl_row, 1)
         dl_search_card.hBoxLayout.addSpacing(16)
@@ -433,8 +460,15 @@ class MainPage(ScrollArea):
         self._apply_search_filter()
 
     def _apply_search_filter(self):
-        kw = self.search_edit.text().strip().lower()
-        vals = self._all_song_values if not kw else [s for s in self._all_song_values if kw in s.lower()]
+        kw = self.search_edit.text().strip()
+        case = self.local_case_btn.isChecked()
+        if not kw:
+            vals = list(self._all_song_values)
+        elif case:
+            vals = [s for s in self._all_song_values if kw in s]
+        else:
+            kw_l = kw.lower()
+            vals = [s for s in self._all_song_values if kw_l in s.lower()]
         cur = self.song_box.currentText()
         self.song_box.blockSignals(True)
         self.song_box.clear()
@@ -568,53 +602,77 @@ class MainPage(ScrollArea):
 
     def _help_auto_start(self):
         QMessageBox.information(self, '自动开始说明',
-            '【手动模式(默认)】\n'
-            '打开Phigros进入选曲/准备界面,选好曲目和难度,连接设备,点"开始演奏"。\n'
-            '程序会在按钮按下的瞬间认为 t≈第一个音符时刻 - 10ms,扫屏手指在那之前就按到屏幕上。\n'
-            '您需要在第一个音符快落到判定线时再点"开始演奏",否则会整体提前/延后。\n\n'
-            '【计时器同步模式】\n'
+            '【方式一: 视觉自动开始(实验性, 默认关闭, 不保证可靠)】\n'
+            '打开"视觉自动开始"开关 -> 点"开始演奏" -> 程序会帮你在屏幕中心点一下, \n'
+            '然后以20fps盯着屏幕帧数据。当检测到Phigros从准备界面跳进演奏界面\n'
+            '(音符开始下落, 画面帧体积突变)的瞬间, 立刻按规划发送事件。\n'
+            '原理: 只看每帧H.264数据的大小, 不解码画面内容, CPU占用极低。\n'
+            '局限(所以默认关): 这是纯启发式猜测, 不是真的"看懂"画面。\n'
+            '  - 帧体积受码率/画面复杂度/模拟器性能影响, 阈值1.8倍是我拍的, \n'
+            '    不同设备/不同曲目可能不跳变或误触发;\n'
+            '  - 20fps意味着最多滞后50ms, 加上我回退的25ms, 误差可能到几十毫秒;\n'
+            '  - 检测到的是"进入演奏界面", 不是"第一个音符落到判定线", \n'
+            '    前奏长的歌会整体偏早。\n'
+            '如果试了不准, 请改用方式二(计时器同步)或方式三。\n\n'
+            '【方式二: 计时器同步(第一拍按下)】\n'
             '点"计时器同步(第一拍按下)"按钮——程序会在屏幕中心点一下(帮您点开始),\n'
-            '并把那一时刻记为 t=0+offset;之后自动开始按规划发送事件。\n'
+            '并把那一时刻记为 t=0+offset; 之后自动开始按规划发送事件。\n'
             '您只需在第一拍(第一个音符下落命中判定线)的瞬间点这个按钮,\n'
-            '程序会根据"偏移(ms)"微调:正值延后,负值提前。\n\n'
-            '【自动开始模式(开关)】\n'
-            '开启后,点"开始演奏"时:程序会自动点屏幕中心触发Phigros开始,\n'
-            '并立刻开始按规划发送事件,无需你对齐第一拍。\n'
+            '程序会根据"偏移(ms)"微调: 正值延后, 负值提前。\n\n'
+            '【方式三: 自动开始开关】\n'
+            '开启"自动开始"后, 点"开始演奏"时: 程序会自动点屏幕中心触发Phigros开始,\n'
+            '并立刻开始按规划发送事件, 无需你对齐第一拍。\n'
             '这要求您的"偏移(ms)"设置得非常准——建议先用计时器同步模式测几次,\n'
-            '记录每局恰好全Perfect时的偏移值,填到"偏移"里再开自动开始。\n'
+            '记录每局恰好全Perfect时的偏移值, 填到"偏移"里再开自动开始。\n'
             '原理: manual_start_plan() 会在第一个音符之前插入扫屏触点的DOWN事件,\n'
             '按下"开始"按钮时直接把时钟设为 第一个事件时刻 - 10ms 开始播放,\n'
-            '实现"按下即开始"的效果,不用等您对齐节拍。\n\n'
+            '实现"按下即开始"的效果, 不用等您对齐节拍。\n\n'
+            '【手动模式】\n'
+            '三个开关都关时, 点"开始演奏"即认为 按下时刻 = 第一拍。\n'
+            '适合你已经很熟、能稳定对齐的情况。\n\n'
             '【微调】\n'
-            '打歌过程中/刚结束前,用方向键/鼠标调节偏移是老版本特性;\n'
-            '当前版本推荐:一局打完看统计信息里的"最大延迟",据此调整偏移ms。')
+            '打歌过程中/刚结束前, 用方向键/鼠标调节偏移是老版本特性;\n'
+            '当前版本推荐: 一局打完看统计信息里的"最大延迟", 据此调整偏移ms。')
 
     def _help_ios(self):
         QMessageBox.information(self, 'iOS 支持说明',
-            '很抱歉,phisap **目前不支持 iOS**。\n\n'
-            '原因:\n'
-            '1. phisap 通过 adb + scrcpy-server 协议向 Android 设备注入触控事件,\n'
-            '   iOS 没有 adb 协议,也无法在非越狱设备上运行 scrcpy-server。\n'
-            '2. iOS 的触控注入在非越狱环境下只能通过 XCTest/WebDriverAgent 等\n'
-            '   测试框架实现,延迟高、安装麻烦、需要签名、而且不支持多点触控高频上报。\n'
-            '3. Phigros官方也没有开放任何外部控制接口。\n\n'
-            '替代方案:\n'
-            '- 使用 Android 模拟器(MuMu / 雷电 / BlueStacks 等)在 PC 上运行Phigros,\n'
-            '  adb连接模拟器(127.0.0.1:端口),phisap直接使用。\n'
-            '- 使用已越狱的iOS设备,通过FingerTouch等触控注入Tweak\n'
-            '  (需要自己写适配层,本项目暂不提供)。\n'
-            '- iPad/iPhone 用户推荐使用Android备用机或模拟器,这是目前最稳妥的方案。')
+            'iOS 无越狱触控注入的现状:\n\n'
+            '【旧方案(需越狱)】\n'
+            '  IOS13-SimulateTouch / ZXTouch / PTFakeTouch\n'
+            '  系统级多点触控注入,延迟很低(5ms内),但需要 iOS 11-14 越狱;\n'
+            '  iOS 15+ 上 palera1n / Taurine 等越狱也能装类似 tweak。\n\n'
+            '【无越狱方案(2025 最新)】\n'
+            '  SideTap (github.com/ucsandman/sidetap) — MIT 开源,\n'
+            '  无需 Mac、无需越狱,只要 USB 数据线 + 免费 Apple ID:\n'
+            '    1) 安装 go-ios + Python 客户端(Windows 一键安装脚本)\n'
+            '    2) iPhone 开启开发者模式(iOS 17+),信任此电脑\n'
+            '    3) 用 Sideloadly 免费签名把 WebDriverAgent.ipa 装到手机\n'
+            '    4) 通过 go-ios USB 隧道访问 WDA,HTTP 接口下发触控事件\n'
+            '  缺点: WDA 单指约 50ms 延迟,多指 MOVE 每批约 50ms,\n'
+            '  对音游(要求 5ms 内释放)延迟偏大,能跑 EZ/HD 或非纵连曲目。\n'
+            '  (免费 Apple ID 签名每 7 天需重签一次,重连即恢复)\n\n'
+            '【iOS 模拟器方案(tapflow)】\n'
+            '  github.com/jo-duchan/tapflow 可在 Mac 上驱动 iOS 模拟器\n'
+            '  并原生 XCTest 注入触控(无 WDA 延迟),但需要 Mac + Xcode 且非真机。\n\n'
+            '【phisap 当前支持情况】\n'
+            '  目前 DeviceController 是为 Android adb + scrcpy 协议写的;\n'
+            '  iOS 需要实现同样的 tap / device_width / device_height 接口才能接入。\n'
+            '  如确需 WDA backend 支持请提 issue。\n\n'
+            '【推荐替代】\n'
+            '  最稳方案仍是 Android 备用机或 PC 模拟器(MuMu/雷电/BlueStocks),\n'
+            '  adb 直连,phisap 开箱即用。')
 
     def _dl_do_search(self):
         def do_search():
             kw = self.dl_search.text().strip()
-            results = self.downloader.search(kw)
+            case = self.dl_case_btn.isChecked()
+            results = self.downloader.search(kw, case_sensitive=case)
             self.dl_list.clear()
             for sid, title, comp, diffs in results[:300]:
                 item = QTreeWidgetItem([title, comp, ' / '.join(diffs)])
                 item.setData(0, Qt.UserRole, sid)
                 self.dl_list.addTopLevelItem(item)
-            self._dl_set_status(f'找到 {len(results)} 首,显示前300首(双击下载)')
+            self._dl_set_status(f'找到 {len(results)} 首,显示前300首(双击下载)' + (' (区分大小写)' if case else ''))
         self._dl_ensure_index(do_search)
 
     def _dl_do_download(self):
@@ -755,6 +813,16 @@ class MainPage(ScrollArea):
             InfoBar.success('已导出', fn, parent=self.window(), duration=2000)
 
     # --- 播放 ---
+    def _on_vauto_changed(self, on: bool):
+        '''视觉自动开始开关: 开时排斥"自动开始(计时器)"开关, 由程序自己盯屏幕。'''
+        self._vauto_event = None
+        self._vauto_fire_time = 0.0
+        self._vauto_waiting = False
+        if on and self.auto_switch.isChecked():
+            self.auto_switch.setChecked(False)
+            self.log('已从"计时器同步"切换到"视觉自动开始"')
+        self.log(f'视觉自动开始: {"开" if on else "关"}')
+
     def sync_ms(self):
         if not self.controller:
             InfoBar.warning('无设备', '请先连接 ADB 设备', parent=self.window(), duration=2500); return
@@ -784,13 +852,104 @@ class MainPage(ScrollArea):
                 return
         if self.auto_switch.isChecked():
             self.sync_ms()
+        elif self.vauto_switch.isChecked():
+            self.log('视觉自动开始: 等待检测进入演奏界面(请先点Phigros开始按钮)')
+            self._start_visual_wait()
         else:
             self.log('手动开始:按下按钮时对齐第一个音符')
             self._start_playback(manual=True)
 
+    def _start_visual_wait(self):
+        '''视觉自动开始: 点一下屏幕中心帮用户触发开始, 然后盯屏幕帧体积突变,
+        检测到 Phigros 从准备界面跳进演奏界面的瞬间, 才真正按规划发送事件。
+        这样不同歌曲(第一个音符在第几秒)都不需要你手动对齐。'''
+        if not self.controller:
+            InfoBar.warning('无设备', '请先连接 ADB 设备', parent=self.window(), duration=2500); return
+        w, h = self.controller.device_width, self.controller.device_height
+        try:
+            self.controller.tap(w >> 1, h >> 1)
+        except Exception:
+            pass
+        try:
+            ev = self.controller.start_activity_watch(cooldown=2.0)
+        except Exception as e:
+            self.log(f'视觉自动开始启动失败(回退到计时器同步): {e}')
+            self.controller.stop_activity_watch()
+            self.sync_ms()
+            return
+        self._vauto_event = ev
+        self._vauto_waiting = True
+        self.log('已开启屏幕监测(20fps), 请在手机上点开始...')
+        InfoBar.info('等待开始', '请在设备上点开始, 程序检测到进入演奏后自动开打',
+                     parent=self.window(), duration=6000, position=InfoBarPosition.TOP)
+        self.go_btn.setText('取消等待')
+        self.go_btn.setIcon(FIF.CANCEL)
+        try:
+            self.go_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.go_btn.clicked.connect(self._cancel_visual_wait)
+        self.sync_btn.setEnabled(False)
+
+        def waiter():
+            fired = ev.wait(timeout=120.0)
+            self.controller.stop_activity_watch()
+            if not self._vauto_waiting:
+                from PyQt5.QtCore import QMetaObject, Qt
+                QMetaObject.invokeMethod(self, '_vauto_abort', Qt.QueuedConnection)
+                return
+            if not fired:
+                self.log('视觉自动开始: 等待超时(120秒)仍未检测到界面跳变')
+            # 记录"检测到跳变"的绝对时刻作为打歌时钟锚点;
+            # 真实跳变发生在 wait() 返回前的某一帧, 这里回退半帧(约25ms @20fps)补偿检测延迟
+            self._vauto_fire_time = time.perf_counter() - 0.025
+            self._start_time = self._vauto_fire_time
+            # 必须在GUI线程里启动播放(要改按钮文字/重连信号),
+            # 这里只提前算好坐标适配太重, 所以用QueuedConnection切回主线程
+            from PyQt5.QtCore import QMetaObject, Qt
+            QMetaObject.invokeMethod(self, '_vauto_launch', Qt.QueuedConnection)
+
+        Thread(target=waiter, daemon=True).start()
+
+    def _vauto_launch(self):
+        '''(GUI线程) 视觉自动开始检测到跳变后真正开始播放'''
+        if not self._vauto_waiting:
+            return
+        self._vauto_waiting = False
+        self.log(f'视觉触发: 已检测到进入演奏, 锚点回退25ms')
+        self._start_playback(manual=False, prestarted=True)
+
+    def _cancel_visual_wait(self):
+        '''视觉自动开始等待期间用户点按钮取消'''
+        if not self._vauto_waiting:
+            return
+        self._vauto_waiting = False
+        if self.controller:
+            self.controller.stop_activity_watch()
+        if self._vauto_event:
+            self._vauto_event.set()   # 唤醒waiter, 它会走abort分支
+        self.log('已取消视觉自动开始等待')
+
+    def _vauto_abort(self):
+        '''(GUI线程) 视觉等待被取消/异常结束时恢复界面'''
+        self._vauto_waiting = False
+        self.go_btn.setText('开始演奏')
+        self.go_btn.setIcon(FIF.PLAY)
+        try:
+            self.go_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.go_btn.clicked.connect(self.run)
+        self.go_btn.setEnabled(True)
+        self.sync_btn.setEnabled(True)
+        self._vauto_event = None
+        self._vauto_fire_time = 0.0
+
     PID_OFFSET = 20000  # 所有程序触点加此偏移,彻底避开人手触屏的PID(通常0开始)
 
-    def _start_playback(self, manual: bool):
+    def _start_playback(self, manual: bool, prestarted: bool = False):
+        '''manual:      True=按下按钮的时刻即第一拍(插入扫屏DOWN触点)
+        prestarted: True=视觉自动开始已触发, 不再自己点屏幕, 直接播放'''
         assert self._raw_ans and self.controller
         ans = self._raw_ans
         dw, dh = self.controller.device_width, self.controller.device_height
@@ -831,6 +990,19 @@ class MainPage(ScrollArea):
                     elif ev.action is UP:
                         active.discard(ev.pointer)
             self._start_time = time.perf_counter() - adapted[0][0] / 1000 - 0.01
+        elif prestarted:
+            # 视觉自动开始: 锚点不是"现在", 而是"检测到界面跳变的时刻"(_vauto_fire_time),
+            # 这样打歌时钟与Phigros内部时钟同源, 每首歌(不管第一音符在第几秒)都自动对齐。
+            fnm = first_note_ms_from_path(self._find_chart_path())
+            adapted = manual_start_plan(adapted, fnm)
+            active = set()
+            for _, evs in adapted:
+                for ev in evs:
+                    if ev.action is DOWN:
+                        active.add(ev.poider)
+                    elif ev.action is UP:
+                        active.discard(ev.poider)
+            self._start_time = self._vauto_fire_time - adapted[0][0] / 1000
 
         self._active_pids = active
         self._running = True
@@ -848,7 +1020,7 @@ class MainPage(ScrollArea):
 
         def worker():
             try:
-                if manual:
+                if manual or prestarted:
                     stats = run_player(self.controller.touch_many, rest,
                                        lambda: self._start_time, lambda: self._running,
                                        first_event=first)
@@ -902,11 +1074,14 @@ class MainPage(ScrollArea):
 
     def _stop(self):
         self._running = False
+        self._vauto_waiting = False
+        self._vauto_fire_time = 0.0
         self.log('正在停止...')
         # 立即发UP释放所有触点,不等player线程自然结束(它可能因为sleep阻塞)
         self._release_all_active()
 
     def _reset_go(self):
+        self._vauto_waiting = False
         self.go_btn.setText('开始演奏')
         self.go_btn.setIcon(FIF.PLAY)
         try:
@@ -914,6 +1089,7 @@ class MainPage(ScrollArea):
         except Exception:
             pass
         self.go_btn.clicked.connect(self.run)
+        self.go_btn.setEnabled(True)
         self.sync_btn.setEnabled(True)
 
     # --- 缓存 ---

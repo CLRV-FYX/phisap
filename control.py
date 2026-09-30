@@ -5,6 +5,7 @@ import threading
 import time
 import random
 import os
+import collections
 
 from algo.algo_base import TouchAction
 from server_patch import prepare_server, SCRCPY_MAX_POINTERS
@@ -113,8 +114,8 @@ class DeviceController:
             'clipboard_autosync=false',
             # phisap 只需要视频流中的屏幕尺寸信息，不需要画面：
             # 降低帧率和码率以减轻设备/模拟器的编码负担，避免影响打歌时序
-            'max_fps=5',
-            'video_bit_rate=500000',
+            'max_fps=20',
+            'video_bit_rate=900000',
         ]
         self.server_process = subprocess.Popen(command_line)
         # 由于我们指定了audio=false，所以这只有两个socket
@@ -199,7 +200,9 @@ class DeviceController:
                             self.device_width, self.device_height = w, h
                             self._size_changed.set()
                     else:
-                        _skip_exact(self.video_socket, int.from_bytes(header[8:12], 'big'))
+                        plen = int.from_bytes(header[8:12], 'big')
+                        self._activity_feed(plen)
+                        _skip_exact(self.video_socket, plen)
             except Exception as e:
                 if self.collector_running:  # 主动close()时不打印
                     print('[client]', f'视频流中断: {e}')
@@ -224,6 +227,47 @@ class DeviceController:
 
     def touch(self, x: float, y: float, action: TouchAction, pointer_id: int) -> None:
         self.control_socket.sendall(self._pack_touch(x, y, action, pointer_id))
+
+    # ---- 屏幕活动度监视（视觉自动开始）：不看画面内容，只统计每帧字节数的突变 ----
+    # Phigros 选曲/准备界面是静态 UI，H.264 编码后帧很小；进入演奏瞬间音符下落+背景流动，
+    # 帧体积显著跳增。用 payload 长度的移动平均突变做启发式检测：零解码依赖、CPU 极低、
+    # 不占用打歌时的发送时序（只读帧头，不缓冲画面）。
+    _ACTIVITY_WIN = 24       # 移动平均窗口(帧数)
+    _ACTIVITY_RATIO = 1.8    # 当前帧长 / 近期平均 超过此倍数即视为"界面跳变"
+    _ACTIVITY_MIN_BYTES = 3000   # 帧至少这么大才参与判定，避免空帧/掉线误触发
+
+    def start_activity_watch(self, cooldown: float = 2.0) -> threading.Event:
+        '''开启"界面跳变"检测，返回一个 Event，检测到跳变时被 set()。
+        调用方需自行 wait()。'''
+        self._activity_watching = True
+        self._activity_cooldown = float(cooldown)
+        self._activity_last_fire = 0.0
+        self._activity_win = collections.deque(maxlen=self._ACTIVITY_WIN)
+        self._activity_event = threading.Event()
+        return self._activity_event
+
+    def stop_activity_watch(self) -> None:
+        self._activity_watching = False
+
+    def _activity_feed(self, payload_len: int) -> None:
+        '''由视频接收线程调用：喂入一帧的字节数，突变则置位事件。'''
+        if not getattr(self, '_activity_watching', False):
+            return
+        now = time.perf_counter()
+        if now - self._activity_last_fire < self._activity_cooldown:
+            return
+        win = self._activity_win
+        if payload_len < self._ACTIVITY_MIN_BYTES:
+            return
+        if len(win) < self._ACTIVITY_WIN // 2:
+            win.append(payload_len)
+            return
+        avg = sum(win) / len(win)
+        if avg > 0 and payload_len > avg * self._ACTIVITY_RATIO:
+            self._activity_last_fire = now
+            print('[client]', f'[视觉触发] 检测到界面跳变: 本帧 {payload_len}B vs 近期均值 {avg:.0f}B')
+            self._activity_event.set()
+        win.append(payload_len)
 
     def touch_many(self, events) -> None:
         '''同一时刻的多个事件(需有pos/action/pointer属性)合并成一次发送'''
