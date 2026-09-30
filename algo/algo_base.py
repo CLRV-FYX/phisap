@@ -15,7 +15,9 @@ MAX_POINTERS = 16
 # v2: 修正官谱/RPE转换谱的y方向、RPE缓动/多层/父线、长按与滑键跟随判定线、16触点
 # v3: 精简长按的MOVE事件; 新增algo3(扫屏)
 # v4: flick滑动加快到3像素/毫秒; algo3/algo3f的flick改为单独规划
-PLAN_CACHE_SUFFIX = '.ans.v6.json'
+# v7: 蓝键(TAP)/长条(HOLD)必须在5ms内释放, 避免触点占满漏判
+# v8: 同位置DRAG/TAP重复按下修复(DRAG复用同毫秒内已按下的触点, 避免挤占触点名额)
+PLAN_CACHE_SUFFIX = '.ans.v9.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -78,6 +80,22 @@ def recalc_pos(position: tuple[float, float], sa: float, ca: float) -> tuple[flo
 def clamp_to_screen(pos: tuple[float, float], margin: float = 1.0) -> tuple[float, float]:
     x, y = pos
     return min(max(x, margin), 1280 - margin), min(max(y, margin), 720 - margin)
+
+
+def _edge_safe(pos: tuple[float, float]) -> tuple[float, float]:
+    """把x>=1280或y>=720的边界点内缩到(1279,719),其余点不变。
+    y=720/x=1280这类点经scrcpy缩放后会映射到物理坐标==device_size,
+    超出Android合法范围[0,size-1],被InputManager静默丢弃,
+    表现为屏幕底边缘(y=720)/右边缘(x=1280)的TAP/HOLD全部漏点。
+    y=0/x=0是合法坐标(0∈[0,size-1])无需处理。
+    1px内缩沿屏幕轴, 对Phigros ±80px垂直判定完全无影响,
+    且在algo生成事件时统一处理(端点和所有MOVE点都过这里),路径连续不会跳变。"""
+    x, y = pos
+    if x >= 1280:
+        x = 1279.0
+    if y >= 720:
+        y = 719.0
+    return x, y
 
 
 def note_state(line, note, ms: float, time_shift: float = 0.0) -> tuple[tuple[float, float], float, float]:

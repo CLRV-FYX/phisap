@@ -7,8 +7,13 @@ from collections import defaultdict
 
 from chart import Chart
 from note import NoteType
-from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, MAX_POINTERS, note_point,
+from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, _edge_safe, MAX_POINTERS, note_point,
                         flick_path, flick_time_shift, FLICK_START, FLICK_END, FLICK_RADIUS)
+
+# 蓝键(TAP)和长条(HOLD)结束后, 触点必须在此时间(ms)内释放, 避免触点占满导致后续音符漏判
+MAX_RELEASE_MS = 5
+# 指针UP之后, 必须至少等待这么多ms才能在新位置重新DOWN同一pid(避免Android把瞬移误判为滑动)
+PID_REUSE_COOLDOWN_MS = 40
 
 
 from rich.console import Console
@@ -87,6 +92,7 @@ class Pointer:
     id: int  # 唯一id，用于发送指令
     note: PlainNote | None = None  # 和这个指针绑定的note
     age: int = 0  # 该指针在屏幕上存在的时间，负数表示该指针正在触发某个note
+    release_deadline: int = 0  # 变为闲置状态后必须在此时间(ms)前抬起
 
 
 def distance_of(note1: PlainNote | None, note2: PlainNote | None) -> float:
@@ -107,17 +113,29 @@ class PointerAllocator:
     now: int
 
     def __init__(self, max_pointers_count: int = MAX_POINTERS, begin_at: int = 1000):
+        self.max_pointers_count = max_pointers_count
+        self.next_pid = begin_at + max_pointers_count
         self.pointers = [Pointer(i + begin_at) for i in range(max_pointers_count)]
         self.events = defaultdict(list)
         self.last_timestamp = None
         self.dropped: list[tuple[int, NoteType]] = []  # 触点不足而无法执行的音符
+        self.released_at: dict[int, int] = {}  # pid -> UP的时刻(用于冷却检查)
 
     def _find_available_pointers(self, note: PlainNote) -> Pointer | None:
         """查找当前屏幕上可以直接拿来用的指针
-        查找条件：距离目标点100个单位之内的、已经被废弃的指针
+        查找条件：距离目标点100个单位之内的、已经被废弃的指针;
+        另外: 本帧内刚刚按下(TAP/HOLD, age==0)且位置非常近(<5像素)的触点也直接复用,
+              避免同位置的DRAG在TAP之外再额外按下一个触点(挤占触点名额)
         """
         ox, oy = note.pos
         ca, sa = math.cos(note.angle), math.sin(note.angle)
+        # 先找本帧内刚按下的触点(age==0即刚按下这一帧, 没有释放), 位置<5像素直接复用
+        for pointer in self.pointers:
+            if pointer.note is None or pointer.age != 0:
+                continue
+            px, py = pointer.note.pos
+            if math.hypot(px - ox, py - oy) < 5:
+                return pointer
         for pointer in self.pointers:
             if pointer.note is None or pointer.age <= 0:  # 忽略闲置指针和正在FLICK的指针
                 continue
@@ -127,22 +145,44 @@ class PointerAllocator:
         return None
 
     def _alloc(self, note: PlainNote) -> Pointer | None:
-        available_pointers = [p for p in self.pointers if p.note is None or p.age > 0]
-        if not available_pointers:
-            # 所有触点都在按住/滑动中(超过触点上限), 只能放弃这个音符
-            self.dropped.append((self.now, note.type))
-            return None
-        return min(available_pointers, key=lambda p: distance_of(p.note, note))  # 优先使用废弃的Pointer
+        # idle指针: note is None; aging指针: age > 0(FLICK刚结束但仍可复用)
+        idle_pointers = [p for p in self.pointers if p.note is None]
+        aging_pointers = [p for p in self.pointers if p.note is not None and p.age > 0]
+
+        # 检查已过冷却期的闲置指针
+        cool_idle = [p for p in idle_pointers
+                     if self.now - self.released_at.get(p.id, -10**9) >= PID_REUSE_COOLDOWN_MS]
+
+        if cool_idle:
+            return min(cool_idle, key=lambda p: distance_of(p.note, note))
+        if aging_pointers:
+            # 老化指针仍在屏幕上(未UP), 无冷却限制, 可以MOVE使用; 但尽量选距离近的
+            return min(aging_pointers, key=lambda p: distance_of(p.note, note))
+        if idle_pointers and len(self.pointers) < MAX_POINTERS:
+            # 存在冷却中的idle指针且还未到达MAX_POINTERS上限: 分配新pid
+            pid = self.next_pid
+            self.next_pid += 1
+            p = Pointer(pid)
+            self.pointers.append(p)
+            return p
+        # 所有触点都在按住/滑动中(超过触点上限或都在冷却中), 只能放弃这个音符
+        self.dropped.append((self.now, note.type))
+        return None
 
     def _insert(self, timestamp: int, event: VirtualTouchEvent) -> None:
+        # 所有发出的坐标经过_edge_safe,避免x>=1280/y>=720边界点映射到物理屏幕外被Android丢弃
+        event = VirtualTouchEvent(_edge_safe(event.pos), event.action, event.pointer)
         self.events[timestamp].append(event)
 
     def _tap(self, pointer: Pointer, note: PlainNote) -> None:
         if pointer.note is not None:
             # 如果分配的是"旧"指针，先抬起，再落下
-            self._insert(self.now - pointer.age + 1, VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
+            up_t = self.now - pointer.age + 1
+            self._insert(up_t, VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
+            self.released_at[pointer.id] = up_t
         pointer.note = note
         pointer.age = 0
+        pointer.release_deadline = self.now + MAX_RELEASE_MS  # tap 按下后最迟 MAX_RELEASE_MS 释放
         self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.DOWN, pointer.id))
 
     def _hold(self, pointer: Pointer, note: PlainNote) -> None:
@@ -154,6 +194,8 @@ class PointerAllocator:
         if path:
             pointer.note = note._replace(pos=path[-1])
         pointer.age = -len(path)
+        # hold 结束(age 从负数变为0时)后最迟 MAX_RELEASE_MS 释放
+        pointer.release_deadline = self.now + len(path) + MAX_RELEASE_MS
 
     def _flick(self, pointer: Pointer, note: PlainNote) -> None:
         if note.path:
@@ -175,6 +217,7 @@ class PointerAllocator:
             self._insert(self.now + delta, VirtualTouchEvent(pos, TouchAction.MOVE, pointer.id))
         pointer.note = note._replace(pos=path[-1])
         pointer.age = -(len(path) - 1)
+        pointer.release_deadline = self.now + len(path) - 1 + 1  # flick 结束1ms后释放
 
     def _drag(self, pointer: Pointer, note: PlainNote) -> None:
         if pointer.note is None:
@@ -184,6 +227,7 @@ class PointerAllocator:
         self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.MOVE, pointer.id))
         pointer.note = note
         pointer.age = 0
+        pointer.release_deadline = self.now + 1  # drag 不要求严格, 1ms后即可释放
 
     def allocate(self, frame: Frame) -> None:
         # 更新pointer age
@@ -191,6 +235,16 @@ class PointerAllocator:
         if self.last_timestamp is not None:
             for pointer in self.pointers:
                 pointer.age += self.now - self.last_timestamp
+
+        # 步骤0: 释放已到达deadline的闲置指针(age>=0, 即不在flick/hold的滑动过程中)
+        # 蓝键(TAP)/长条(HOLD)必须在 MAX_RELEASE_MS ms 内释放, 避免占满触点导致后续音符漏判
+        for pointer in self.pointers:
+            if pointer.note is not None and pointer.age >= 0 and self.now >= pointer.release_deadline:
+                self._insert(min(pointer.release_deadline, self.now),
+                             VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
+                self.released_at[pointer.id] = self.now
+                pointer.note = None
+                pointer.age = 0
 
         # 步骤1：分配tap与hold(hold按下后由同一个指针跟随到结束)
         for note in frame.taps():
@@ -212,7 +266,11 @@ class PointerAllocator:
         for note in frame.drags():
             pointer = self._find_available_pointers(note)
             if pointer:
+                # 复用已有触点(同位置刚按下的TAP/HOLD或邻近的闲置触点): 发一个MOVE到drag位置
+                self._insert(self.now, VirtualTouchEvent(note.pos, TouchAction.MOVE, pointer.id))
+                pointer.note = note
                 pointer.age = 0
+                pointer.release_deadline = self.now + 1
                 continue
             pointer = self._alloc(note)
             if pointer is not None:

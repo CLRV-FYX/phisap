@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 
-from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, distance_of, recalc_pos,
+from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, distance_of, recalc_pos, _edge_safe,
                         MAX_POINTERS, note_point, flick_path, flick_time_shift,
                         FLICK_START, FLICK_END, FLICK_RADIUS)
 from chart import Chart
@@ -15,12 +15,20 @@ from note import NoteType
 from rich.console import Console
 from rich.progress import track
 
+# 蓝键(TAP)和长条(HOLD)结束后, 触点必须在此时间(ms)内释放, 避免触点占满导致后续音符漏判
+MAX_RELEASE_MS = 5
+# 指针UP之后, 必须至少等待这么多ms才能在新位置重新DOWN同一pid.
+# 否则Android会把同一pointerId的远距离瞬移当作滑动/异常手势, 导致新位置的tap被吞掉
+PID_REUSE_COOLDOWN_MS = 40
+
+
 @dataclass
 class Pointer:
     pid: int
     pos: tuple[float, float]
     timestamp: int
     occupied: int = 0
+    release_deadline: int = 0  # 进入闲置状态后必须在此时间(ms)前释放
 
 
 class FrameEventAction(Enum):
@@ -60,32 +68,59 @@ class PointerManager:
         self.max_pointer_id = begin
         self.pointers = {}
         self.recycled = set()
+        self.recycled_at: dict[int, int] = {}  # pid -> UP时间(ms), 用于冷却检查
         self.unused = {}
         self.delta = delta
         self.unused_now = {}
         self.mark_as_released = []
 
     def _new(self) -> int:
-        if not self.recycled:
-            pid = self.max_pointer_id
-            self.max_pointer_id += self.delta
+        # 优先从recycled中取出已过冷却期的pid
+        now = self.now
+        ready = [pid for pid in self.recycled if now - self.recycled_at.get(pid, 0) >= PID_REUSE_COOLDOWN_MS]
+        if ready:
+            pid = min(ready)
+            self.recycled.remove(pid)
+            self.recycled_at.pop(pid, None)
             return pid
-        return self.recycled.pop()
+        pid = self.max_pointer_id
+        self.max_pointer_id += self.delta
+        return pid
 
     def _del(self, pointer_id: int) -> None:
         self.recycled.add(pointer_id)
+        self.recycled_at[pointer_id] = self.now
         if len(self.recycled) == (self.max_pointer_id - self.begin) / self.delta:
             self.max_pointer_id = self.begin
             self.recycled.clear()
+            self.recycled_at.clear()
 
-    def acquire(self, event: FrameEvent, new: bool = True) -> tuple[int, bool]:
+    # acquire()返回值: (pid, is_new)
+    # is_new=True → 物理上需要新按下(DOWN); is_new=False → 指针已在屏幕上(MOVE即可)
+    # 注意: 从recycled池取pid时is_new=True(已被UP过, 需要重新DOWN)
+    #       从unused池复用pid时is_new=False(仍按着, MOVE即可)
+    def acquire(self, event: FrameEvent, new: bool = True) -> tuple[int, bool, tuple[float,float] | None]:
+        """返回 (pid, is_new, old_pos):
+        is_new=True: 需要发DOWN; False: 指针已在屏幕上.
+        old_pos: 仅当从unused复用且is_new=False时返回复用前的旧位置(需要先UP再DOWN时使用)
+        """
         event_id = event.id
         if event_id in self.pointers:
             ptr = self.pointers[event_id]
             ptr.timestamp = self.now
             ptr.pos = event.point
-            return ptr.pid, False
+            return ptr.pid, False, None
         if not new:
+            # 1) 优先recycled(已物理抬起、且过了冷却期的pid, 需重新DOWN但不会引入误判)
+            ready = [pid for pid in self.recycled
+                     if self.now - self.recycled_at.get(pid, 0) >= PID_REUSE_COOLDOWN_MS]
+            if ready:
+                pid = min(ready)
+                self.recycled.remove(pid)
+                self.recycled_at.pop(pid, None)
+                self.pointers[event_id] = Pointer(pid, event.point, self.now)
+                return pid, True, None
+            # 2) 再找unused(仍按着)
             nearest_distance = 200
             nearest_pid = None
             for pid, ptr in self.unused.items():
@@ -95,15 +130,17 @@ class PointerManager:
             if nearest_pid is not None:
                 ptr = self.unused[nearest_pid]
                 del self.unused[nearest_pid]
+                old_pos = ptr.pos
                 ptr.timestamp = self.now
                 ptr.pos = event.point
                 ptr.occupied = 0
+                ptr.release_deadline = 0
                 self.pointers[event_id] = ptr
-                return ptr.pid, False
+                return ptr.pid, False, old_pos
         self._make_room()
         pid = self._new()
         self.pointers[event_id] = Pointer(pid, event.point, self.now)
-        return pid, True
+        return pid, True, None
 
     def _on_screen(self) -> int:
         return len(self.pointers) + len(self.unused) + len(self.unused_now) - len(self.mark_as_released)
@@ -114,7 +151,8 @@ class PointerManager:
             pid = min(self.unused, key=lambda k: self.unused[k].timestamp)
             ptr = self.unused.pop(pid)
             # 不立即回收pid(避免同一毫秒内同一pid先按下后抬起), 在recycle中回收
-            self.forced.append((ptr.pid, min(ptr.timestamp + 1, self.now), ptr.pos))
+            ts = min(ptr.release_deadline, max(ptr.timestamp + 1, self.now))
+            self.forced.append((ptr.pid, ts, ptr.pos))
         if self._on_screen() >= self.max_pointers:
             self.overflow.append(self.now)
 
@@ -122,6 +160,12 @@ class PointerManager:
         event_id = event.id
         if event_id in self.pointers:
             ptr = self.pointers[event_id]
+            # 蓝键(TAP)/长条(HOLD)结束后必须在 MAX_RELEASE_MS ms 内释放, 避免占满触点
+            # 其他音符(drag/flick)复用闲置触点时不会产生太多触点堆积, 释放时限可以放宽
+            if event.action in (FrameEventAction.TAP, FrameEventAction.HOLD_END):
+                ptr.release_deadline = self.now + MAX_RELEASE_MS
+            else:
+                ptr.release_deadline = self.now + 1
             self.unused_now[ptr.pid] = ptr
             self.mark_as_released.append(event_id)
 
@@ -134,15 +178,15 @@ class PointerManager:
         for event_id in self.mark_as_released:
             del self.pointers[event_id]
         self.mark_as_released = []
-        if is_keyframe:
-            for ptr in self.unused.values():
-                ptr.occupied += 1
-                if ptr.occupied > 0:
-                    yield ptr.pid, ptr.timestamp + 1, ptr.pos
-                    self._del(ptr.pid)
-                    marked.append(ptr.pid)
+        # 每帧检查所有闲置指针: 到达释放时限的必须释放(蓝键/长条最多5ms)
+        for pid, ptr in list(self.unused.items()):
+            if self.now >= ptr.release_deadline:
+                yield pid, min(ptr.release_deadline, self.now), ptr.pos
+                self._del(pid)
+                marked.append(pid)
         for pid in marked:
             del self.unused[pid]
+        marked = []
         self.unused |= self.unused_now
         self.unused_now = {}
 
@@ -150,8 +194,8 @@ class PointerManager:
         while len(self.unused) + len(self.pointers) > self.max_pointers and self.unused:
             pid = min(self.unused, key=lambda k: self.unused[k].timestamp)
             ptr = self.unused.pop(pid)
-            yield ptr.pid, ptr.timestamp + 1, ptr.pos
-            self._del(ptr.pid)
+            yield pid, min(ptr.release_deadline, max(ptr.timestamp + 1, self.now)), ptr.pos
+            self._del(pid)
 
     def finish(self):
         for ptr in self.unused.values():
@@ -221,6 +265,7 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
     result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
 
     def add_touch_event(milliseconds: int, pos: tuple[float, float], action: TouchAction, pointer_id: int):
+        pos = _edge_safe(pos)  # 避免y>=720/x>=1280边界点被Android丢弃
         if action == TouchAction.UP:
             # 同一毫秒内先抬起再按下, 避免瞬间超出触点上限
             result[milliseconds].insert(0, VirtualTouchEvent(pos, action, pointer_id))
@@ -230,21 +275,45 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
     for ms, frame in track(sorted(frames.items()), description='正在规划触控事件...', console=console):
         pointers.now = ms
         is_keyframe = False
+        # 本毫秒内已经按下(由TAP/HOLD_START产生)的触点位置->pid, DRAG遇到同位置时直接复用发MOVE
+        down_positions: dict[tuple[float, float], int] = {}
         for event in frame:
             match event.action:
                 case FrameEventAction.TAP:
-                    add_touch_event(ms, event.point, TouchAction.DOWN, pointers.acquire(event)[0])
+                    # new=False: 优先复用recycled已抬起的pid(避免高速纵连时pid递增耗尽触点)
+                    pid, is_new, old_pos = pointers.acquire(event, new=False)
+                    if old_pos is not None:
+                        # 复用了unused里仍按着的指针: 必须先在旧位置UP, 再DOWN到新位置才能产生新点击
+                        add_touch_event(ms, old_pos, TouchAction.UP, pid)
+                        is_new = True
+                    if is_new:
+                        add_touch_event(ms, event.point, TouchAction.DOWN, pid)
+                        down_positions[event.point] = pid
                     pointers.release(event)
                     is_keyframe = True
                 case FrameEventAction.DRAG:
-                    pid, new = pointers.acquire(event, new=False)
-                    act = TouchAction.DOWN if new else TouchAction.MOVE
+                    # 找同毫秒内已按下的触点, 位置<5像素时复用(发MOVE), 不重复按下
+                    shared_pid = None
+                    for (px, py), spid in down_positions.items():
+                        if abs(px - event.point[0]) < 5 and abs(py - event.point[1]) < 5:
+                            shared_pid = spid
+                            break
+                    if shared_pid is not None:
+                        add_touch_event(ms, event.point, TouchAction.MOVE, shared_pid)
+                        continue
+                    pid, is_new, old_pos = pointers.acquire(event, new=False)
+                    if old_pos is not None:
+                        # 复用unused里近距指针只发MOVE即可(DRAG不需要DOWN触发)
+                        pass
+                    act = TouchAction.DOWN if is_new else TouchAction.MOVE
                     add_touch_event(ms, event.point, act, pid)
+                    if is_new:
+                        down_positions[event.point] = pid
                     pointers.release(event)
                     # is_keyframe = True
                 case FrameEventAction.FLICK_START:
-                    pid, new = pointers.acquire(event, new=False)
-                    act = TouchAction.DOWN if new else TouchAction.MOVE
+                    pid, is_new, old_pos = pointers.acquire(event, new=False)
+                    act = TouchAction.DOWN if is_new else TouchAction.MOVE
                     add_touch_event(ms, event.point, act, pid)
                 case FrameEventAction.FLICK | FrameEventAction.HOLD:
                     add_touch_event(ms, event.point, TouchAction.MOVE, pointers.acquire(event)[0])
@@ -252,7 +321,9 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                     add_touch_event(ms, event.point, TouchAction.MOVE, pointers.acquire(event)[0])
                     pointers.release(event)
                 case FrameEventAction.HOLD_START:
-                    add_touch_event(ms, event.point, TouchAction.DOWN, pointers.acquire(event)[0])
+                    pid, _, _ = pointers.acquire(event)
+                    add_touch_event(ms, event.point, TouchAction.DOWN, pid)
+                    down_positions[event.point] = pid
                     is_keyframe = True
 
         for pid, ts, pos in pointers.recycle(is_keyframe):
