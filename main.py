@@ -38,8 +38,8 @@ from algo.algo_base import (
     first_note_ms, manual_start_plan,
 )
 from chart import Chart
-from control import DeviceController, max_touch_points
-from player import run_player
+from control import DeviceController, max_touch_points, VIDEO_MAX_FPS
+from player import run_player, raise_timer_resolution
 from rpe import detect_kind, rpe_to_official_v3
 from downloader import Downloader, SOURCES, DEFAULT_SOURCE
 
@@ -65,16 +65,39 @@ def chart_difficulty(filename: str) -> str | None:
     return None
 
 
+_FIRST_NOTE_CACHE: dict[tuple, int] = {}
+
+
 def first_note_ms_from_path(path: str | None) -> int:
+    '''谱面第一个音符的判定时间(ms)。
+
+    这个函数会被 _start_playback 在每次点"开始演奏"时调用, 而它的实现是
+    "读盘 -> json.load -> Chart.from_dict -> 遍历所有判定线和音符取最小值"。
+    一张2.5MB的谱面实测就要42ms, 大谱面(3000+判定线)轻松上几百毫秒,
+    而且全部发生在GUI线程、发生在用户点完按钮之后 —— 表现为"点了开始要等
+    一会儿才动"。所以这里按 (路径, mtime, 大小) 缓存, 同一张谱面只算一次。
+    '''
     if not path or not os.path.exists(path):
         return 0
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return 0
+    v = _FIRST_NOTE_CACHE.get(key)
+    if v is not None:
+        return v
     try:
         with open(path, 'r', encoding='utf-8-sig') as f:
             ch = Chart.from_dict(json.load(f))
         v = first_note_ms(ch)
-        return v if v else 0
+        v = v if v else 0
     except Exception:
-        return 0
+        v = 0
+    if len(_FIRST_NOTE_CACHE) > 64:
+        _FIRST_NOTE_CACHE.clear()
+    _FIRST_NOTE_CACHE[key] = v
+    return v
 
 
 def find_chart_path(song_id: str, diff: str) -> str | None:
@@ -130,6 +153,24 @@ class PlanThread(QThread):
             self.failed.emit(traceback.format_exc())
 
 
+# 手动开始时, 打歌时钟比"现在"提前这么多(秒)。注入触控有延迟(经 adb 转发 +
+# scrcpy-server 处理), 游戏是在收到点击之后才开始计时的; 这里留一点提前量,
+# 让第一批事件(按下按钮那一戳)落在游戏开始之前而不是之后。
+MANUAL_START_LEAD = 0.01
+
+
+def _active_pids_of(adapted) -> set[int]:
+    '''从适配后的事件表算出"当前处于按下状态的触点集合", 停止时用来全部抬起。'''
+    active: set[int] = set()
+    for _, evs in adapted:
+        for ev in evs:
+            if ev.action is TouchAction.DOWN:
+                active.add(ev.pointer)
+            elif ev.action is TouchAction.UP:
+                active.discard(ev.pointer)
+    return active
+
+
 # ============== 主页面 ==============
 class MainPage(ScrollArea):
     # ---- 跨线程通知GUI线程的信号 ----
@@ -158,10 +199,18 @@ class MainPage(ScrollArea):
         self._running = False
         self._player_thread: Thread | None = None
         self._start_time: float = 0.0
+        # 坐标适配结果缓存: (key, adapted, active)。适配只依赖(规划, 屏幕尺寸),
+        # 所以可以在后台提前算好, 点"开始演奏"时直接取, 不在GUI线程里卡几百毫秒。
+        self._adapt_cache: tuple | None = None
+        self._adapt_gen = 0
         # 播放"代际": 每启动一次播放就+1。worker 记住自己属于哪一代,
         # 发现代际变了就立刻停止发送——防止上一次没退干净的线程继续往设备上戳。
         self._playback_gen = 0
 
+        # Windows 上把计时器精度提到1ms: 否则 time.sleep(0.001) 实际睡15.6ms,
+        # 打歌循环每批事件都会被睡过头, 系统性晚发最多15ms(见 player.raise_timer_resolution)
+        if not raise_timer_resolution():
+            self._timer_res_warned = True
         self._build()
         self._load_font_scale()
         self.detect_adb_devices()
@@ -564,9 +613,81 @@ class MainPage(ScrollArea):
             self.export_btn.setEnabled(True)
             self.go_btn.setEnabled(self.controller is not None)
             self.log(f'已载入缓存规划: {os.path.basename(cand)}')
+            # 提前在后台把坐标适配算好(要100多ms), 用户点"开始演奏"时直接取
+            self._refresh_adapted()
 
     def _find_chart_path(self):
         return find_chart_path(self.song_box.currentText(), self.diff_box.currentText())
+
+    # ---- 坐标适配(重活, 不能放在GUI线程里) ----
+    def _adapt_key(self):
+        '''适配结果的缓存键: 规划对象 + 屏幕尺寸。任一变化缓存即失效。'''
+        c = self.controller
+        if c is None or not self._raw_ans:
+            return None
+        return (id(self._raw_ans), c.device_width, c.device_height)
+
+    def _build_adapted(self):
+        '''把规划坐标适配到当前屏幕 + PID偏移, 同时算出"当前按下的触点集合"(停止时全部UP用)。
+
+        一张谱面有5万多个时间点, 逐个 map_to/_replace 实测要138ms。
+        这段以前直接在GUI线程的 _start_playback 里跑, 用户点完"开始演奏"界面要卡
+        几百毫秒才动 —— 这就是之前一直被当成"延迟1秒"的那个卡顿, 和视频参数无关。
+        '''
+        ans = self._raw_ans
+        dw, dh = self.controller.device_width, self.controller.device_height
+        w, h = dw, dh
+        s = min(w / 1280, h / 720)
+        xo = (w - 1280 * s) / 2
+        yo = (h - 720 * s) / 2
+        sx, sy = dw / w, dh / h
+        DOWN, UP = TouchAction.DOWN, TouchAction.UP
+        adapted = []
+        active: set[int] = set()
+        for ts in sorted(ans.keys()):
+            batch = []
+            for ev in ans[ts]:
+                mapped = ev.map_to(xo * sx, yo * sy, s * sx, s * sy)
+                new_pid = mapped.pointer + self.PID_OFFSET
+                nev = mapped._replace(pointer=new_pid)
+                batch.append(nev)
+                if nev.action is DOWN:
+                    active.add(new_pid)
+                elif nev.action is UP:
+                    active.discard(new_pid)
+            adapted.append((ts, batch))
+        return adapted, active
+
+    def _refresh_adapted(self):
+        '''后台预计算适配结果。选歌/生成规划/连接设备后调用, 等用户点开始时早就备好了。'''
+        key = self._adapt_key()
+        if key is None:
+            self._adapt_cache = None
+            return
+        self._adapt_gen += 1
+        my_gen = self._adapt_gen
+
+        def work():
+            try:
+                res = self._build_adapted()
+            except Exception:
+                return          # 算失败就留着旧缓存, 播放时会同步重算
+            if my_gen == self._adapt_gen:
+                self._adapt_cache = (key,) + res
+
+        Thread(target=work, daemon=True).start()
+
+    def _adapted_now(self):
+        '''取适配结果。缓存没算好就当场算(慢但保证正确), 绝不在GUI线程里干等。'''
+        key = self._adapt_key()
+        if key is None:
+            return None
+        c = self._adapt_cache
+        if c is not None and c[0] == key:
+            return c[1], c[2]
+        res = self._build_adapted()
+        self._adapt_cache = (key,) + res
+        return res
 
     def _scroll_to_download(self):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
@@ -829,12 +950,15 @@ class MainPage(ScrollArea):
                                 parent=self.window(), position=InfoBarPosition.TOP, duration=3000)
                 return
             self.devices_box.addItems(devs)
+            self._adapt_cache = None
             self.controller = self._make_controller(devs[0])
             self.dev_badge.setText(f'已连接 {devs[0]}')
             self.log(f'设备已连接: {devs[0]} ({self.controller.device_width}x{self.controller.device_height})'
                      f', 触控后端: {"MaaTouch" if self._cache_get("touch_backend","scrcpy")=="maatouch" else "scrcpy"}')
             if self._raw_ans is not None:
                 self.go_btn.setEnabled(True)
+                # 屏幕尺寸以连接时为准, 变了他适配结果也要重算
+                self._refresh_adapted()
         except FileNotFoundError:
             self.dev_badge.setText('ADB 未找到')
             InfoBar.error('ADB 未找到', '请把 adb 加入 PATH', parent=self.window(), duration=4000)
@@ -872,6 +996,8 @@ class MainPage(ScrollArea):
         if self.controller:
             self.go_btn.setEnabled(True)
         self.log(f'规划完成: {os.path.basename(plan_path)} ({len(ans)} 个时间点)')
+        # 同上: 后台预计算坐标适配, 别让用户点开始时再等
+        self._refresh_adapted()
         InfoBar.success('规划完成', f'{len(ans)} 个时间点', parent=self.window(), duration=2000)
 
     def _plan_fail(self, tb):
@@ -963,7 +1089,7 @@ class MainPage(ScrollArea):
             return
         self._vauto_event = ev
         self._vauto_waiting = True
-        self.log('已开启屏幕监测(20fps), 请在手机上点开始...')
+        self.log(f'已开启屏幕监测(约{VIDEO_MAX_FPS}fps), 请在手机上点开始...')
         InfoBar.info('等待开始', '请在设备上点开始, 程序检测到进入演奏后自动开打',
                      parent=self.window(), duration=6000, position=InfoBarPosition.TOP)
         self.go_btn.setText('取消等待')
@@ -1034,66 +1160,15 @@ class MainPage(ScrollArea):
     # 这里保留偏移只是为了在日志/调试时能区分程序触点, 不影响实际行为。
     PID_OFFSET = 20000
 
+
     def _start_playback(self, manual: bool, prestarted: bool = False):
         '''manual:      True=按下按钮的时刻即第一拍(插入扫屏DOWN触点)
         prestarted: True=视觉自动开始已触发, 不再自己点屏幕, 直接播放'''
         assert self._raw_ans and self.controller
         # 新的一轮播放: 代际+1, 让任何还没退干净的上一个worker立即停止发送
         self._playback_gen += 1
-        ans = self._raw_ans
         dw, dh = self.controller.device_width, self.controller.device_height
-        w, h = dw, dh
-        s = min(w / 1280, h / 720)
-        xo = (w - 1280 * s) / 2
-        yo = (h - 720 * s) / 2
-        sx, sy = dw / w, dh / h
-        self.log(f'屏幕 {dw}x{dh}, 缩放 {s:.4f}, 偏移 ({xo:.1f},{yo:.1f})')
-
-        DOWN = TouchAction.DOWN
-        UP = TouchAction.UP
-
-        # 坐标适配 + PID偏移,同时跟踪当前按下的触点集合,停止时用于全部UP
-        adapted = []
-        active: set[int] = set()
-        for ts in sorted(ans.keys()):
-            batch = []
-            for ev in ans[ts]:
-                mapped = ev.map_to(xo * sx, yo * sy, s * sx, s * sy)
-                new_pid = mapped.pointer + self.PID_OFFSET
-                nev = mapped._replace(pointer=new_pid)
-                batch.append(nev)
-                if nev.action is DOWN:
-                    active.add(new_pid)
-                elif nev.action is UP:
-                    active.discard(new_pid)
-            adapted.append((ts, batch))
-
-        if manual:
-            fnm = first_note_ms_from_path(self._find_chart_path())
-            adapted = manual_start_plan(adapted, fnm)
-            active = set()
-            for _, evs in adapted:
-                for ev in evs:
-                    if ev.action is DOWN:
-                        active.add(ev.pointer)
-                    elif ev.action is UP:
-                        active.discard(ev.pointer)
-            self._start_time = time.perf_counter() - adapted[0][0] / 1000 - 0.01
-        elif prestarted:
-            # 视觉自动开始: 锚点不是"现在", 而是"检测到界面跳变的时刻"(_vauto_fire_time),
-            # 这样打歌时钟与Phigros内部时钟同源, 每首歌(不管第一音符在第几秒)都自动对齐。
-            fnm = first_note_ms_from_path(self._find_chart_path())
-            adapted = manual_start_plan(adapted, fnm)
-            active = set()
-            for _, evs in adapted:
-                for ev in evs:
-                    if ev.action is DOWN:
-                        active.add(ev.poider)
-                    elif ev.action is UP:
-                        active.discard(ev.poider)
-            self._start_time = self._vauto_fire_time - adapted[0][0] / 1000
-
-        self._active_pids = active
+        self.log(f'屏幕 {dw}x{dh}')
         self._running = True
         self.go_btn.setText('停止演奏')
         self.go_btn.setIcon(FIF.CANCEL)
@@ -1104,9 +1179,6 @@ class MainPage(ScrollArea):
         self.go_btn.clicked.connect(self._stop)
         self.sync_btn.setEnabled(False)
 
-        first = adapted[0]
-        rest = iter(adapted[1:])
-
         my_gen = self._playback_gen
 
         def worker():
@@ -1114,6 +1186,32 @@ class MainPage(ScrollArea):
             if my_gen != self._playback_gen:
                 return
             try:
+                # 重活全搬到这里, 不在GUI线程做:
+                #   5万多次坐标适配(实测138ms) + 读盘解析整张谱面取首音符(实测42ms起)
+                # 以前这两段跑在GUI线程、跑在用户点完"开始演奏"之后, 界面要卡几百毫秒
+                # 才动 —— 那就是一直被当成"延迟1秒左右"的卡顿, 跟视频参数无关。
+                got = self._adapted_now()
+                if got is None:
+                    return
+                adapted, active = got
+                if manual:
+                    fnm = first_note_ms_from_path(self._find_chart_path())
+                    adapted = manual_start_plan(adapted, fnm)
+                    active = _active_pids_of(adapted)
+                    self._start_time = time.perf_counter() - adapted[0][0] / 1000 - MANUAL_START_LEAD
+                elif prestarted:
+                    # 视觉自动开始: 锚点不是"现在", 而是"检测到界面跳变的时刻"(_vauto_fire_time),
+                    # 这样打歌时钟与Phigros内部时钟同源, 每首歌(不管第一音符在第几秒)都自动对齐。
+                    fnm = first_note_ms_from_path(self._find_chart_path())
+                    adapted = manual_start_plan(adapted, fnm)
+                    active = _active_pids_of(adapted)
+                    self._start_time = self._vauto_fire_time - adapted[0][0] / 1000
+                self._active_pids = active
+                if not adapted:
+                    self.log('规划为空, 没有可发送的事件')
+                    return
+                first = adapted[0]
+                rest = iter(adapted[1:])
                 if manual or prestarted:
                     stats = run_player(self.controller.touch_many, rest,
                                        lambda: self._start_time, lambda: self._running,
@@ -1137,7 +1235,6 @@ class MainPage(ScrollArea):
 
         self._player_thread = Thread(target=worker, daemon=True)
         self._player_thread.start()
-
     def _release_all_active(self):
         """给所有仍处于按下状态的程序触点发送 UP 事件,防止手指卡住"""
         try:

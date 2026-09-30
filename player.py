@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import time
 from typing import Callable, Iterator
 
@@ -15,6 +16,31 @@ from algo.algo_base import TouchAction
 
 LATE_WARN_MS = 20      # 晚于计划这么多ms才记录(Perfect判定窗口为±80ms)
 REPORT_LIMIT = 12      # 结束时最多列出这么多次延迟
+
+# 距离下一批事件还有这么多ms以内就退出sleep改成忙等。
+# 必须大于 time.sleep() 的实际粒度: Windows 上默认计时器精度是15.6ms,
+# time.sleep(0.001) 实际会睡15.6ms(除非进程调用过 timeBeginPeriod),
+# 阈值取3ms时每次都会被睡过头, 事件系统性晚发最多15ms。main.py 启动时会把
+# 计时器精度调到1ms, 那时这个3ms阈值才真正生效。
+BUSY_WAIT_MS = 3
+
+
+def raise_timer_resolution() -> bool:
+    '''把系统计时器精度提到1ms(仅Windows)。
+
+    Windows 默认计时器粒度15.6ms, 且Python不会自动调用 timeBeginPeriod,
+    于是 time.sleep(0.001) 实际睡15.6ms。打歌循环只提前 BUSY_WAIT_MS 退出sleep,
+    不提高精度的话每一批事件都会被睡过头, 系统性晚发最多15ms —— 这正好卡在
+    "20ms告警阈值"下面, 平时看不出来, 但确实在拖慢判定。
+    返回True表示成功(或非Windows不需要)。
+    '''
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.winmm.timeBeginPeriod(1) == 0   # TIMERR_NOERROR == 0
+    except Exception:
+        return False
 
 
 class PlayStats:
@@ -69,6 +95,12 @@ def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]
     stats = PlayStats()
     gc.collect()
     gc.freeze()
+    # 播放期间彻底关掉GC。理由: 这一轮里所有事件对象都被 plan 列表持有,
+    # 播放过程中不产生任何垃圾(只有 struct.pack/join 的临时bytes, 由引用计数立即回收),
+    # 所以gen-2回收在这里纯属白干——而它要扫掉整个堆(规划5万多个对象 + 整个Qt程序),
+    # 实测在大谱面上能造成几十毫秒的停顿, 表现为"某一刻突然集体晚发"。
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     try:
         timestamp, events = first_event if first_event is not None else next(ans_iter)
         while running() and (should_continue is None or should_continue()):
@@ -76,7 +108,7 @@ def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]
             if wait > 0:
                 if idle is not None and wait > 8:
                     idle()
-                elif wait > 3:
+                elif wait > BUSY_WAIT_MS:
                     sleep(0.001)
                 continue
             send(events)
@@ -86,7 +118,9 @@ def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]
         pass
     finally:
         gc.unfreeze()
+        if gc_was_enabled:
+            gc.enable()
     return stats
 
 
-__all__ = ['PlayStats', 'run_player', 'LATE_WARN_MS']
+__all__ = ['PlayStats', 'run_player', 'LATE_WARN_MS', 'BUSY_WAIT_MS', 'raise_timer_resolution']
