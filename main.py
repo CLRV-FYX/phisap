@@ -285,11 +285,38 @@ class MainPage(ScrollArea):
             pass
         self._dl_refresh_status_text()
 
+    def _enable_touch_scroll(self):
+        '''让设置页面可以用手指直接拖动滚动(触屏电脑)。
+
+        MainPage 是 ScrollArea, 而 QScrollArea 默认只认滚轮和滚动条 ——
+        在触屏电脑上手指划页面没有反应, 用户看到的就是"我能用手指滑动页面,
+        但程序不可以"。QScroller 加一个手势识别就够, 不用自己写触摸逻辑。
+
+        只抓 TouchGesture, 故意不抓 LeftMouseButtonGesture: 后者会把左键按下
+        事件延迟(QScrollerProperties::MousePressEventDelay 默认0.25秒),
+        页面上所有按钮/下拉框/数字框的点击都会变肉。手指走真正的触摸事件就行。
+
+        整段包 try: 某些 PyQt 构建或平台上没有 QScroller, 抓不到也不能让界面
+        起不来。self 和 viewport() 都抓一次 —— 不同 PyQt 版本上手势要接在
+        哪个对象上表现不一样, 哪个生效算哪个。
+        '''
+        try:
+            from PyQt5.QtWidgets import QScroller
+        except Exception:
+            return
+        for target in (self, self.viewport()):
+            try:
+                QScroller.grabGesture(target, QScroller.TouchGesture)
+            except Exception:
+                pass
+
     def _build(self):
         self.scroll_widget = QWidget()
         self.setWidget(self.scroll_widget)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 触屏电脑上用手指拖动页面滚动(见 _enable_touch_scroll)
+        self._enable_touch_scroll()
         outer = QVBoxLayout(self.scroll_widget)
         outer.setContentsMargins(32, 24, 32, 24)
         outer.setSpacing(16)
