@@ -338,15 +338,22 @@ class MainPage(ScrollArea):
         # 免得闭包捕获循环变量踩坑。
         page_defs = [('song', '曲目'), ('plan', '规划与设备'), ('play', '演奏'), ('log', '日志')]
         self.tab_layouts = []
+        self.tab_widgets = []
         for _ in page_defs:
             w = QWidget()
+            # 立刻存进 self.tab_widgets, 不要等布局建好再存: 无父对象的 QWidget 只被
+            # 循环里的局部变量引用时, Python 一轮回收就把 C++ 对象销毁了, 连挂在它上面
+            # 的布局一起没。上一版就是只存了布局、靠 lay.parentWidget() 回头找控件,
+            # 启动时直接 RuntimeError: wrapped C/C++ object of type QVBoxLayout has been
+            # deleted, 整个程序起不来。创建出来马上有人背书, 就不存在能被回收的窗口。
+            self.tab_widgets.append(w)
             lay = QVBoxLayout(w)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(16)
             self.tab_layouts.append(lay)
         self.stack = QStackedWidget()
-        for lay in self.tab_layouts:
-            self.stack.addWidget(lay.parentWidget())
+        for w in self.tab_widgets:
+            self.stack.addWidget(w)
         self.pivot = Pivot(self)
         for key, text in page_defs:
             self.pivot.addItem(routeKey=key, text=text)

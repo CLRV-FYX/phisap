@@ -102,6 +102,68 @@ class TabsTest(unittest.TestCase):
             if isinstance(f, ast.Attribute) and f.attr == 'addLayout' and len(node.args) >= 3:
                 self.fail(f'第{node.lineno}行 addLayout 用了{len(node.args)}个参数')
 
+    @staticmethod
+    def _blocks():
+        """_build 里所有语句块(函数体/循环体/分支体)"""
+        out = []
+        for n in ast.walk(_build()):
+            for field in ('body', 'orelse', 'finalbody'):
+                b = getattr(n, field, None)
+                if isinstance(b, list) and b and all(isinstance(x, ast.stmt) for x in b):
+                    out.append(b)
+        return out
+
+    def test_no_orphan_qwidget(self):
+        """无父对象的 QWidget 只被局部变量引用时会被 Python 回收, C++对象连它上面的
+        布局一起销毁, 启动时直接 RuntimeError: wrapped C/C++ object of type
+        QVBoxLayout has been deleted —— 整个程序起不来(真实发生过)。
+        规则: QWidget() 之后3条语句内, 必须被 addWidget 挂进布局, 或被存到 self 上。"""
+        checked = 0
+        for stmts in self._blocks():
+            for i, st in enumerate(stmts):
+                if not (isinstance(st, ast.Assign) and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Name)):
+                    continue
+                v = st.value
+                if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                        and v.func.id == 'QWidget'):
+                    continue
+                name = st.targets[0].id
+                checked += 1
+                ok = False
+                for nxt in stmts[i + 1:i + 4]:
+                    for x in ast.walk(nxt):
+                        # self.xxx = w
+                        if (isinstance(x, ast.Assign) and isinstance(x.targets[0], ast.Attribute)
+                                and isinstance(x.targets[0].value, ast.Name)
+                                and x.targets[0].value.id == 'self'
+                                and isinstance(x.value, ast.Name) and x.value.id == name):
+                            ok = True
+                        if not isinstance(x, ast.Call) or not isinstance(x.func, ast.Attribute):
+                            continue
+                        args = [a.id for a in x.args if isinstance(a, ast.Name)]
+                        # xxx.addWidget(w, ...)
+                        if x.func.attr == 'addWidget' and name in args:
+                            ok = True
+                        # self.xxx.append(w)
+                        if (x.func.attr == 'append' and name in args
+                                and isinstance(x.func.value, ast.Attribute)
+                                and isinstance(x.func.value.value, ast.Name)
+                                and x.func.value.value.id == 'self'):
+                            ok = True
+                self.assertTrue(ok, f"第{st.lineno}行 {name} = QWidget() 之后3条语句内既没存到 self "
+                                    f"也没挂进布局, 会被 Python 回收导致界面崩溃")
+        self.assertGreaterEqual(checked, 2, "没扫到预期的 QWidget(), AST遍历可能失效了")
+
+    def test_page_widgets_are_kept(self):
+        """页面控件必须被 self.tab_widgets 留住(不能只存布局再 parentWidget() 回头找)"""
+        seg = ast.dump(_build())
+        self.assertIn('tab_widgets', seg, "没有留住页面控件本身")
+        # 只查可执行代码: 注释里本来就会提到 parentWidget 这个词, 字符串匹配会误伤自己
+        used = {n.attr for n in ast.walk(_build()) if isinstance(n, ast.Attribute)}
+        self.assertNotIn('parentWidget', used,
+                         "还在用 parentWidget() 回头找控件, 控件被回收就会崩")
+
     def test_each_page_gets_a_stretch(self):
         seg = ast.dump(_build())
         self.assertIn('tab_layouts', seg, '没有遍历标签页补伸缩')
