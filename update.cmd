@@ -15,7 +15,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 $Repo   = 'CLRV-FYX/phisap'
-$Branch = 'arena/01a0e107-phisap'
+$Branch = 'arena/01a0f7b0-phisap'
 # 更新时保留的用户数据（其余旧文件会先移入 .old_version 备份目录，再放入新版本文件）
 $Keep   = @('Assets', 'cache', '.git', '.old_version')
 # 下载地址：依次尝试，GitHub 直连失败时使用第三方加速镜像
