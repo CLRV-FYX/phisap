@@ -16,7 +16,7 @@ from threading import Thread
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QTextCursor, QFont
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMessageBox, QFileDialog, QTreeWidget, QTreeWidgetItem, QHeaderView
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMessageBox, QFileDialog, QStackedWidget, QTreeWidget, QTreeWidgetItem, QHeaderView
 
 from qfluentwidgets import (
     MSFluentWindow, FluentIcon as FIF,
@@ -25,7 +25,7 @@ from qfluentwidgets import (
     SearchLineEdit, PlainTextEdit,
     TransparentToolButton,
     ComboBox, DoubleSpinBox, CheckBox,
-    SettingCardGroup, SettingCard,
+    SettingCardGroup, SettingCard, Pivot,
     InfoBar, InfoBarPosition,
     IndeterminateProgressBar,
     ScrollArea,
@@ -330,6 +330,35 @@ class MainPage(ScrollArea):
         title_box.addWidget(s)
         outer.addLayout(title_box)
 
+        # ---- 标签页 ----
+        # 以前曲目/下载/规划/设备/设置/演奏/日志全都堆在一个滚动页面里, 想改个设置要滚很久。
+        # 现在按用途分成4页, 每页内部照样可以滚动(外层 ScrollArea 没动)。
+        # Pivot 是 qfluentwidgets 的分段导航(官方 settings 演示就是这个用法),
+        # 用 currentItemChanged 而不是每个 item 各自 connect 一个 lambda,
+        # 免得闭包捕获循环变量踩坑。
+        page_defs = [('song', '曲目'), ('plan', '规划与设备'), ('play', '演奏'), ('log', '日志')]
+        self.tab_layouts = []
+        for _ in page_defs:
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(16)
+            self.tab_layouts.append(lay)
+        self.stack = QStackedWidget()
+        for lay in self.tab_layouts:
+            self.stack.addWidget(lay.parentWidget())
+        self.pivot = Pivot(self)
+        for key, text in page_defs:
+            self.pivot.addItem(routeKey=key, text=text)
+        # 用字典查表而不是 list.index(): 万一哪天 Pivot 多回调一个未知 key,
+        # list.index 会抛 ValueError 把界面搞崩, 查表最多少切一页。
+        self._tab_index = {key: i for i, (key, _) in enumerate(page_defs)}
+        self.pivot.currentItemChanged.connect(
+            lambda k: self.stack.setCurrentIndex(self._tab_index.get(k, 0)))
+        outer.addWidget(self.pivot)
+        outer.addWidget(self.stack)
+        p_song, p_plan, p_play, p_log = self.tab_layouts
+
         # ---- 曲目组 ----
         song_group = SettingCardGroup('曲目')
 
@@ -381,7 +410,7 @@ class MainPage(ScrollArea):
         btn_row.addWidget(btn_dl)
         btn_row.addStretch(1)
         song_group.vBoxLayout.addLayout(btn_row)
-        outer.addWidget(song_group)
+        p_song.addWidget(song_group)
 
         # ---- 规划组 ----
         plan_group = SettingCardGroup('规划')
@@ -442,7 +471,7 @@ class MainPage(ScrollArea):
         plan_btn_row.addWidget(self.export_btn)
         plan_btn_row.addStretch(1)
         plan_group.vBoxLayout.addLayout(plan_btn_row)
-        outer.addWidget(plan_group)
+        p_plan.addWidget(plan_group)
 
         # ---- 设备组 ----
         dev_group = SettingCardGroup('设备')
@@ -476,7 +505,7 @@ class MainPage(ScrollArea):
         self.dev_badge = CaptionLabel('未连接')
         dev_row.addWidget(self.dev_badge)
         dev_group.vBoxLayout.addLayout(dev_row)
-        outer.addWidget(dev_group)
+        p_plan.addWidget(dev_group)
 
         # ---- 在线下载组 ----
         dl_group = SettingCardGroup('在线谱面下载')
@@ -538,7 +567,7 @@ class MainPage(ScrollArea):
         dl_group.vBoxLayout.addLayout(dl_btn_row)
         self.dl_list.itemSelectionChanged.connect(lambda: self.dl_btn.setEnabled(bool(self.dl_list.selectedItems())))
         self.dl_list.itemDoubleClicked.connect(lambda *_: self._dl_do_download())
-        outer.addWidget(dl_group)
+        p_song.addWidget(dl_group)
 
         # ---- 设置组 ----
         setting_group = SettingCardGroup('设置')
@@ -585,7 +614,7 @@ class MainPage(ScrollArea):
 
         self.about_card = SettingCard(FIF.INFO, '关于', 'Phisap by FYX')
         setting_group.addSettingCard(self.about_card)
-        outer.addWidget(setting_group)
+        p_play.addWidget(setting_group)
 
         # ---- 同步 & 播放 ----
         play_group = SettingCardGroup('同步与演奏')
@@ -620,7 +649,7 @@ class MainPage(ScrollArea):
         live_row.addWidget(CaptionLabel('播放中随时调, 下一批事件生效'))
         live_row.addStretch(1)
         play_group.vBoxLayout.addLayout(live_row)
-        outer.addWidget(play_group)
+        p_play.addWidget(play_group)
 
         # ---- 日志 ----
         log_head = QHBoxLayout()
@@ -630,15 +659,17 @@ class MainPage(ScrollArea):
         self.log_export_btn.setToolTip('导出完整日志到文件')
         self.log_export_btn.clicked.connect(self._export_log)
         log_head.addWidget(self.log_export_btn)
-        outer.addLayout(log_head)
+        p_log.addLayout(log_head)
         self.log_view = PlainTextEdit()
         self.log_view.setReadOnly(True)
         # 高一点, 并且允许用户自己拖高: 以前只有160px, 一屏就只能看几行,
         # 排查问题时来回翻很痛苦。同时每行都写进了 ./phisap.log, 不怕丢。
         self.log_view.setMinimumHeight(260)
-        outer.addWidget(self.log_view)
+        p_log.addWidget(self.log_view)
 
-        outer.addStretch(1)
+        # 每页末尾各留一段伸缩, 让卡片贴顶、不会被拉高
+        for lay in self.tab_layouts:
+            lay.addStretch(1)
 
         # ---- 跨线程信号 -> 槽 ----
         self.playback_finished.connect(self._reset_go)
