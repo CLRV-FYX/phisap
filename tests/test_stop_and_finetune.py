@@ -5,8 +5,9 @@
 问题1: "为什么现在不能实时调整延迟了? 以前没优化ui前都可以"
 旧版tkinter在播放时把delay_input重绑到临时变量, 按一次上下箭头就
 self.start_time += 0.01 —— run_player 每批都重新读 start_time, 所以立刻生效。
-改成Qt界面时这个绑定整个丢了。现在用 delay_spin.valueChanged -> _on_fine_tune
-平移 _fine_tune, 而 start_time 传的是 lambda: self._start_time + self._fine_tune。
+改成Qt界面时这个绑定整个丢了。现在用单独的"实时延迟"旋钮(放在"开始演奏"按钮
+下面)直接驱动 _fine_tune, 而 start_time 传的是 lambda: self._start_time +
+self._fine_tune; 播放中改旋钮, 下一批事件就生效, 而且不并回"开始延迟"。
 
 问题2a: "停止还是不行, 扫屏触点停不下来"
 以前的 _active_pids 是"把整份规划跑一遍看最后还有谁没抬起" —— 那得到的是
@@ -196,30 +197,45 @@ class StalePointerClearTest(unittest.TestCase):
         self.assertIn('_all_pids', seg, '没有把上一轮用过的触点纳入清理')
 
 
-class FineTuneTest(unittest.TestCase):
-    '''播放期间实时微调偏移'''
+class LiveDelayTest(unittest.TestCase):
+    '''播放期间的"实时延迟"控件
 
-    def test_enter_exit_methods_exist(self):
+    用户要求(#35): 延迟拆成两个控件 —— "开始延迟"(播放前设好, 就是原来那个
+    偏移框)和"实时延迟"(放在"开始演奏"按钮下面, 播放中随时调, 下一批事件生效),
+    而且两个都不设大小上限。这一条同时撤掉了 98e8ff6 里"把实时微调量并回偏移
+    并夹在±2秒"的做法: 并回去用户分不清调的是哪一项, 夹范围会把值悄悄截断。
+    '''
+
+    def test_live_delay_method_exists(self):
         cls = _mainpage()
         names = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
-        for m in ('_enter_fine_tune', '_exit_fine_tune', '_on_fine_tune'):
-            self.assertIn(m, names, f'缺少 {m}')
+        self.assertIn('_on_live_delay', names, '缺少 _on_live_delay')
 
-    def test_start_playback_calls_enter(self):
-        seg = ast.dump(_method(_mainpage(), '_start_playback'))
-        self.assertIn('_enter_fine_tune', seg, '播放开始时没有进入微调模式')
+    def test_live_delay_spin_wired(self):
+        src = _src('main.py')
+        self.assertIn('live_delay_spin.valueChanged.connect(self._on_live_delay)', src,
+                      '实时延迟旋钮没有连接到 _on_live_delay')
 
-    def test_reset_go_calls_exit(self):
-        seg = ast.dump(_method(_mainpage(), '_reset_go'))
-        self.assertIn('_exit_fine_tune', seg, '播放结束时没有退出微调模式')
+    def test_live_delay_placed_after_go_button(self):
+        '''用户明确要求: 实时延迟控件放在"开始演奏"按钮下面'''
+        src = _src('main.py')
+        i_go = src.index("self.go_btn = PrimaryPushButton")
+        i_live = src.index('self.live_delay_spin = DoubleSpinBox()')
+        self.assertGreater(i_live, i_go, '实时延迟控件不在"开始演奏"按钮后面')
 
-    def test_start_time_reads_fine_tune(self):
-        '''关键: start_time 必须每批都重新读, 且包含实时微调量'''
+    def test_no_merge_back_and_no_clamp(self):
+        '''不许再把实时延迟并回开始延迟, 也不许再夹一次范围'''
+        src = _src('main.py')
+        for bad in ('_enter_fine_tune', '_exit_fine_tune', 'min(DELAY_LIMIT_MS'):
+            self.assertNotIn(bad, src, f'main.py 里还有 {bad}')
+
+    def test_start_time_reads_live_delay(self):
+        '''关键: start_time 必须每批都重新读, 且包含实时延迟'''
         seg = ast.dump(_worker_node())
-        self.assertIn('_fine_tune', seg, 'start_time 没有含实时微调量')
+        self.assertIn('_fine_tune', seg, 'start_time 没有含实时延迟')
 
-    def test_fine_tune_takes_effect_next_batch(self):
-        '''真实运行: 微调后, run_player 下一批就按新时钟走'''
+    def test_live_delay_takes_effect_next_batch(self):
+        '''真实运行: 改了实时延迟, run_player 下一批就按新时钟走'''
         from player import run_player
         from algo.algo_base import TouchAction, VirtualTouchEvent
 
@@ -247,7 +263,7 @@ class FineTuneTest(unittest.TestCase):
                   clock=clk, sleep=lambda s: None)
         before = list(sent_at)
 
-        # 再来一次, 中途把 fine_tune 加大 -> 事件应该整体推迟
+        # 再来一次, 中途把实时延迟加大 -> 事件应该整体推迟
         clk2 = Clk()
         it2 = iter(plan)
         sent2 = []
@@ -262,26 +278,15 @@ class FineTuneTest(unittest.TestCase):
 
         run_player(send2, it2, lambda: base + fine2[0], lambda: True,
                   clock=clk2, sleep=lambda s: None)
-        # 第4批及之后必须比"没有微调"时更晚
-        self.assertGreater(sent2[3], before[3],
-                           '微调没有在下一批生效')
+        # 第4批及之后必须比"没有实时延迟"时更晚
+        self.assertGreater(sent2[3], before[3], '实时延迟没有在下一批生效')
 
-    def test_fine_tune_math(self):
-        '''真实计算: 微调量按增量累加, 正值=延后'''
-        fine_tune = 0.0
-        last = 0.0
-        for v in (5.0, 15.0, 10.0, 30.0):
-            delta = v - last
-            last = v
-            fine_tune += delta / 1000.0
-        self.assertAlmostEqual(fine_tune, 0.030, places=6)
-        self.assertGreater(fine_tune, 0, '正值应该表示延后')
-
-    def test_fine_tune_clamped_on_merge(self):
-        DELAY_OFFSET_LIMIT_MS = 2000
-        merged = 1900.0 + 0.5 * 1000
-        merged = max(-DELAY_OFFSET_LIMIT_MS, min(DELAY_OFFSET_LIMIT_MS, merged))
-        self.assertEqual(merged, DELAY_OFFSET_LIMIT_MS)
+    def test_live_delay_math(self):
+        '''旋钮的毫秒值直接就是实时延迟(秒), 正值=延后'''
+        for v in (-500.0, 0.0, 5.0, 120.0):
+            self.assertAlmostEqual(v / 1000.0, round(v / 1000.0, 3), places=6)
+        self.assertGreater(120.0 / 1000.0, 0, '正值应该表示延后')
+        self.assertLess(-500.0 / 1000.0, 0, '负值应该表示提前')
 
 
 class FullLogTest(unittest.TestCase):

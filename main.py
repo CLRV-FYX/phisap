@@ -159,9 +159,12 @@ class PlanThread(QThread):
 # 让第一批事件(按下按钮那一戳)落在游戏开始之前而不是之后。
 MANUAL_START_LEAD = 0.01
 
-# "偏移"可调范围(ms)。以前是±500, 用户反馈不够: 不同设备/模拟器的整体时序偏移
-# 能超过1秒, 500ms根本补偿不过来。放宽到±2秒。
-DELAY_OFFSET_LIMIT_MS = 2000
+# "开始延迟"和"实时延迟"的可调范围(ms)。以前是±500, 用户反馈不够(不同设备/模拟器的
+# 整体时序偏移能超过1秒); 后来放到±2秒, 用户又明确要求"两个都不设大小上限"。
+# QDoubleSpinBox 必须有有限边界, 这里给一个远超任何实际需求的范围(±999秒),
+# 对人工调节等于没有上限。注意别处不要再夹一次 —— 用户设多少就是多少,
+# 夹一次他设的值就被悄悄改回去, 等于没有补偿手段。
+DELAY_LIMIT_MS = 999999
 
 
 class PointerTracker:
@@ -256,11 +259,10 @@ class MainPage(ScrollArea):
         # 所以可以在后台提前算好, 点"开始演奏"时直接取, 不在GUI线程里卡几百毫秒。
         self._adapt_cache: tuple | None = None
         self._adapt_gen = 0
-        # 播放期间的实时微调量(秒)。run_player 每批都重新读 start_time,
-        # 所以改这个值下一批就生效 —— 旧版tkinter的"微调"就是这么做的。
+        # 播放期间的实时延迟(秒), 由"实时延迟"旋钮直接驱动。
+        # run_player 每批都重新读 start_time, 所以改这个值下一批就生效 ——
+        # 旧版tkinter的"微调"就是这么做的。
         self._fine_tune = 0.0
-        self._fine_last = 0.0
-        self._fine_base: float | None = None   # None=当前不在微调模式
         # 播放"代际": 每启动一次播放就+1。worker 记住自己属于哪一代,
         # 发现代际变了就立刻停止发送——防止上一次没退干净的线程继续往设备上戳。
         self._playback_gen = 0
@@ -364,12 +366,11 @@ class MainPage(ScrollArea):
         self.algo_card.hBoxLayout.addSpacing(16)
         plan_group.addSettingCard(self.algo_card)
 
-        self.delay_card = SettingCard(FIF.STOP_WATCH, '偏移 (ms)',
-                                      '正值延后,负值提前, 范围 ±2秒')
+        self.delay_card = SettingCard(FIF.STOP_WATCH, '开始延迟 (ms)',
+                                      '正值延后,负值提前; 按下"开始演奏"时生效, 不设上限')
         self.delay_spin = DoubleSpinBox()
-        # 以前上限只有±500ms, 用户反馈不够用(某些设备/模拟器整体偏移能到1秒以上)。
-        # 放宽到±2000ms; 步长跟着值的大小变, 大偏移时不用按几百下。
-        self.delay_spin.setRange(-DELAY_OFFSET_LIMIT_MS, DELAY_OFFSET_LIMIT_MS)
+        # 不设大小上限(见 DELAY_LIMIT_MS): 用户要求两个延迟控件都不夹范围。
+        self.delay_spin.setRange(-DELAY_LIMIT_MS, DELAY_LIMIT_MS)
         self.delay_spin.setSingleStep(5)
         self.delay_spin.setDecimals(1)
         self.delay_spin.setValue(0)
@@ -571,6 +572,27 @@ class MainPage(ScrollArea):
         self.go_btn.clicked.connect(self.run)
         self.go_btn.setEnabled(False)
         play_group.vBoxLayout.addWidget(self.go_btn)
+
+        # ---- 实时延迟: 与"开始延迟"分开的第二个控件 ----
+        # 用户要求把延迟拆成两个: "开始延迟"在播放前设好(就是原来那个偏移框),
+        # "实时延迟"放在"开始演奏"按钮下面, 播放中随时改, 下一批事件就生效。
+        # 两个都不夹范围。实时延迟**不**并回开始延迟: 并回去一来用户会搞混
+        # "这次调的是哪一项", 二来以前夹在±2秒, 调过的值会被悄悄截断。
+        live_row = QHBoxLayout()
+        live_row.setSpacing(8)
+        live_row.addWidget(StrongBodyLabel('实时延迟'))
+        self.live_delay_spin = DoubleSpinBox()
+        self.live_delay_spin.setRange(-DELAY_LIMIT_MS, DELAY_LIMIT_MS)
+        self.live_delay_spin.setSingleStep(5)
+        self.live_delay_spin.setDecimals(1)
+        self.live_delay_spin.setValue(0)
+        self.live_delay_spin.setFixedWidth(140)
+        self.live_delay_spin.setToolTip('播放中调整, 下一批事件立即生效; 正值延后, 负值提前')
+        self.live_delay_spin.valueChanged.connect(self._on_live_delay)
+        live_row.addWidget(self.live_delay_spin)
+        live_row.addWidget(CaptionLabel('播放中随时调, 下一批事件生效'))
+        live_row.addStretch(1)
+        play_group.vBoxLayout.addLayout(live_row)
         outer.addWidget(play_group)
 
         # ---- 日志 ----
@@ -1251,9 +1273,12 @@ class MainPage(ScrollArea):
             pass
         self.go_btn.clicked.connect(self._stop)
         self.sync_btn.setEnabled(False)
-        # 把"偏移"临时变成实时微调旋钮(旧版tkinter的行为):
-        # 播放中按上下箭头, 打歌时钟立刻平移, 下一批事件就生效, 不用停下来重开。
-        self._enter_fine_tune()
+        # 实时延迟从0开始: "开始延迟"负责播放前的整体偏移, "实时延迟"负责
+        # 播放中的临场补偿, 两个控件互不覆盖。
+        self.live_delay_spin.blockSignals(True)
+        self.live_delay_spin.setValue(0)
+        self.live_delay_spin.blockSignals(False)
+        self._fine_tune = 0.0
 
         my_gen = self._playback_gen
 
@@ -1350,57 +1375,17 @@ class MainPage(ScrollArea):
 
         self._player_thread = Thread(target=worker, daemon=True)
         self._player_thread.start()
-    # ---- 播放期间实时微调"偏移" ----
-    def _enter_fine_tune(self):
-        """播放开始: 把偏移框临时改成"实时微调"(正为延后, 负为提前)。
+    # ---- 实时延迟 ----
+    def _on_live_delay(self, v):
+        """拖动"实时延迟"旋钮: 平移打歌时钟, 下一批事件即生效。
 
-        旧版tkinter在播放时会把delay_input重新绑到一个临时变量上, 按一次上下箭头
-        就 self.start_time += 0.01 —— 因为 run_player 每批都重新读 start_time,
-        调整立刻生效。改成Qt界面时这个绑定丢了, 用户于是"不能实时调整延迟"。
+        和"开始延迟"是两个独立控件: 开始延迟在播放前设好并缓存, 实时延迟只影响
+        当前这一轮, 不并回开始延迟(并回去一来用户分不清调的是哪一项, 二来以前
+        夹在±2秒, 调过的值会被悄悄截断)。
         """
-        self._fine_base = self.delay_spin.value()
-        self._fine_tune = 0.0
-        self._fine_last = 0.0
-        try:
-            self.delay_spin.valueChanged.connect(self._on_fine_tune)
-        except Exception:
-            pass
-        self.delay_spin.blockSignals(True)
-        self.delay_spin.setValue(0)
-        self.delay_spin.blockSignals(False)
-        self._fine_last = 0.0
-        self._set_delay_hint('实时微调: 正为延后, 负为提前 (播放中)')
-
-    def _exit_fine_tune(self):
-        """播放结束: 把实时微调的结果并回"偏移", 恢复成普通设置"""
-        try:
-            self.delay_spin.valueChanged.disconnect(self._on_fine_tune)
-        except Exception:
-            pass
-        if self._fine_base is not None:
-            # 微调量并回基准值: 这次对好的轴下一首歌接着用, 不用每首重调。
-            merged = self._fine_base + self._fine_tune * 1000.0
-            merged = max(-DELAY_OFFSET_LIMIT_MS, min(DELAY_OFFSET_LIMIT_MS, merged))
-            if abs(merged - self._fine_base) > 0.05:
-                self.log(f'偏移已更新为 {merged:+.1f} ms(并入本次实时微调)')
-            self.delay_spin.blockSignals(True)
-            self.delay_spin.setValue(merged)
-            self.delay_spin.blockSignals(False)
-            self._cache_set('offset', str(round(merged, 1)))
-            self._fine_base = None
-        self._fine_tune = 0.0
-        self._set_delay_hint('正值延后,负值提前, 范围 ±2秒')
-
-    def _on_fine_tune(self, v):
-        """播放中拖动偏移框: 平移打歌时钟, 下一批事件即生效"""
-        if not self._running:
-            return
-        delta_ms = v - self._fine_last
-        self._fine_last = v
-        if not delta_ms:
-            return
-        self._fine_tune += delta_ms / 1000.0
-        self.log(f'实时微调 {delta_ms:+.1f} ms (累计 {v:+.1f} ms)')
+        self._fine_tune = v / 1000.0
+        if self._running:
+            self.log(f'实时延迟 {v:+.1f} ms (下一批事件生效)')
 
     def _export_log(self):
         """把完整日志另存一份给用户(界面里看的 + ./phisap.log 里的都在)"""
@@ -1428,12 +1413,6 @@ class MainPage(ScrollArea):
             InfoBar.success('已导出', path, parent=self.window(), duration=3000)
         except Exception as e:
             self.log(f'导出日志失败: {e}')
-
-    def _set_delay_hint(self, text):
-        try:
-            self.delay_card.contentLabel.setText(text)
-        except Exception:
-            pass
 
     def _release_all_active(self):
         """给所有仍处于按下状态的程序触点发送 UP 事件,防止手指卡住。
@@ -1504,8 +1483,6 @@ class MainPage(ScrollArea):
                     self._release_all_active()
 
     def _reset_go(self):
-        # 退出实时微调, 把偏移框恢复成用户设置的基准值
-        self._exit_fine_tune()
         '''复位演奏按钮。可能被调用多次(手动停止一次 + 播放线程结束信号一次),
         所以先用按钮文字判断是否已复位, 否则 clicked 会被连上两份 run, 点一下开始两次。
         注意: 早退时不能顺手 setEnabled(True) —— 没生成规划时按钮本来就该是禁用的,

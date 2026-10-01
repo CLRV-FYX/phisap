@@ -253,19 +253,23 @@ class StopRaceTest(unittest.TestCase):
 
 
 class DelayOffsetTest(unittest.TestCase):
-    '''偏移范围 + 手动开始模式必须也吃这个偏移'''
+    '''延迟范围(不设上限) + 手动开始模式必须也吃这个偏移'''
 
-    def test_delay_range_widened(self):
+    def test_delay_range_not_clamped(self):
+        '''用户要求"两个都不设大小上限": 两个旋钮都要用不夹范围的边界'''
         cls = _mainpage()
         seg = ast.dump(cls)
-        self.assertNotIn("Constant(value=-500)", seg, '偏移上限还是±500ms')
-        self.assertIn('DELAY_OFFSET_LIMIT_MS', seg)
+        self.assertNotIn("Constant(value=-500)", seg, '延迟上限还是±500ms')
+        self.assertIn('DELAY_LIMIT_MS', seg)
+        src = _src('main.py')
+        self.assertEqual(src.count('setRange(-DELAY_LIMIT_MS, DELAY_LIMIT_MS)'), 2,
+                         '开始延迟/实时延迟没有都设成不夹范围')
 
     def test_delay_limit_value(self):
         src = _src('main.py')
-        i = src.index('DELAY_OFFSET_LIMIT_MS = ')
+        i = src.index('DELAY_LIMIT_MS = ')
         v = int(src[i:src.index('\n', i)].split('=')[1])
-        self.assertGreaterEqual(v, 1500, f'偏移上限只有±{v}ms, 补偿不了1秒以上的整体偏移')
+        self.assertGreaterEqual(v, 1500, f'延迟上限只有±{v}ms, 补偿不了1秒以上的整体偏移')
 
     def test_manual_path_applies_offset(self):
         '''用户用的是手动开始, 偏移在手动路径里也必须生效'''
