@@ -69,11 +69,37 @@ def chart_difficulty(filename: str) -> str | None:
 _FIRST_NOTE_CACHE: dict[tuple, int] = {}
 
 
+def load_chart_file(path: str):
+    """从磁盘读一份谱面并转成 Chart。官谱(formatVersion 1/2/3)和 RPE 谱面都认。
+
+    以前这里是裸的 Chart.from_dict(json.load(f))。用户选到 RPE 谱面时
+    (RPE 没有 formatVersion, 靠 BPMList/META/judgeLineList 识别)直接
+    KeyError: 'formatVersion' 崩掉, 而 import_songs 那条导入路本来就有 RPE 转换,
+    规划这条路忘了 —— 于是"能导入却没法规划"。
+
+    认不出来时抛带文件名的 ValueError, 比 KeyError 好排查得多。
+    返回 (Chart, 警告列表), 警告由调用方决定怎么显示。
+    """
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        data = json.load(f)
+    kind = detect_kind(data)
+    warns: list[str] = []
+    if kind == 'rpe':
+        data, warns = rpe_to_official_v3(data)
+    elif kind == 'unknown':
+        raise ValueError(
+            f'无法识别的谱面格式: {os.path.basename(path)}\n'
+            f'既不是官谱(formatVersion 1/2/3), 也不是 RPE 谱面'
+            f'(RPE 需要 BPMList / META / judgeLineList)。\n'
+            f'如果你认为这个文件没问题, 请把文件发给作者。')
+    return Chart.from_dict(data), warns
+
+
 def first_note_ms_from_path(path: str | None) -> int:
     '''谱面第一个音符的判定时间(ms)。
 
     这个函数会被 _start_playback 在每次点"开始演奏"时调用, 而它的实现是
-    "读盘 -> json.load -> Chart.from_dict -> 遍历所有判定线和音符取最小值"。
+    "读盘 -> 识别格式(RPE要转换) -> 遍历所有判定线和音符取最小值"。
     一张2.5MB的谱面实测就要42ms, 大谱面(3000+判定线)轻松上几百毫秒,
     而且全部发生在GUI线程、发生在用户点完按钮之后 —— 表现为"点了开始要等
     一会儿才动"。所以这里按 (路径, mtime, 大小) 缓存, 同一张谱面只算一次。
@@ -89,8 +115,7 @@ def first_note_ms_from_path(path: str | None) -> int:
     if v is not None:
         return v
     try:
-        with open(path, 'r', encoding='utf-8-sig') as f:
-            ch = Chart.from_dict(json.load(f))
+        ch, _ = load_chart_file(path)
         v = first_note_ms(ch)
         v = v if v else 0
     except Exception:
@@ -142,8 +167,11 @@ class PlanThread(QThread):
             from rich.console import Console as RConsole
             buf = io.StringIO()
             cap = RConsole(file=buf, highlight=False, force_terminal=False)
-            with open(self.chart_path, 'r', encoding='utf-8-sig') as f:
-                chart = Chart.from_dict(json.load(f))
+            # 用 load_chart_file 而不是裸的 Chart.from_dict: 用户选到 RPE 谱面时
+            # 必须先转成官方v3结构, 否则 KeyError: 'formatVersion' 直接规划失败。
+            chart, chart_warns = load_chart_file(self.chart_path)
+            for w in chart_warns:
+                cap.print(f'[yellow]RPE转换: {w}[/yellow]')
             mod = importlib.import_module(f'algo.{self.algo}')
             ans = mod.solve(chart, cap, self.max_pointers)
             with open(self.plan_path, 'w', encoding='utf-8') as fp:
