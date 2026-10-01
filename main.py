@@ -80,6 +80,11 @@ def load_chart_file(path: str):
     认不出来时抛带文件名的 ValueError, 比 KeyError 好排查得多。
     返回 (Chart, 警告列表), 警告由调用方决定怎么显示。
     """
+    if is_plan_cache(path):
+        raise ValueError(
+            f'选中了规划缓存文件而不是谱面: {os.path.basename(path)}\n'
+            f'*.ans.vN.json 是程序自己生成的规划结果, 不是谱面, 读不出 formatVersion。\n'
+            f'请重新选择曲目和难度; 如果曲目列表里只剩下缓存文件, 说明这张谱面没被正确导入。')
     with open(path, 'r', encoding='utf-8-sig') as f:
         data = json.load(f)
     kind = detect_kind(data)
@@ -126,12 +131,25 @@ def first_note_ms_from_path(path: str | None) -> int:
     return v
 
 
+# 规划缓存文件的名字形如 Chart_AT.ans.v10.json。**必须按模式匹配所有版本**,
+# 不能只排除当前版本的后缀: 缓存版本号一升(v9 -> v10), 上一版留下的旧缓存
+# (.ans.v9.json)就不再被排除, 会被当成谱面选中去规划, 报"无法识别的谱面格式"。
+# 用户实际踩过这个坑。
+_PLAN_CACHE_RE = re.compile(r'\.ans\.v\d+\.json$', re.IGNORECASE)
+
+
+def is_plan_cache(filename: str) -> bool:
+    """是不是程序自己生成的规划缓存(*.ans.vN.json), 而不是谱面"""
+    return bool(_PLAN_CACHE_RE.search(os.path.basename(filename)))
+
+
 def find_chart_path(song_id: str, diff: str) -> str | None:
     folder = os.path.join('./Assets/Tracks', song_id)
     if not os.path.isdir(folder):
         return None
     for f in os.listdir(folder):
-        if chart_difficulty(f) == diff and f.endswith('.json') and PLAN_CACHE_SUFFIX not in f:
+        if (chart_difficulty(f) == diff and f.endswith('.json')
+                and not is_plan_cache(f)):
             return os.path.join(folder, f)
     return None
 
@@ -1074,6 +1092,12 @@ class MainPage(ScrollArea):
         ok = 0
         for fp in files:
             try:
+                if is_plan_cache(fp):
+                    # 规划缓存也是合法JSON, 不拦的话会被存成一张空谱面,
+                    # 曲目列表里多出一个莫名其妙的新歌。
+                    ok += 1
+                    self.log(f'跳过规划缓存文件(不是谱面): {os.path.basename(fp)}')
+                    continue
                 with open(fp, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if detect_kind(data) == 'rpe':

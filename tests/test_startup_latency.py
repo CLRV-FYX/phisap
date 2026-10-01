@@ -89,7 +89,8 @@ class FirstNoteCacheTest(unittest.TestCase):
         # load_chart_file 也要一起抽出来: first_note_ms_from_path 现在走它
         # (官谱/RPE 都认, 见 main.load_chart_file), 少了它抽出来的函数会 NameError,
         # 被自己的 try/except 吞掉返回0, 表现为"缓存测试莫名失败"。
-        want = ('_FIRST_NOTE_CACHE', 'load_chart_file', 'first_note_ms_from_path')
+        want = ('_FIRST_NOTE_CACHE', '_PLAN_CACHE_RE', 'load_chart_file',
+                'first_note_ms_from_path', 'is_plan_cache')
         def _is_cache_assign(n):
             if isinstance(n, ast.AnnAssign):
                 return isinstance(n.target, ast.Name) and n.target.id == '_FIRST_NOTE_CACHE'
@@ -97,12 +98,16 @@ class FirstNoteCacheTest(unittest.TestCase):
                 return any(isinstance(t, ast.Name) and t.id == '_FIRST_NOTE_CACHE' for t in n.targets)
             return False
 
-        _want_fns = ('first_note_ms_from_path', 'load_chart_file')
+        _want_fns = ('first_note_ms_from_path', 'load_chart_file', 'is_plan_cache')
         picked = [n for n in tree.body
                   if _is_cache_assign(n)
+                  or (isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == '_PLAN_CACHE_RE'
+                              for t in n.targets))
                   or (isinstance(n, ast.FunctionDef) and n.name in _want_fns)]
         self.assertEqual(len(picked), len(want), 'main.py 里找不到 _FIRST_NOTE_CACHE / first_note_ms_from_path')
-        ns = {'os': os, 'json': json, 'Chart': Chart, 'first_note_ms': first_note_ms,
+        ns = {'os': os, 'json': json, 're': __import__('re'), 'Chart': Chart,
+              'first_note_ms': first_note_ms,
               'detect_kind': detect_kind, 'rpe_to_official_v3': rpe_to_official_v3}
         exec(compile(ast.Module(body=picked, type_ignores=[]), '<main-extract>', 'exec'), ns)
         return ns

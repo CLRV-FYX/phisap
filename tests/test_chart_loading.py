@@ -35,17 +35,37 @@ def _function(name):
 
 
 def _load_chart_file():
-    """把 load_chart_file 从 main.py 里抽出来真跑(main.py 依赖 PyQt5, 整体导入不了)"""
-    ns = {'json': json, 'os': os}
+    """把 load_chart_file 从 main.py 里抽出来真跑(main.py 依赖 PyQt5, 整体导入不了)。
+
+    它现在会调用 is_plan_cache, 所以那个函数和它用到的 _PLAN_CACHE_RE 也要一起抽出来,
+    少一个就 NameError, 被它自己的 except 吞掉之后表现为"莫名返回0/莫名失败"。
+    """
+    ns = {'json': json, 'os': os, 're': __import__('re')}
     from rpe import detect_kind, rpe_to_official_v3
     from chart import Chart
     ns['detect_kind'] = detect_kind
     ns['rpe_to_official_v3'] = rpe_to_official_v3
     ns['Chart'] = Chart
-    src = ast.get_source_segment(_src(), _function('load_chart_file'))
-    assert src and 'load_chart_file' in src
-    exec(compile(src, 'main.py:load_chart_file', 'exec'), ns)
+    tree = ast.parse(_src())
+    picked = [n for n in tree.body
+              if (isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == '_PLAN_CACHE_RE' for t in n.targets))
+              or (isinstance(n, ast.FunctionDef) and n.name in ('is_plan_cache', 'load_chart_file'))]
+    self_names = [n.name for n in picked if isinstance(n, ast.FunctionDef)]
+    assert sorted(self_names) == ['is_plan_cache', 'load_chart_file'], self_names
+    exec(compile(ast.Module(body=picked, type_ignores=[]), '<main-extract>', 'exec'), ns)
     return ns['load_chart_file']
+
+
+def _is_plan_cache():
+    ns = {'os': os, 're': __import__('re')}
+    node = next(n for n in ast.parse(_src()).body
+                if isinstance(n, ast.FunctionDef) and n.name == 'is_plan_cache')
+    pat = next(n for n in ast.parse(_src()).body
+               if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == '_PLAN_CACHE_RE' for t in n.targets))
+    exec(compile(ast.Module(body=[pat, node], type_ignores=[]), '<main-extract>', 'exec'), ns)
+    return ns['is_plan_cache']
 
 
 OFFICIAL_V3 = {
@@ -120,6 +140,77 @@ class LoadChartFileTest(unittest.TestCase):
             self.fail('还在漏 KeyError, RPE 转换没有生效')
         except ValueError:
             pass
+
+
+class PlanCacheTest(unittest.TestCase):
+    """规划缓存文件(*.ans.vN.json)不是谱面, 三处地方都必须认出来。
+
+    用户实际踩的坑: 缓存版本号从 v9 升到 v10 之后, find_chart_path 里
+    "PLAN_CACHE_SUFFIX not in f" 只能排除当前版本, 上一版留下的
+    Chart_AT.ans.v9.json 不再被过滤, 被当成谱面选中去规划。
+    """
+
+    def test_pattern_matches_every_version(self):
+        f = _is_plan_cache()
+        for name in ('Chart_AT.ans.v9.json', 'Chart_AT.ans.v10.json',
+                     'chart_in.ans.v11.json', 'x.ans.v1.json'):
+            self.assertTrue(f(name), f'{name} 应该被认出是规划缓存')
+        for name in ('Chart_AT.json', 'Chart.json', 'ans.v9.json',
+                     'Chart_AT.json.bak', 'x.ans.json', 'Chart_AT.ans.json'):
+            self.assertFalse(f(name), f'{name} 不该被误判成规划缓存')
+
+    def test_load_chart_file_rejects_plan_cache(self):
+        """读到的若是缓存文件, 报错必须说清楚"这是规划结果不是谱面" """
+        fn = _load_chart_file()
+        d = tempfile.mkdtemp(prefix='phisap-cache-')
+        p = os.path.join(d, 'Chart_AT.ans.v9.json')
+        with io.open(p, 'w', encoding='utf-8') as f:
+            json.dump({'0': [{'pos': [1, 2], 'action': 0, 'pointer': 1000}]}, f)
+        with self.assertRaises(ValueError) as cm:
+            fn(p)
+        msg = str(cm.exception)
+        self.assertIn('Chart_AT.ans.v9.json', msg)
+        self.assertIn('规划缓存', msg)
+
+    def test_find_chart_path_skips_old_cache(self):
+        """目录里同时有谱面和旧版缓存时, 必须选中谱面"""
+        node = next(n for n in ast.parse(_src()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == 'find_chart_path')
+        pat = next(n for n in ast.parse(_src()).body
+                   if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == '_PLAN_CACHE_RE' for t in n.targets))
+        fn_node = next(n for n in ast.parse(_src()).body
+                       if isinstance(n, ast.FunctionDef) and n.name == 'is_plan_cache')
+        ns = {'os': os, 're': __import__('re'), 'PLAN_CACHE_SUFFIX': '.ans.v10.json',
+              'chart_difficulty': lambda f: 'AT' if f.lower().startswith('chart_at') else None}
+        exec(compile(ast.Module(body=[pat, fn_node, node], type_ignores=[]),
+                     '<main-extract>', 'exec'), ns)
+
+        root = tempfile.mkdtemp(prefix='phisap-tracks-')
+        cwd = os.getcwd()
+        try:
+            os.chdir(root)
+            folder = os.path.join('./Assets/Tracks', 'SongA')
+            os.makedirs(folder)
+            # 旧版缓存排在前面的情况也要对
+            for name in ('Chart_AT.ans.v9.json', 'Chart_AT.json', 'Chart_AT.ans.v10.json'):
+                with io.open(os.path.join(folder, name), 'w', encoding='utf-8') as f:
+                    f.write('{}')
+            got = ns['find_chart_path']('SongA', 'AT')
+            self.assertEqual(os.path.basename(got), 'Chart_AT.json',
+                             f'选中了 {got}, 应该是 Chart_AT.json')
+            # 目录里只剩缓存时要返回None, 而不是把缓存当谱面
+            os.remove(os.path.join(folder, 'Chart_AT.json'))
+            self.assertIsNone(ns['find_chart_path']('SongA', 'AT'))
+        finally:
+            os.chdir(cwd)
+
+    def test_import_songs_guards_plan_cache(self):
+        seg = ast.dump(next(n for n in ast.parse(_src()).body
+                            if isinstance(n, ast.ClassDef) and n.name == 'MainPage'
+                            for n2 in n.body
+                            if isinstance(n2, ast.FunctionDef) and n2.name == 'import_songs'))
+        self.assertIn('is_plan_cache', seg, 'import_songs 没有拦规划缓存文件')
 
 
 class CallSiteTest(unittest.TestCase):
