@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, distance_of, recalc_pos, _edge_safe,
-                        MAX_POINTERS, note_point, flick_path, flick_time_shift,
+                        MAX_POINTERS, note_point, hold_point, flick_path, flick_time_shift,
                         FLICK_START, FLICK_END, FLICK_RADIUS)
 from chart import Chart
 from note import NoteType
@@ -247,14 +247,16 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                     add_frame_event(ms + FLICK_END, FrameEventAction.FLICK_END, path[-1], current_event_id)
                 case NoteType.HOLD:
                     hold_ms = math.ceil(line.seconds(event.hold) * 1000)
-                    head = recalc_pos((px, py), sa, ca)
+                    # hold_point: 音符越界时沿垂直方向夹到屏幕边缘, 手指位置连续,
+                    # 不会在判定线瞬移出屏幕时被要求1ms内跳几百像素(见 algo_base.hold_point)
+                    head = hold_point(line, event, ms)
                     add_frame_event(ms, FrameEventAction.HOLD_START, head, current_event_id)
                     # 按住期间每毫秒跟随判定线(屏幕外映射时使用该时刻的角度, 而不是按下时的角度)
                     # (位置不变或变化很小的毫秒不发送MOVE, 见thin_path)
-                    hold_path = [note_point(line, event, ms + offset) for offset in range(1, hold_ms)]
+                    hold_path = [hold_point(line, event, ms + offset) for offset in range(1, hold_ms)]
                     for i in thin_path(hold_path, head):
                         add_frame_event(ms + i + 1, FrameEventAction.HOLD, hold_path[i], current_event_id)
-                    add_frame_event(ms + hold_ms, FrameEventAction.HOLD_END, note_point(line, event, ms + hold_ms),
+                    add_frame_event(ms + hold_ms, FrameEventAction.HOLD_END, hold_point(line, event, ms + hold_ms),
                                     current_event_id)
             current_event_id += 1
 

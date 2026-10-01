@@ -1,3 +1,7 @@
+# 判定区半宽(像素, 1280x720)。触点沿判定线方向的投影落在音符位置 ±这个范围内即判定成功,
+# 垂直方向不影响判定(见 tools/judge_sim.py 的 local_x / xmax)。
+JUDGE_HALF_WIDTH = 151.2
+
 # 指针规划算法的基类和一些实用类型、函数
 from typing import Self, IO
 from enum import Enum
@@ -17,7 +21,9 @@ MAX_POINTERS = 16
 # v4: flick滑动加快到3像素/毫秒; algo3/algo3f的flick改为单独规划
 # v7: 蓝键(TAP)/长条(HOLD)必须在5ms内释放, 避免触点占满漏判
 # v8: 同位置DRAG/TAP重复按下修复(DRAG复用同毫秒内已按下的触点, 避免挤占触点名额)
-PLAN_CACHE_SUFFIX = '.ans.v9.json'
+# v9: 修复指针预算被扫屏/滑键触点偷走(released_at记真实抬手时刻, 增长上限改为剩余名额)
+# v10: 长条触点越界时沿垂直方向夹到屏幕边缘, 不再跳到"垂直弦中点"(手指位置连续)
+PLAN_CACHE_SUFFIX = '.ans.v10.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -110,6 +116,33 @@ def note_point(line, note, ms: float, time_shift: float = 0.0) -> tuple[float, f
     """音符在ms毫秒时的可点击位置(屏幕外时用该时刻的角度映射回屏幕内)"""
     pos, sa, ca = note_state(line, note, ms, time_shift)
     return recalc_pos(pos, sa, ca)
+
+
+def hold_point(line, note, ms: float, time_shift: float = 0.0) -> tuple[float, float]:
+    """长条(HOLD)触点的位置: 音符在屏幕内时取音符本身; 越界时沿垂直于判定线的方向
+    夹回屏幕内, 取最靠近音符的那个屏幕内的点。
+
+    为什么不能沿用 recalc_pos: recalc_pos 在越界时返回"垂直弦的中点", 这和屏幕内的
+    表示(音符本身)根本不是一套坐标。谱面让判定线瞬移出屏幕再回来时, 手指会被要求在
+    1ms 内从 (768, 2.6) 跳到 (768, 360) 再跳回 (192, 720) —— Chart_AT 实测单次瞬移
+    357px / 679px, 全程最大 1603px。这种瞬移只要被注入延迟吃掉一部分, 长条就会因为
+    "触点离开判定区超过 UP_TOLERANCE(50ms)"而断。
+
+    沿垂直方向夹到屏幕边缘则完全不同: 音符滑出屏幕上沿时, 手指连续地滑到 y=1 并一直
+    按在屏幕边缘上, 不再有几百像素的跳变; 判定线瞬移回来时, 只有沿判定线方向的分量
+    需要跟随(那本来就是必须跟的)。沿判定线方向的投影始终精确等于音符的位置, 判定不受影响。
+    """
+    pos, sa, ca = note_state(line, note, ms, time_shift)
+    x, y = pos
+    if in_screen(pos):
+        return pos
+    lo, hi = _perpendicular_room(x, y, -sa, ca)
+    lo, hi = lo + 1, hi - 1
+    if lo > hi:
+        # 垂直方向在屏幕内没有余量(几乎擦着角落过去), 退回原来的弦中点
+        return recalc_pos(pos, sa, ca)
+    s = min(max(0.0, lo), hi)
+    return clamp_to_screen((x - sa * s, y + ca * s))
 
 
 def flick_time_shift(line, note, console=None) -> float:
@@ -297,4 +330,4 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
            'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'FLICK_START', 'FLICK_END', 'FLICK_RADIUS', 'thin_path', 'first_note_ms', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
-           'clamp_to_screen']
+           'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH']

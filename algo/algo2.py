@@ -8,7 +8,8 @@ from collections import defaultdict
 from chart import Chart
 from note import NoteType
 from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, _edge_safe, MAX_POINTERS, note_point,
-                        flick_path, flick_time_shift, FLICK_START, FLICK_END, FLICK_RADIUS)
+                        hold_point, flick_path, flick_time_shift,
+                        FLICK_START, FLICK_END, FLICK_RADIUS)
 
 # 蓝键(TAP)和长条(HOLD)结束后, 触点必须在此时间(ms)内释放, 避免触点占满导致后续音符漏判
 MAX_RELEASE_MS = 5
@@ -316,9 +317,12 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
             pos = x + off_x * math.cos(alpha), y + off_x * math.sin(alpha)
             match note.type:
                 case NoteType.HOLD:
-                    # 按下之后每毫秒的位置(随判定线移动/旋转), 由同一个指针执行
+                    # 按下之后每毫秒的位置(随判定线移动/旋转), 由同一个指针执行。
+                    # 用 hold_point 而不是 note_point: 音符越界时沿垂直方向夹到屏幕边缘,
+                    # 手指位置连续, 不会在判定线瞬移出屏幕时被要求1ms内跳几百像素(见 algo_base.hold_point)
                     hold_ms = math.ceil(line.seconds(note.hold) * 1000)
-                    path = tuple(note_point(line, note, ms + offset) for offset in range(1, hold_ms + 1))
+                    pos = hold_point(line, note, ms)
+                    path = tuple(hold_point(line, note, ms + offset) for offset in range(1, hold_ms + 1))
                     frames[ms].add(NoteType.HOLD, pos, alpha, path)
                 case NoteType.FLICK:
                     # 判定点在屏幕外时的时间微调(说明见algo1.py); 滑动轨迹逐毫秒跟随判定线

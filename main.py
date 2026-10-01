@@ -1525,6 +1525,19 @@ class MainPage(ScrollArea):
                 pass
             self.go_btn.clicked.connect(self.run)
             self.go_btn.setEnabled(True)
+        # 演奏结束(或手动停止)时把"实时延迟"归零。
+        # 它是播放中的临时补偿: 用户边放边调, 调完这一轮就使命完成了。
+        # 不清零的话下一轮会 silently 继承上次的补偿量, 表现为"这次没调却还是有延迟",
+        # 而用户早就忘了自己上一轮拧过这个旋钮。开始演奏时也会归零一次(见_start_playback),
+        # 但那一轮播放中拧的值必须在这里收尾, 否则停止/自然结束后仍然留着。
+        # 注意 setValue(0) 在值本来就是0时不会发 valueChanged, 所以 _fine_tune 要显式清零。
+        if abs(self._fine_tune) > 1e-9:
+            self.log(f'实时延迟已归零(本轮播放中为 {self._fine_tune * 1000:+.1f} ms)')
+        try:
+            self.live_delay_spin.setValue(0)
+        except Exception:
+            pass
+        self._fine_tune = 0.0
         self.sync_btn.setEnabled(True)
 
     # --- 缓存 ---

@@ -34,8 +34,8 @@ from rich.console import Console
 from chart import Chart
 from note import NoteType
 from . import algo2
-from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, MAX_POINTERS, SWEEP_POINTER_BASE_MIN, TouchAction,
-                        VirtualTouchEvent, flick_path, flick_time_shift)
+from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, JUDGE_HALF_WIDTH, MAX_POINTERS,
+                        SWEEP_POINTER_BASE_MIN, TouchAction, VirtualTouchEvent, flick_path, flick_time_shift)
 
 SWEEP_X_MIN = 20.0
 SWEEP_X_MAX = 1260.0
@@ -52,7 +52,6 @@ ACTIVE_AFTER = 400
 MERGE_GAP = 1500         # 两段扫屏间隔小于此值时合并, 避免频繁按下/抬起
 DOWN_GUARD = 300         # 扫屏触点按下时, 前后这么多ms内的tap/hold需避开
 DOWN_SEARCH = 2000       # 找不到安全的按下时机时, 最多提前这么多ms
-JUDGE_HALF_WIDTH = 151.2  # 判定宽度的一半(像素), 见 tools/judge_sim.py
 SAFE_MARGIN = 30.0
 SETTLE_MS = 40           # 按下后先静止这么久(超过30fps的一帧)再开始扫动, 保证"按下"这一帧的位置是安全的
 PAUSE_BUTTON_BOX = (160.0, 160.0)  # 左上角暂停按钮附近不作为按下位置
