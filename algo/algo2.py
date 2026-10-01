@@ -10,6 +10,7 @@ from note import NoteType
 from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, _edge_safe, MAX_POINTERS, note_point,
                         hold_point, flick_path, flick_time_shift,
                         FLICK_START, FLICK_END, FLICK_RADIUS)
+from .relay import HoldTrack, plan_hold_relays, pool_peak
 
 # 蓝键(TAP)和长条(HOLD)结束后, 触点必须在此时间(ms)内释放, 避免触点占满导致后续音符漏判
 MAX_RELEASE_MS = 5
@@ -28,6 +29,8 @@ class PlainNote(NamedTuple):
     angle: float
     # flick: 滑动轨迹(每毫秒一个点, 从pos所在时刻开始); hold: 按下之后每毫秒的位置
     path: tuple[tuple[float, float], ...] | None = None
+    # 调用方给的标识(比如长条的(判定线号, 音符号)), 分配器会记下执行它的触点id, 事后用来找到这个长条的触点
+    tag: object = None
 
 
 class Frame:
@@ -41,9 +44,9 @@ class Frame:
         self.unallocated = defaultdict(list)
 
     def add(self, note_type: NoteType, pos: tuple[float, float], angle: float,
-            path: tuple[tuple[float, float], ...] | None = None) -> None:
+            path: tuple[tuple[float, float], ...] | None = None, tag: object = None) -> None:
         pos = recalc_pos(pos, math.sin(angle), math.cos(angle))
-        self.unallocated[note_type].append(PlainNote(note_type, self.timestamp, pos, angle, path))
+        self.unallocated[note_type].append(PlainNote(note_type, self.timestamp, pos, angle, path, tag))
 
     def holds(self) -> Iterator[PlainNote]:
         holds = self.unallocated[NoteType.HOLD]
@@ -121,6 +124,7 @@ class PointerAllocator:
         self.last_timestamp = None
         self.dropped: list[tuple[int, NoteType]] = []  # 触点不足而无法执行的音符
         self.released_at: dict[int, int] = {}  # pid -> UP的时刻(用于冷却检查)
+        self.hold_pointer: dict[object, int] = {}  # 长条的tag -> 执行它的触点id(只记带tag的)
 
     def _find_available_pointers(self, note: PlainNote) -> Pointer | None:
         """查找当前屏幕上可以直接拿来用的指针
@@ -192,6 +196,8 @@ class PointerAllocator:
     def _hold(self, pointer: Pointer, note: PlainNote) -> None:
         """按下后同一个指针逐毫秒跟随判定线移动, 直到hold结束; 期间该指针不会被其他音符占用"""
         self._tap(pointer, note)
+        if note.tag is not None:
+            self.hold_pointer[note.tag] = pointer.id
         path = note.path or ()
         for i in thin_path(path, note.pos):  # 位置不变或变化很小的毫秒不发送MOVE
             self._insert(self.now + i + 1, VirtualTouchEvent(path[i], TouchAction.MOVE, pointer.id))
@@ -304,17 +310,25 @@ class PointerAllocator:
         return self.events
 
 
-def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> defaultdict[int, list[VirtualTouchEvent]]:
+def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stats: dict | None = None,
+          relay: bool = True) -> defaultdict[int, list[VirtualTouchEvent]]:
+    """stats: 传入一个dict就会被填上 dropped(因触点不足而丢掉的音符数) 和
+    pool_peak(tap/hold池里同时按着或在冷却的触点数峰值, 即至少需要多少个触点), 不影响规划结果。
+    relay: 判定线瞬移的长条是否加接力触点(见 relay.py)。"""
     frames = Frames()
+    holds: dict[tuple[int, int], tuple] = {}   # tag -> (line, note, 按下时刻, 持续时间, 路径, 按下位置)
+    heads: list[tuple[int, object, object]] = []   # 所有tap/hold的判定时刻, 接力触点按下时要避开
 
     # 统计frames
-    for line in track(chart.judge_lines, description='统计操作帧...', console=console):
-        for note in line.notes_above + line.notes_below:
+    for li, line in enumerate(track(chart.judge_lines, description='统计操作帧...', console=console)):
+        for ni, note in enumerate(line.notes_above + line.notes_below):
             ms = round(line.seconds(note.time) * 1000)
             off_x = note.x * 72
             x, y = line.pos(note.time)
             alpha = -line.angle(note.time) * math.pi / 180
             pos = x + off_x * math.cos(alpha), y + off_x * math.sin(alpha)
+            if note.type in (NoteType.TAP, NoteType.HOLD):
+                heads.append((ms, line, note))
             match note.type:
                 case NoteType.HOLD:
                     # 按下之后每毫秒的位置(随判定线移动/旋转), 由同一个指针执行。
@@ -323,7 +337,8 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                     hold_ms = math.ceil(line.seconds(note.hold) * 1000)
                     pos = hold_point(line, note, ms)
                     path = tuple(hold_point(line, note, ms + offset) for offset in range(1, hold_ms + 1))
-                    frames[ms].add(NoteType.HOLD, pos, alpha, path)
+                    holds[(li, ni)] = (line, note, ms, hold_ms, path, pos)
+                    frames[ms].add(NoteType.HOLD, pos, alpha, path, tag=(li, ni))
                 case NoteType.FLICK:
                     # 判定点在屏幕外时的时间微调(说明见algo1.py); 滑动轨迹逐毫秒跟随判定线
                     shift = flick_time_shift(line, note, console)
@@ -342,7 +357,16 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
     if allocator.dropped:
         console.print(f'[yellow]警告: 有{len(allocator.dropped)}个音符因同时需要超过{max_pointers}个触点而无法执行'
                       f'(首次出现在{allocator.dropped[0][0]}ms)[/yellow]')
-    return allocator.done()
+    events = allocator.done()
+    pool = [p.id for p in allocator.pointers]
+    if stats is not None:
+        stats['dropped'] = len(allocator.dropped)
+        stats['pool_peak'] = pool_peak(events, pool, PID_REUSE_COOLDOWN_MS)
+    if relay:
+        tracks = [HoldTrack(allocator.hold_pointer[tag], *info[:2], info[2], info[3], info[4], info[5])
+                  for tag, info in holds.items() if tag in allocator.hold_pointer]
+        plan_hold_relays(tracks, events, pool, heads, PID_REUSE_COOLDOWN_MS, console)
+    return events
 
 
 __all__ = ['solve']

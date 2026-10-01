@@ -10,6 +10,11 @@ import math
 import json
 
 
+# 左上角暂停按钮的触发区(1280x720坐标)。在这里"点一下"(按下再抬起)会让游戏暂停,
+# 所以任何只按一下就抬起的触点(扫屏/滑键触点的按下、长条接力触点)都不能落在这里。
+PAUSE_BUTTON_BOX = (160.0, 160.0)
+
+
 # Android 系统允许同时存在的最大触点数(MotionEvent 硬上限)。
 # phisap 会推送补丁版 scrcpy-server 以解除官方的10触点限制, 补丁失败时退回10。
 MAX_POINTERS = 16
@@ -23,7 +28,9 @@ MAX_POINTERS = 16
 # v8: 同位置DRAG/TAP重复按下修复(DRAG复用同毫秒内已按下的触点, 避免挤占触点名额)
 # v9: 修复指针预算被扫屏/滑键触点偷走(released_at记真实抬手时刻, 增长上限改为剩余名额)
 # v10: 长条触点越界时沿垂直方向夹到屏幕边缘, 不再跳到"垂直弦中点"(手指位置连续)
-PLAN_CACHE_SUFFIX = '.ans.v10.json'
+# v11: 长条判定线瞬移时加接力触点(整体时间偏差容忍度从±40ms扩到±90ms, 见 algo/relay.py);
+#      flick很密的谱面自动增加滑键触点, 排不下的flick推迟/短划(见 algo3.solve_with)
+PLAN_CACHE_SUFFIX = '.ans.v11.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -330,4 +337,4 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
            'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'FLICK_START', 'FLICK_END', 'FLICK_RADIUS', 'thin_path', 'first_note_ms', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
-           'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH']
+           'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH', 'PAUSE_BUTTON_BOX']

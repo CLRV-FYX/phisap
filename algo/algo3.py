@@ -21,6 +21,12 @@
 # + 只沿x方向扫动时, 竖直的判定线(投影方向是y)无法覆盖, 所以需要多行或者再加一个上下扫的触点。
 # + 各触点的周期互不相同且与帧率不成整数比, 避免每帧都采样到同样的几个位置。
 #
+# 滑键触点的个数不是固定的: 默认16触点时4个、10触点时尽量3个; 但"红键雨"(比如Rrhar'il AT 23秒处,
+# 每79ms同一毫秒4个红键、连续8组)需要更多手指 —— 每个手指划一次要占用约100ms, 一组4个红键之后
+# 79ms内同一批手指还没划完, 只能交替用两批共8个。tap/hold池其实只需要"峰值同时占用数"个触点,
+# 多出来的名额(默认给tap/hold的10个里往往只用4~6个)匀给滑键触点, 最多到 FLICK_FINGERS_MAX 个,
+# 见 solve_with。手指数用满仍排不下的flick, 才把划动推迟一点或改用更快的短划(见 plan_flick_fingers)。
+#
 # 风险: 扫屏/滑键触点按下的瞬间会被当成一次点击, 可能抢走附近的tap/hold判定;
 # 所以按下的时间和位置会避开前后 300ms 内的所有tap/hold, 并在按下后先静止 SETTLE_MS 再开始移动。
 
@@ -34,7 +40,7 @@ from rich.console import Console
 from chart import Chart
 from note import NoteType
 from . import algo2
-from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, JUDGE_HALF_WIDTH, MAX_POINTERS,
+from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, JUDGE_HALF_WIDTH, MAX_POINTERS, PAUSE_BUTTON_BOX,
                         SWEEP_POINTER_BASE_MIN, TouchAction, VirtualTouchEvent, flick_path, flick_time_shift)
 
 SWEEP_X_MIN = 20.0
@@ -54,7 +60,6 @@ DOWN_GUARD = 300         # 扫屏触点按下时, 前后这么多ms内的tap/hol
 DOWN_SEARCH = 2000       # 找不到安全的按下时机时, 最多提前这么多ms
 SAFE_MARGIN = 30.0
 SETTLE_MS = 40           # 按下后先静止这么久(超过30fps的一帧)再开始扫动, 保证"按下"这一帧的位置是安全的
-PAUSE_BUTTON_BOX = (160.0, 160.0)  # 左上角暂停按钮附近不作为按下位置
 
 
 class Sweeper(NamedTuple):
@@ -227,13 +232,40 @@ FLICK_UPDATE_MS = 4      # 滑键触点的位置更新间隔(ms)
 FLICK_RELEASE_AFTER = 40
 WHOLE_SONG_BEFORE = 1000   # 滑键触点在第一个音符之前多久按下(ms)
 WHOLE_SONG_AFTER = 500     # 最后一个音符(含hold尾)之后多久抬起(ms)
+FLICK_FINGERS_MAX = 8      # 滑键触点个数上限: 同一毫秒最多约4个flick, 交替用两批就够
+TAP_HOLD_SPARE = 0         # tap/hold池在"峰值需求"之上多留的触点数。0 = 刚好够用: tap_hold_demand 与分配器实测一致,
+                           # solve_with 分配之后还会校验不丢音符; 接力触点按时间窗口找空闲触点, 峰值之外的时段本来就有空位
+# flick排不下时的两种让步(每个flick只在没有空闲手指时才用, 先推迟, 再改短划):
+FLICK_SLACK_MS = 40        # 把整个划动最多推迟这么久(判定窗口是±160ms, 这点推迟远没用满)
+FLICK_SLACK_STEP = 10
+SQUEEZE_START = -30        # 短划: 同样滑过200像素, 但只用60ms(3.3像素/毫秒), 手指空出来更快
+SQUEEZE_END = 30
 
 
 def flick_finger_count(max_pointers: int, sweepers: int = 0) -> int:
-    """滑键触点个数: 16触点时4个; 10触点时尽量3个, 但至少给tap/hold留5个"""
+    """滑键触点的默认个数: 16触点时4个; 10触点时尽量3个, 但至少给tap/hold留5个。
+    flick很密的谱面会在 solve_with 里增加(见 fingers_for)。"""
     if max_pointers >= 16:
         return 4
     return max(2, min(3, max_pointers - sweepers - 5))
+
+
+def tap_hold_demand(chart: Chart) -> int:
+    """tap/hold池至少需要的触点数: 每个tap/hold占用一个触点, 从按下到释放(tap 5ms, hold 持续时间+5ms)
+    再加上UP之后的冷却(40ms)。就是algo2分配器在这张谱面上"不丢音符"所需的最少触点数(实测一致)。"""
+    spans = []
+    for line in chart.judge_lines:
+        for note in line.notes:
+            if note.type in POINTER_NOTE_TYPES:
+                t = round(line.seconds(note.time) * 1000)
+                hold = math.ceil(line.seconds(note.hold) * 1000) if note.type == NoteType.HOLD else 0
+                spans.append((t, t + hold + algo2.MAX_RELEASE_MS + algo2.PID_REUSE_COOLDOWN_MS))
+    edges = sorted([(a, 1) for a, _ in spans] + [(b, -1) for _, b in spans])   # 同一时刻先减后加: 区间右开
+    cur = peak = 0
+    for _, d in edges:
+        cur += d
+        peak = max(peak, cur)
+    return peak
 
 
 def _safe_points(heads, t: int, candidates: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -264,9 +296,14 @@ class _Finger:
         self.down = False
 
 
-def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
+def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None, relax: bool = True
                        ) -> tuple[defaultdict[int, list[VirtualTouchEvent]], int]:
-    """滑键触点: 返回 (事件, 没有分配到滑键触点的flick数)"""
+    """滑键触点: 返回 (事件, 没有分配到滑键触点的flick数)。
+
+    relax: 某个flick到来时所有手指都还在划上一个, 本来只能放弃(交给扫屏触点碰运气)。
+    relax=True 时先试着把这一划推迟最多 FLICK_SLACK_MS(判定窗口是±160ms), 再不行就改成
+    SQUEEZE_END-SQUEEZE_START 毫秒的短划(同样200像素, 更快, 手指空出来也更快); 都不行才放弃。
+    没有拥挤时(有手指空着)行为和以前完全一样。"""
     events: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
     heads = _heads(chart)
     items = []
@@ -282,7 +319,7 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
         else:
             groups.append([it])
 
-    unassigned = unsafe = 0
+    unassigned = unsafe = squeezed = delayed = 0
     if not groups:
         return events, 0
     # 滑键触点全曲只按下一次: 第一个音符之前按下, 最后一个音符之后才抬起, 中间只滑动不抬起
@@ -308,15 +345,30 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
     for group in groups:
         for t_ms, line, note in group:
             shift = flick_time_shift(line, note)
-            s0 = t_ms + FLICK_START
-            ready = [f for f in fingers if f.free <= s0 - 8]
-            if not ready:
+            # 先按正常的划动找空闲手指; 没有再依次试: 推迟, 短划(+推迟)
+            variants = [(FLICK_START, FLICK_END, d) for d in range(0, (FLICK_SLACK_MS if relax else 0) + 1, FLICK_SLACK_STEP)]
+            if relax:
+                variants += [(SQUEEZE_START, SQUEEZE_END, d) for d in range(0, FLICK_SLACK_MS + 1, FLICK_SLACK_STEP)]
+            pick = None
+            for a, b, delay in variants:
+                s0 = t_ms + delay + a
+                ready = [f for f in fingers if f.free <= s0 - 8]
+                if ready:
+                    pick = (a, b, delay, s0, ready)
+                    break
+            if pick is None:
                 unassigned += 1
                 continue
+            a, b, delay, s0, ready = pick
+            squeezed += a != FLICK_START
+            delayed += delay > 0
             best = None
+            # 划动轨迹只和判定线/音符/方向有关, 和哪个手指去划无关: 每个方向只算一次
+            paths = {rev: flick_path(line, note, t_ms + delay, a, b, FLICK_RADIUS, shift, reverse=rev)
+                     for rev in (False, True)}
             for f in ready:
                 for rev in (False, True):
-                    path = flick_path(line, note, t_ms, FLICK_START, FLICK_END, FLICK_RADIUS, shift, reverse=rev)
+                    path = paths[rev]
                     gx, gy = path[0][0] - f.pos[0], path[0][1] - f.pos[1]
                     dx, dy = path[-1][0] - path[0][0], path[-1][1] - path[0][1]
                     dist = math.hypot(gx, gy)
@@ -346,6 +398,8 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
 
     if console is not None:
         console.print(f'滑键触点: {count}个, {len(groups)}段, 共{len(items)}个flick')
+        if squeezed or delayed:
+            console.print(f'flick太密, 有{delayed}个推迟了划动(最多{FLICK_SLACK_MS}ms), 其中{squeezed}个改用快速短划')
         if unassigned:
             console.print(f'[yellow]警告: 有{unassigned}个flick同时出现得太密, 没有空闲的滑键触点(扫屏触点可能接到)[/yellow]')
         if unsafe:
@@ -353,12 +407,40 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None
     return events, unassigned
 
 
+def fingers_for(chart: Chart, base: int, cap: int) -> int:
+    """滑键触点要几个: 从 base 个起, 找最少多少个手指能让所有flick都分到手指(只看手指数, 不靠推迟/短划);
+    cap 个都不够就取让"没分到的flick"最少的最小个数。"""
+    best, best_unassigned = base, None
+    for count in range(base, cap + 1):
+        unassigned = plan_flick_fingers(chart, count, relax=False)[1]
+        if best_unassigned is None or unassigned < best_unassigned:
+            best, best_unassigned = count, unassigned
+        if unassigned == 0:
+            break
+    return best
+
+
 def solve_with(chart: Chart, console: Console, max_pointers: int, sweepers: list[Sweeper],
                intervals: list[list[int]]) -> defaultdict[int, list[VirtualTouchEvent]]:
-    fingers = flick_finger_count(max_pointers, len(sweepers))
-    rest = max_pointers - len(sweepers) - fingers
-    console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {fingers}个滑键触点(flick), {rest}个触点处理tap/hold')
-    ans = algo2.solve(_without_sweep_notes(chart), console, rest)
+    base = flick_finger_count(max_pointers, len(sweepers))
+    budget = max_pointers - len(sweepers)          # 滑键触点和tap/hold共用的名额
+    taphold = _without_sweep_notes(chart)
+    # flick很密("红键雨")时, 把tap/hold用不上的名额匀给滑键触点, 但tap/hold至少留 峰值需求(+TAP_HOLD_SPARE)个
+    fingers = base
+    spare = budget - base - (tap_hold_demand(taphold) + TAP_HOLD_SPARE)
+    if spare > 0:
+        fingers = fingers_for(chart, base, min(base + spare, FLICK_FINGERS_MAX))
+    while True:
+        rest = budget - fingers
+        extra = f'(flick很密, 滑键触点由{base}个增加到{fingers}个)' if fingers > base else ''
+        console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {fingers}个滑键触点(flick), {rest}个触点处理tap/hold{extra}')
+        stats: dict = {}
+        ans = algo2.solve(taphold, console, rest, stats=stats)
+        if not stats['dropped'] or fingers <= base:
+            break
+        # 理论上不会发生(tap_hold_demand 是分配器不丢音符的最少触点数); 万一丢了音符, 把名额还给tap/hold
+        console.print('[yellow]tap/hold触点不够, 减少滑键触点后重新规划[/yellow]')
+        fingers -= 1
     for ms, evs in plan_sweepers(chart, sweepers, intervals, console).items():
         ans[ms].extend(evs)
     for ms, evs in plan_flick_fingers(chart, fingers, console)[0].items():
