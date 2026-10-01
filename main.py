@@ -23,6 +23,7 @@ from qfluentwidgets import (
     SubtitleLabel, CaptionLabel, StrongBodyLabel,
     PrimaryPushButton, PushButton, ToolButton, SwitchButton,
     SearchLineEdit, PlainTextEdit,
+    TransparentToolButton,
     ComboBox, DoubleSpinBox, CheckBox,
     SettingCardGroup, SettingCard,
     InfoBar, InfoBarPosition,
@@ -163,6 +164,54 @@ MANUAL_START_LEAD = 0.01
 DELAY_OFFSET_LIMIT_MS = 2000
 
 
+class PointerTracker:
+    """跟着发送进度实时维护"当前哪些触点正按在屏幕上"。
+
+    以前的写法是拿"整份规划跑完之后还没抬起的触点"当作停止时要释放的集合 ——
+    一份完整规划里所有触点最后都会被抬起, 于是那个集合基本永远为空,
+    点停止时一个UP都发不出去。扫屏触点是"第一个音符之前按下、最后一个音符之后
+    抬起", 正好永远不在这个集合里, 所以用户看到的就是"扫屏触点停不下来"。
+
+    release_set() = 当前真正按下的(live) ∪ 这一轮用过的全部触点(all_pids)。
+    后半部分是必须的: 用户用手指点过屏幕后, Android 会给应用发 ACTION_CANCEL,
+    应用的触点被取消了, 但 scrcpy-server 内部的 PointersState 仍认为那些触点
+    按着。只发live里的UP清不掉它的状态, 下一轮用同一个pointerId发DOWN会被当成
+    "已经按下"而失效, 于是用户必须重启模拟器才能恢复。
+    """
+    __slots__ = ('live', 'all_pids')
+
+    def __init__(self):
+        self.live: set[int] = set()
+        self.all_pids: set[int] = set()
+
+    def update(self, events) -> None:
+        for e in events:
+            self.all_pids.add(e.pointer)
+            if e.action is TouchAction.DOWN:
+                self.live.add(e.pointer)
+            elif e.action is TouchAction.UP:
+                self.live.discard(e.pointer)
+
+    def release_set(self) -> set[int]:
+        return self.live | self.all_pids
+
+
+LOG_FILE = './phisap.log'
+
+
+def _log_to_file(msg: str) -> None:
+    """每一行日志都追加写到 ./phisap.log。
+
+    界面里的日志控件高度有限, 而且用户经常只截一小段图; 落盘之后
+    完整过程随时可查(排查"停止不彻底/断连/延迟"这类问题时特别需要)。
+    """
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(str(msg).rstrip('\n') + '\n')
+    except Exception:
+        pass
+
+
 def _active_pids_of(adapted) -> set[int]:
     '''从适配后的事件表算出"当前处于按下状态的触点集合", 停止时用来全部抬起。'''
     active: set[int] = set()
@@ -207,6 +256,11 @@ class MainPage(ScrollArea):
         # 所以可以在后台提前算好, 点"开始演奏"时直接取, 不在GUI线程里卡几百毫秒。
         self._adapt_cache: tuple | None = None
         self._adapt_gen = 0
+        # 播放期间的实时微调量(秒)。run_player 每批都重新读 start_time,
+        # 所以改这个值下一批就生效 —— 旧版tkinter的"微调"就是这么做的。
+        self._fine_tune = 0.0
+        self._fine_last = 0.0
+        self._fine_base: float | None = None   # None=当前不在微调模式
         # 播放"代际": 每启动一次播放就+1。worker 记住自己属于哪一代,
         # 发现代际变了就立刻停止发送——防止上一次没退干净的线程继续往设备上戳。
         self._playback_gen = 0
@@ -520,10 +574,19 @@ class MainPage(ScrollArea):
         outer.addWidget(play_group)
 
         # ---- 日志 ----
-        outer.addWidget(StrongBodyLabel('日志'))
+        log_head = QHBoxLayout()
+        log_head.addWidget(StrongBodyLabel('日志'))
+        log_head.addStretch(1)
+        self.log_export_btn = TransparentToolButton(FIF.SAVE)
+        self.log_export_btn.setToolTip('导出完整日志到文件')
+        self.log_export_btn.clicked.connect(self._export_log)
+        log_head.addWidget(self.log_export_btn)
+        outer.addLayout(log_head)
         self.log_view = PlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setFixedHeight(160)
+        # 高一点, 并且允许用户自己拖高: 以前只有160px, 一屏就只能看几行,
+        # 排查问题时来回翻很痛苦。同时每行都写进了 ./phisap.log, 不怕丢。
+        self.log_view.setMinimumHeight(260)
         outer.addWidget(self.log_view)
 
         outer.addStretch(1)
@@ -543,6 +606,7 @@ class MainPage(ScrollArea):
 
     def _append_log(self, msg):
         '''(GUI线程) 真正刷新日志控件'''
+        _log_to_file(msg)
         self.log_view.appendPlainText(msg)
         self.log_view.moveCursor(QTextCursor.End)
 
@@ -1187,6 +1251,9 @@ class MainPage(ScrollArea):
             pass
         self.go_btn.clicked.connect(self._stop)
         self.sync_btn.setEnabled(False)
+        # 把"偏移"临时变成实时微调旋钮(旧版tkinter的行为):
+        # 播放中按上下箭头, 打歌时钟立刻平移, 下一批事件就生效, 不用停下来重开。
+        self._enter_fine_tune()
 
         my_gen = self._playback_gen
 
@@ -1202,12 +1269,11 @@ class MainPage(ScrollArea):
                 got = self._adapted_now()
                 if got is None:
                     return
-                adapted, active = got
+                adapted, _unused = got
                 offset = self.delay_spin.value() / 1000.0
                 if manual:
                     fnm = first_note_ms_from_path(self._find_chart_path())
                     adapted = manual_start_plan(adapted, fnm)
-                    active = _active_pids_of(adapted)
                     # 偏移正负号与 sync_ms 一致: 正值=打歌时钟往后推=事件延后。
                     # 手动开始以前完全不读这个偏移, 用户调了没反应, 等于没有补偿手段。
                     self._start_time = (time.perf_counter() - adapted[0][0] / 1000
@@ -1219,22 +1285,51 @@ class MainPage(ScrollArea):
                     # 这样打歌时钟与Phigros内部时钟同源, 每首歌(不管第一音符在第几秒)都自动对齐。
                     fnm = first_note_ms_from_path(self._find_chart_path())
                     adapted = manual_start_plan(adapted, fnm)
-                    active = _active_pids_of(adapted)
                     self._start_time = self._vauto_fire_time - adapted[0][0] / 1000 + offset
-                self._active_pids = active
+                # ---- 触点状态实时跟踪 ----
+                # 以前的写法是"把整份规划跑一遍, 看最后还有谁没抬起", 得到的是
+                # **规划结束时**的状态。一份完整规划里所有触点最后都会被抬起, 于是这个
+                # 集合基本永远是空的 —— 点停止时一个UP都发不出去。
+                # 扫屏触点是"第一个音符前按下、最后一个音符后抬起", 正好永远不在这个
+                # 集合里, 所以用户看到的就是"扫屏触点停不下来"。
+                # 现在跟着发送进度实时维护: self._active_pids 就是这个set对象本身,
+                # 停止时读到的就是"当下真正按在屏幕上的是哪几个"。
+                # 开打前先把可能残留的触点状态清干净。
+                # 用户用手指点过屏幕后, Android 会给应用发 ACTION_CANCEL, 应用的触点
+                # 被取消了, 但 scrcpy-server 内部的 PointersState 仍然认为那些触点
+                # 按着。不清掉的话, 下一轮用同一个 pointerId 发DOWN会被当成
+                # "已经按下了"而失效 —— 用户看到的就是"必须重启模拟器和程序才能恢复"。
+                stale = (set(getattr(self, '_all_pids', None) or ())
+                         | {e.pointer for _, evs in adapted for e in evs})
+                if stale:
+                    try:
+                        self.controller.release_pointers(sorted(stale))
+                    except Exception:
+                        pass
+
+                tracker = PointerTracker()
+                self._active_pids = tracker.live
+                self._all_pids = tracker.all_pids
                 if not adapted:
                     self.log('规划为空, 没有可发送的事件')
                     return
                 first = adapted[0]
                 rest = iter(adapted[1:])
+
+                def send(events):
+                    tracker.update(events)
+                    self.controller.touch_many(events)
+
                 if manual or prestarted:
-                    stats = run_player(self.controller.touch_many, rest,
-                                       lambda: self._start_time, lambda: self._running,
+                    stats = run_player(send, rest,
+                                       lambda: self._start_time + self._fine_tune,
+                                       lambda: self._running,
                                        first_event=first,
                                        should_continue=lambda: my_gen == self._playback_gen)
                 else:
-                    stats = run_player(self.controller.touch_many, iter(adapted),
-                                       lambda: self._start_time, lambda: self._running,
+                    stats = run_player(send, iter(adapted),
+                                       lambda: self._start_time + self._fine_tune,
+                                       lambda: self._running,
                                        should_continue=lambda: my_gen == self._playback_gen)
                 self.log('演奏结束')
                 if stats is not None:
@@ -1255,20 +1350,118 @@ class MainPage(ScrollArea):
 
         self._player_thread = Thread(target=worker, daemon=True)
         self._player_thread.start()
+    # ---- 播放期间实时微调"偏移" ----
+    def _enter_fine_tune(self):
+        """播放开始: 把偏移框临时改成"实时微调"(正为延后, 负为提前)。
+
+        旧版tkinter在播放时会把delay_input重新绑到一个临时变量上, 按一次上下箭头
+        就 self.start_time += 0.01 —— 因为 run_player 每批都重新读 start_time,
+        调整立刻生效。改成Qt界面时这个绑定丢了, 用户于是"不能实时调整延迟"。
+        """
+        self._fine_base = self.delay_spin.value()
+        self._fine_tune = 0.0
+        self._fine_last = 0.0
+        try:
+            self.delay_spin.valueChanged.connect(self._on_fine_tune)
+        except Exception:
+            pass
+        self.delay_spin.blockSignals(True)
+        self.delay_spin.setValue(0)
+        self.delay_spin.blockSignals(False)
+        self._fine_last = 0.0
+        self._set_delay_hint('实时微调: 正为延后, 负为提前 (播放中)')
+
+    def _exit_fine_tune(self):
+        """播放结束: 把实时微调的结果并回"偏移", 恢复成普通设置"""
+        try:
+            self.delay_spin.valueChanged.disconnect(self._on_fine_tune)
+        except Exception:
+            pass
+        if self._fine_base is not None:
+            # 微调量并回基准值: 这次对好的轴下一首歌接着用, 不用每首重调。
+            merged = self._fine_base + self._fine_tune * 1000.0
+            merged = max(-DELAY_OFFSET_LIMIT_MS, min(DELAY_OFFSET_LIMIT_MS, merged))
+            if abs(merged - self._fine_base) > 0.05:
+                self.log(f'偏移已更新为 {merged:+.1f} ms(并入本次实时微调)')
+            self.delay_spin.blockSignals(True)
+            self.delay_spin.setValue(merged)
+            self.delay_spin.blockSignals(False)
+            self._cache_set('offset', str(round(merged, 1)))
+            self._fine_base = None
+        self._fine_tune = 0.0
+        self._set_delay_hint('正值延后,负值提前, 范围 ±2秒')
+
+    def _on_fine_tune(self, v):
+        """播放中拖动偏移框: 平移打歌时钟, 下一批事件即生效"""
+        if not self._running:
+            return
+        delta_ms = v - self._fine_last
+        self._fine_last = v
+        if not delta_ms:
+            return
+        self._fine_tune += delta_ms / 1000.0
+        self.log(f'实时微调 {delta_ms:+.1f} ms (累计 {v:+.1f} ms)')
+
+    def _export_log(self):
+        """把完整日志另存一份给用户(界面里看的 + ./phisap.log 里的都在)"""
+        try:
+            text = self.log_view.toPlainText()
+            path, _ = QFileDialog.getSaveFileName(self, '导出日志', 'phisap-log.txt',
+                                                  '文本文件 (*.txt)')
+            if not path:
+                return
+            with io.open(path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            # 顺便把落盘的那份也带上(它比界面里更完整)
+            if os.path.exists(LOG_FILE):
+                try:
+                    with io.open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+                        disk = f.read()
+                    with io.open(path, 'a', encoding='utf-8') as f:
+                        if not text.endswith('\n'):
+                            f.write('\n')
+                        f.write('\n===== ./phisap.log 完整记录 =====\n')
+                        f.write(disk)
+                except Exception:
+                    pass
+            self.log(f'日志已导出: {path}')
+            InfoBar.success('已导出', path, parent=self.window(), duration=3000)
+        except Exception as e:
+            self.log(f'导出日志失败: {e}')
+
+    def _set_delay_hint(self, text):
+        try:
+            self.delay_card.contentLabel.setText(text)
+        except Exception:
+            pass
+
     def _release_all_active(self):
-        """给所有仍处于按下状态的程序触点发送 UP 事件,防止手指卡住"""
+        """给所有仍处于按下状态的程序触点发送 UP 事件,防止手指卡住。
+
+        释放范围 = 当前真正按下的(live) ∪ 这一轮规划用过的全部触点(all_pids)。
+        后半部分是必须的: 用户用手指点过屏幕后, Android 会给应用发 ACTION_CANCEL,
+        应用的触点被取消了, 但 scrcpy-server 内部的 PointersState 仍然认为那些
+        触点按着 —— 只发live里的UP清不掉它的状态, 下一轮播放再用同一个pointerId
+        发DOWN就会被当成"已经按下了"而失效, 于是必须重启模拟器才能恢复。
+        """
         try:
             ctrl = self.controller
-            if ctrl is None or not ctrl.collector_running:
+            if ctrl is None:
                 return
-            active = getattr(self, '_active_pids', set())
-            if not active:
+            # 只看控制通道。视频流断不断跟能不能抬手指毫无关系, 以前这里判的是
+            # collector_running(视频), 视频一抖就连UP都发不出去。
+            if not getattr(ctrl, 'control_running', True):
+                return
+            pids = set(getattr(self, '_active_pids', None) or ())
+            pids |= set(getattr(self, '_all_pids', None) or ())   # live ∪ all_pids
+            if not pids:
                 return
             # 抬起位置用屏幕中心即可: Android 按 pointerId 匹配, 坐标不影响抬起语义。
             # 具体怎么发(scrcpy 控制socket / MaaTouch 指令)由后端自己封装。
-            ctrl.release_pointers(list(active))
-            self.log(f'已释放 {len(active)} 个残余触点')
-            self._active_pids = set()
+            ctrl.release_pointers(sorted(pids))
+            self.log(f'已释放 {len(pids)} 个触点(当前按下 {len(self._active_pids or ())} 个)')
+            if isinstance(self._active_pids, set):
+                self._active_pids.clear()
         except Exception as e:
             self.log(f'释放残余触点失败(可忽略): {e}')
 
@@ -1311,6 +1504,8 @@ class MainPage(ScrollArea):
                     self._release_all_active()
 
     def _reset_go(self):
+        # 退出实时微调, 把偏移框恢复成用户设置的基准值
+        self._exit_fine_tune()
         '''复位演奏按钮。可能被调用多次(手动停止一次 + 播放线程结束信号一次),
         所以先用按钮文字判断是否已复位, 否则 clicked 会被连上两份 run, 点一下开始两次。
         注意: 早退时不能顺手 setEnabled(True) —— 没生成规划时按钮本来就该是禁用的,
