@@ -158,8 +158,11 @@ class PointerAllocator:
         if aging_pointers:
             # 老化指针仍在屏幕上(未UP), 无冷却限制, 可以MOVE使用; 但尽量选距离近的
             return min(aging_pointers, key=lambda p: distance_of(p.note, note))
-        if idle_pointers and len(self.pointers) < MAX_POINTERS:
-            # 存在冷却中的idle指针且还未到达MAX_POINTERS上限: 分配新pid
+        if idle_pointers and len(self.pointers) < self.max_pointers_count:
+            # 分配新pid。上限是 max_pointers_count(调用方solve_with扣掉扫屏/滑键触点后
+            # 剩下的名额), 不是 MAX_POINTERS: 后者是Android的硬上限, 而这里再涨就会
+            # 突破当前后端(scrcpy-server 官方10/补丁16, MaaTouch 10)的同时触点上限,
+            # 多出来的DOWN被服务端**静默丢弃**, 表现就是"某一波长条莫名断一个"。
             pid = self.next_pid
             self.next_pid += 1
             p = Pointer(pid)
@@ -240,9 +243,15 @@ class PointerAllocator:
         # 蓝键(TAP)/长条(HOLD)必须在 MAX_RELEASE_MS ms 内释放, 避免占满触点导致后续音符漏判
         for pointer in self.pointers:
             if pointer.note is not None and pointer.age >= 0 and self.now >= pointer.release_deadline:
-                self._insert(min(pointer.release_deadline, self.now),
-                             VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
-                self.released_at[pointer.id] = self.now
+                # UP事件的时刻就是 release_deadline(这一帧来得晚也一样按到期时刻发出),
+                # released_at 记的也必须是这个真实抬起时刻, 不能记 self.now:
+                # 谱面稀疏时(两个密集段之间几百毫秒没有任何tap/hold), self.now 会比真实
+                # 抬起时刻晚一大截, PID_REUSE_COOLDOWN_MS 被凭空拉长, 刚刚能用的触点
+                # 被当成"还在冷却"而无谓占住 —— Chart_AT 第二波长条的第一个hold
+                # 因此拿不到刚释放的pid, 只能另开新pid, 把触点预算吃光。
+                up_t = min(pointer.release_deadline, self.now)
+                self._insert(up_t, VirtualTouchEvent(pointer.note.pos, TouchAction.UP, pointer.id))
+                self.released_at[pointer.id] = up_t
                 pointer.note = None
                 pointer.age = 0
 
