@@ -47,18 +47,28 @@ class PlayStats:
     def __init__(self) -> None:
         self.batches = 0
         self.events = 0
-        self.late: list[tuple[int, float, bool]] = []   # (计划时刻ms, 延迟ms, 是否含按下/抬起)
+        self.late: list[tuple[int, float, bool, float]] = []   # (计划时刻ms, 延迟ms, 是否含按下/抬起, 发送耗时ms)
         self.max_late = 0.0
         self.max_late_at = 0
+        self.max_send_ms = 0.0
+        self.max_send_at = 0
 
-    def record(self, timestamp: int, late_ms: float, events: list) -> None:
+    def record(self, timestamp: int, late_ms: float, events: list,
+               send_ms: float = 0.0) -> None:
         self.batches += 1
         self.events += len(events)
         if late_ms > self.max_late:
             self.max_late, self.max_late_at = late_ms, timestamp
+        # send_ms: 这一批真正花在"发出"上的时间。late_ms 是总迟到量,
+        # 两者相减就是"卡在等发送之前"的部分(调度/GIL/time.sleep睡过头)。
+        # 分开记才能判断延迟是出在自己进程里还是出在传输链路上 ——
+        # 用户日志里的75~82ms必须能定位到具体是哪一段, 否则没法修。
+        if send_ms > self.max_send_ms:
+            self.max_send_ms = send_ms
+            self.max_send_at = timestamp
         if late_ms > LATE_WARN_MS:
             key = any(e.action != TouchAction.MOVE for e in events)
-            self.late.append((timestamp, late_ms, key))
+            self.late.append((timestamp, late_ms, key, send_ms))
 
     def summary(self, first_note_ms: int = 0) -> list[str]:
         def at(ms: int) -> str:
@@ -66,13 +76,19 @@ class PlayStats:
             return f'{s:.2f}秒'
 
         lines = [f'发送统计: {self.batches}批/{self.events}个事件, 最大延迟{self.max_late:.0f}ms'
-                 f'(第一个音符后{at(self.max_late_at)})']
+                 f'(第一个音符后{at(self.max_late_at)}), '
+                 f'单批最长发送耗时{self.max_send_ms:.0f}ms(第一个音符后{at(self.max_send_at)})']
         if self.late:
-            keys = sum(1 for _, _, k in self.late if k)
+            keys = sum(1 for _, _, k, _ in self.late if k)
             lines.append(f'[yellow]有{len(self.late)}批事件晚于计划超过{LATE_WARN_MS}ms'
                          f'(其中{keys}批含按下/抬起), 这些时刻附近可能断连:[/yellow]')
             worst = sorted(self.late, key=lambda x: -x[1])[:REPORT_LIMIT]
-            lines.append('  ' + ', '.join(f'{at(t)}(+{d:.0f}ms{"" if k else ",仅移动"})' for t, d, k in sorted(worst)))
+            lines.append('  ' + ', '.join(
+                f'{at(t)}(+{d:.0f}ms, 发送{s:.0f}ms{"" if k else ",仅移动"})'
+                for t, d, k, s in sorted(worst)))
+            lines.append('  括号里"发送Xms"是这批真正花在sendall上的时间; '
+                         '如果它接近总延迟, 说明卡在传输链路(设备/adb), '
+                         '如果远小于总延迟, 说明卡在自己进程里(线程调度/GC)')
         else:
             lines.append(f'所有事件都在计划时刻{LATE_WARN_MS}ms内发出')
         return lines
@@ -111,8 +127,9 @@ def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]
                 elif wait > BUSY_WAIT_MS:
                     sleep(0.001)
                 continue
+            _t0 = clock()
             send(events)
-            stats.record(timestamp, -wait, events)
+            stats.record(timestamp, -wait, events, (clock() - _t0) * 1000)
             timestamp, events = next(ans_iter)
     except StopIteration:
         pass

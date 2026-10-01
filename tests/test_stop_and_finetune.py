@@ -336,5 +336,68 @@ class FullLogTest(unittest.TestCase):
         self.assertIn('_export_log', names, '缺少 _export_log 方法')
 
 
+class SendTimeSplitTest(unittest.TestCase):
+    """把"总延迟"拆成"发送耗时"和"等发送之前的卡顿"。
+
+    用户日志里那 75~82ms 必须能定位到具体是哪一段:
+    - 发送耗时接近总延迟 -> 卡在传输链路(设备/adb/scrcpy-server), 程序这边无能为力
+    - 发送耗时远小于总延迟 -> 卡在自己进程里(线程调度/GC/time.sleep 粒度), 可以修
+    没有这个拆分就只能猜。
+    """
+
+    STEP = 0.0001          # 假时钟每次读数前进0.1ms
+
+    def _run(self, send_advance: float, gap_ms: int = 10):
+        """send_advance: 每次 send 让假时钟前进多少秒(模拟阻塞发送的时长)。
+
+        gap_ms 取10ms, 比 send_advance(20ms)小, 这样后面的批次会被拖迟,
+        才会走进 self.late 分支, 才能验到汇总里那段"怎么判断卡在哪"的说明。
+        """
+        from player import run_player
+        from algo.algo_base import TouchAction, VirtualTouchEvent
+        ev = VirtualTouchEvent((100.0, 200.0), TouchAction.DOWN, 1000)
+        plan = [(0, [ev]), (gap_ms, [ev]), (gap_ms * 2, [ev])]
+        t = {'v': 0.0}
+
+        def clock():
+            # 必须自己往前走: run_player 在 0 < wait <= BUSY_WAIT_MS 时既不sleep
+            # 也不发送(忙着等), 时钟不动就永远出不去。真实时钟总在走, 这里要模拟。
+            t['v'] += self.STEP
+            return t['v']
+
+        def sleep(sec):
+            t['v'] += sec
+
+        def send(events):
+            t['v'] += send_advance
+
+        it = iter(plan)
+        return run_player(send, it, lambda: 0.0, lambda: True,
+                          clock=clock, sleep=sleep, first_event=next(it))
+
+    def test_send_duration_is_measured(self):
+        st = self._run(0.02)            # 模拟一次20ms的阻塞发送
+        self.assertAlmostEqual(st.max_send_ms, 20.0, delta=1.0,
+                               msg='没有把 send 的耗时单独记下来')
+
+    def test_slow_send_makes_later_batches_late(self):
+        # 第N批的发送耗时体现在第N+1批的迟到量里, 这正是要拆分出来的东西
+        st = self._run(0.02)
+        self.assertTrue(st.late, '发送慢到把后面的批次拖迟了, 却没有记录')
+        self.assertGreater(st.max_late, 5.0)
+
+    def test_summary_shows_both_numbers(self):
+        st = self._run(0.02)
+        txt = '\n'.join(st.summary(0))
+        self.assertIn('单批最长发送耗时20ms', txt, '汇总里没有发送耗时')
+        self.assertIn('发送20ms', txt, '汇总里没有逐批的发送耗时')
+        self.assertIn('传输链路', txt, '没有告诉用户怎么根据这两个数字判断卡在哪')
+        self.assertIn('自己进程里', txt)
+
+    def test_fast_send_reports_near_zero(self):
+        st = self._run(0.0, gap_ms=50)
+        self.assertLess(st.max_send_ms, 1.0, '不阻塞的发送不该记出耗时')
+
+
 if __name__ == '__main__':
     unittest.main()
