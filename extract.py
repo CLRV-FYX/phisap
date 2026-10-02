@@ -589,11 +589,21 @@ class PPtr:
 
 
 class TextAsset(NamedObject):
-    text: str
+    data: bytes
 
     def __init__(self, reader: ObjectReader):
         super().__init__(reader)
-        self.text = reader.string(reader.i32)
+        length = reader.i32
+        if not 0 <= length <= reader.byte_size:
+            raise ValueError(f'TextAsset 长度异常({length}, 对象只有 {reader.byte_size} 字节)')
+        # 原样保留字节: 谱面写盘时不能经过 解码->再编码(遇到非 UTF-8 的字节会炸, 也白白多拷两份几十 MB)
+        self.data = reader.read(length)
+        if len(self.data) != length:
+            raise ValueError('TextAsset 数据被截断')
+
+    @property
+    def text(self) -> str:
+        return self.data.decode('utf-8')
 
 
 class StreamFile:

@@ -197,7 +197,7 @@ def build_serialized_file(texts: list[tuple[str, str]], *, version: int = 17,
         d.i32(len(nb))
         d.raw(nb)
         d.align(4)
-        tb = text.encode('utf-8')
+        tb = text if isinstance(text, bytes) else text.encode('utf-8')  # 允许直接给字节(测试非 UTF-8 内容)
         d.i32(len(tb))
         d.raw(tb)
         d.align(4)

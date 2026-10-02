@@ -88,7 +88,7 @@ A: 在"曲目"页, "曲目"和"在线谱面下载"之间有一组"从游戏安�
 - "没有权限读取 …/Android/obb": 个别系统不让 adb 读这个目录, 用文件管理器把 .obb 拷出来, 再用"选择 APK/OBB 解包…"。
 - "catalog 里没有可识别的谱面" / "bundle 文件名对不上": 4.0.0 起所有 bundle 重建过, catalog 里记的 bundle 名(`<哈希>_<文件名>.bundle`)和 APK 里的真实文件名不一致, `m_InternalIds` 还可能用前缀压缩(`0#xxx.bundle`)。解包时会按 Addressables 的表结构从 bundle 自己条目的加载路径换算出真实文件名(`catalog.parse_track_entries`)。如果还是对不上, 提示后面会带"诊断信息"(catalog 里的键/条目/加载路径个数、谱面路径样例、catalog 给出的 bundle 名样例、所选文件里的 bundle 名样例), 日志页和 `phisap.log` 里也有, 整段发给作者即可; 命令行 `python apk_tools.py inspect <APK/OBB...>` 只看不写, 输出同样的信息。
 - "N 份是加密的已跳过": 4.0.0 第九章的隐藏曲(`c9s.*`)是整包 AES 加密的, 密码是游戏里解谜的答案, 不在 `Assets/Tracks` 下, 一般碰不到; 碰到了就跳过并在日志里说明。
-- "全部解包失败 / 资源已加密 / catalog.bin": 说明这个游戏版本的资源格式 phisap 还不认识; 日志页(和 `phisap.log`)里有前几个失败原因(带 bundle 的 Unity 版本和压缩方式), 发给作者。
+- "全部解包失败 / 资源已加密 / catalog.bin": 说明这个游戏版本的资源格式 phisap 还不认识; 日志页(和 `phisap.log`)里有前几个失败原因(带 bundle 的 Unity 版本和压缩方式), 发给作者。自带的解析器出错时如果装了 UnityPy(`pip install UnityPy`, 不在默认依赖里), 会自动改用它重试, 日志里会写"改用 UnityPy 读出来了"。
 - 界面起不来也能用命令行: `python apk_tools.py all`(提取并解包)、`pull`、`extract <文件...>`、`devices`, 同样有进度条。
 
 怎么验证(还没有在真机/真 APK 上验证过): 沙箱里没有设备也不能放游戏素材, 所以测试用的是现拼的数据 —— UnityFS 容器(LZ4 / LZMA / 不压缩、块信息在头部或尾部、Unity 2019/2021/2022 的头部标志、有无类型树、SerializedFile 格式 17~22), 两种格式的 catalog, 以及一个按 adb 命令行约定应答的假 adb; 拼数据用的夹具另外用 UnityPy 交叉验证过, 避免夹具和解析器一起错。用真机验证的话: 点"提取并解包", 看进度条能走完、`./Assets/Tracks` 里出现谱面、难度下拉框里有 EZ/HD/IN/AT。顺带修了 `extract.py` 里几处旧问题: 不支持 LZMA、块信息在文件末尾时定位写反、Unity 2021.3.2+/2022 的头部标志和 SerializedFile 格式 22 不认识、读到损坏数据时会死循环; 以及 `chart_difficulty` 不认 EZ(EZ 谱面以前永远选不到)。

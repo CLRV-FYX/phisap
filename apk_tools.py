@@ -719,6 +719,7 @@ class ExtractResult:
     skipped: int = 0                                      # 已存在且选了"不覆盖"
     failed: list[tuple[str, str]] = field(default_factory=list)
     encrypted: list[str] = field(default_factory=list)    # 整包加密的(第九章隐藏曲), 没有密码解不了, 已跳过
+    fallback_used: int = 0                                # 靠备用解析器 UnityPy 读出来的 bundle 个数
     songs: set[str] = field(default_factory=set)
     elapsed: float = 0.0
 
@@ -746,14 +747,14 @@ class ExtractResult:
         return ''.join(parts)
 
 
-def read_text_assets(data: bytes, name: str = 'x.bundle') -> list[tuple[str, str]]:
-    """解析一个 bundle, 返回里面所有 TextAsset 的 (名字, 文本)"""
+def read_text_assets(data: bytes, name: str = 'x.bundle') -> list[tuple[str, bytes]]:
+    """解析一个 bundle, 返回里面所有 TextAsset 的 (名字, 原始字节)"""
     from extract import AssetsManager, FileReader, TextAsset  # 延迟导入: 会拉进 rich
 
     mgr = AssetsManager()
     mgr.load_file(FileReader(data, name))
     mgr.read_assets()
-    return [(o.name, o.text) for f in mgr.asset_files for o in f.objects if isinstance(o, TextAsset)]
+    return [(o.name, o.data) for f in mgr.asset_files for o in f.objects if isinstance(o, TextAsset)]
 
 
 def describe_bundle(data: bytes) -> str:
@@ -786,11 +787,54 @@ def describe_bundle(data: bytes) -> str:
         return '头部无法解析'
 
 
+def _read_with_unitypy(data: bytes) -> list[tuple[str, bytes]] | None:
+    """备用解析器: 装了 UnityPy 才用(不在依赖里 —— 它带一堆图像/音频库, 某些 Python 版本没有现成的安装包)。
+    自带的解析器遇到没见过的 Unity 版本出错时, 有它兜底成功率高得多; 没装就返回 None。"""
+    try:
+        import UnityPy
+    except ImportError:
+        return None
+    try:
+        out = []
+        for obj in UnityPy.load(data).objects:
+            if obj.type.name == 'TextAsset':
+                t = obj.read()
+                script = t.m_Script
+                # UnityPy 把解不了码的内容用 surrogateescape 塞进 str, 编回去就是原始字节
+                raw = script.encode('utf-8', 'surrogateescape') if isinstance(script, str) else bytes(script)
+                out.append((getattr(t, 'm_Name', None) or getattr(t, 'name', '') or '', raw))
+        return out
+    except Exception:  # noqa: BLE001 - 备用路径出错就当没有, 让调用方报自带解析器的错误
+        return None
+
+
+def _unitypy_installed() -> bool:
+    import importlib.util
+    return importlib.util.find_spec('UnityPy') is not None
+
+
+def _read_assets_with_fallback(data: bytes, name: str) -> tuple[list[tuple[str, bytes]], bool]:
+    """先用自带解析器, 出错或者什么都没读到再试 UnityPy。返回 (资产列表, 是不是靠 UnityPy 读出来的)"""
+    err = None
+    try:
+        assets = read_text_assets(data, name)
+        if assets:
+            return assets, False
+    except Exception as e:  # noqa: BLE001
+        err = e
+    alt = _read_with_unitypy(data)
+    if alt:
+        return alt, True
+    if err is not None:
+        raise err
+    return [], False
+
+
 def _norm_asset_name(name: str) -> str:
     return re.sub(r'\s*#\s*\d+$', '', name.strip()).lower()
 
 
-def _pick_text(assets: list[tuple[str, str]], stem: str) -> str:
+def _pick_text(assets: list[tuple[str, bytes]], stem: str) -> bytes:
     """名字和资产路径主干一致的优先(忽略大小写和 3.20.0 的 " #编号"); 没有同名的, bundle 里只有一个就用它"""
     if not assets:
         raise ValueError('bundle 里没有 TextAsset')
@@ -802,9 +846,11 @@ def _pick_text(assets: list[tuple[str, str]], stem: str) -> str:
     raise ValueError(f'bundle 里有 {len(assets)} 个 TextAsset, 没有叫 {stem} 的, 无法确定是哪个')
 
 
-def _check_chart_text(text: str) -> None:
-    s = text.strip().lstrip('\ufeff')
-    if not (s.startswith('{') and s.endswith('}')):
+def _check_chart_text(data: bytes) -> None:
+    """谱面是一个 JSON 对象: 去掉 BOM 和首尾空白后以 { 开头、} 结尾。只看两头, 不把十几 MB 全解码一遍"""
+    head = data[:256].lstrip(b'\xef\xbb\xbf \t\r\n')
+    tail = data[-256:].rstrip(b' \t\r\n\x00')
+    if not (head.startswith(b'{') and tail.endswith(b'}')):
         raise ValueError('解出来的内容不像谱面 JSON(可能是游戏版本太新或资源已加密)')
 
 
@@ -1000,11 +1046,12 @@ def extract_charts(archives: Sequence[str], tracks_dir: str = DEFAULT_TRACKS_DIR
                         log(f'跳过 {t.asset_path}: bundle 是整包加密的(第九章隐藏曲), 需要游戏里解谜的密码')
                         done_bytes += max(t.member.file_size, 1)
                         continue
-                    last_assets = read_text_assets(payload, t.member.filename)
+                    last_assets, used_fallback = _read_assets_with_fallback(payload, t.member.filename)
+                    result.fallback_used += used_fallback
                     last_bundle = t.bundle
-                text = _pick_text(last_assets, t.stem)
-                _check_chart_text(text)
-                status = write_chart(tracks_dir, t.song_id, t.file_name, text.encode('utf-8'), overwrite=overwrite)
+                payload_bytes = _pick_text(last_assets, t.stem)
+                _check_chart_text(payload_bytes)
+                status = write_chart(tracks_dir, t.song_id, t.file_name, payload_bytes, overwrite=overwrite)
             except Exception as e:  # noqa: BLE001 - 单个坏 bundle 不能拖垮整批
                 msg = f'{type(e).__name__}: {e}'
                 if payload:
@@ -1024,12 +1071,15 @@ def extract_charts(archives: Sequence[str], tracks_dir: str = DEFAULT_TRACKS_DIR
             done_bytes += max(t.member.file_size, 1)
         meter.update(total, f'解包完成 {len(targets)}/{len(targets)}', force=True)
         if result.failed and not result.total:
+            hint = '' if _unitypy_installed() else '\n也可以试试 pip install UnityPy: 装上之后解包会自动改用它重试。'
             raise PackageError(f'{len(targets)} 份谱面全部解包失败, 第一个错误: {first_error}\n'
-                               f'可能是这个游戏版本的资源格式 phisap 还不支持(例如已加密)。')
+                               f'可能是这个游戏版本的资源格式 phisap 还不支持(例如已加密)。' + hint)
     finally:
         for z in zips:
             z.close()
     result.elapsed = time.monotonic() - t0
+    if result.fallback_used:
+        log(f'有 {result.fallback_used} 个 bundle 自带解析器读不了, 改用 UnityPy 读出来了')
     for asset, msg in result.failed[:5]:
         log(f'解包失败 {asset}: {msg}')
     if len(result.failed) > 5:

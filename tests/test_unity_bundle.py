@@ -270,6 +270,30 @@ class TestEncryptionFlags(unittest.TestCase):
         self.assertEqual(extract.BundleFile._parse_unity_version('2019.4.31f1c1'), (2019, 4, 31))
 
 
+class TestTextAssetBytes(unittest.TestCase):
+    def test_raw_bytes_kept_and_text_property_decodes(self):
+        sf = build_serialized_file([('a', 'héllo 谱面'), ('b', b'\xff\xfe raw')])
+        mgr = AssetsManager()
+        mgr.load_file(FileReader(build_bundle({'CAB-1': sf}, compression='lz4'), 'x.bundle'))
+        mgr.read_assets()
+        assets = {o.name: o for f in mgr.asset_files for o in f.objects if isinstance(o, TextAsset)}
+        self.assertEqual(assets['a'].data, 'héllo 谱面'.encode('utf-8'))
+        self.assertEqual(assets['a'].text, 'héllo 谱面')
+        self.assertEqual(assets['b'].data, b'\xff\xfe raw')
+        with self.assertRaises(UnicodeDecodeError):  # text 仍然是严格解码, 老用法不变
+            assets['b'].text
+
+    def test_absurd_length_is_rejected(self):
+        sf = bytearray(build_serialized_file([('a', 'hello world')]))
+        pos = sf.index(b'hello world') - 4  # m_Script 的长度字段
+        struct.pack_into('<i', sf, pos, 0x7FFFFFF0)
+        with self.assertRaisesRegex(ValueError, '长度异常'):
+            call_with_timeout(parse_text_assets, build_bundle({'CAB-1': bytes(sf)}, compression='lz4'))
+        struct.pack_into('<i', sf, pos, -5)
+        with self.assertRaisesRegex(ValueError, '长度异常'):
+            call_with_timeout(parse_text_assets, build_bundle({'CAB-1': bytes(sf)}, compression='lz4'))
+
+
 class TestClassId(unittest.TestCase):
     def test_unknown_id_is_reported_once_and_does_not_become_an_enum_member(self):
         import contextlib

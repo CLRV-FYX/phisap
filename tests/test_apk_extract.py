@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import zipfile
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -282,6 +283,21 @@ class TestExtractBasics(Base):
         self.extract(pkg)
         with open(os.path.join(self.tracks, 'Foo.Bar', 'Chart_IN.json'), 'rb') as f:
             self.assertEqual(f.read(), text.encode('utf-8'))
+
+    def test_non_utf8_and_bom_bytes_are_preserved_exactly(self):
+        """TextAsset 原样当字节处理: 带 BOM、带非 UTF-8 的字节也不能出错, 写出去必须逐字节一致"""
+        cases = {
+            IN: b'\xef\xbb\xbf{"bom":true}\r\n',
+            HD: b'{"s":"\xff\xfe not utf8"}',
+            AT: b'  \n{"padded":1}\x00\x00 \n',
+        }
+        pkg = self.package(cases, catalog='v4')
+        r = self.extract(pkg)
+        self.assertEqual((r.written, len(r.failed)), (3, 0), r.failed)
+        for addr, raw in cases.items():
+            name = A.chart_target(addr)[1]
+            with open(os.path.join(self.tracks, 'Foo.Bar', name), 'rb') as f:
+                self.assertEqual(f.read(), raw, addr)
 
     def test_difficulty_filter(self):
         pkg = self.package({IN: chart_json('in'), AT: chart_json('at'), HD: chart_json('hd'), EZ: chart_json('ez'),
@@ -631,6 +647,67 @@ class TestFailures(Base):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, 'evil')))
         self.assertFalse(os.path.exists(os.path.join(self.tmp, 'evil2')))
         self.assertEqual(self.listing(), {'Foo.Bar': ['Chart_IN.json']})
+
+
+HAVE_UNITYPY = importlib.util.find_spec('UnityPy') is not None
+
+
+class TestUnityPyFallback(Base):
+    """自带解析器遇到没见过的 Unity 版本出错时, 装了 UnityPy 就自动改用它(不装也不影响正常使用)"""
+
+    def broken_parser(self):
+        def boom(*_a, **_k):
+            raise RuntimeError('自带解析器不认识这个版本')
+        return mock.patch.object(A, 'read_text_assets', boom)
+
+    @unittest.skipUnless(HAVE_UNITYPY, '没装 UnityPy, 跳过(只有开发时会装)')
+    def test_falls_back_to_unitypy_and_keeps_exact_bytes(self):
+        cases = {IN: chart_json('in').encode(), HD: b'{"s":"\xff\xfe raw"}', AT: b'\xef\xbb\xbf{"bom":1}'}
+        pkg = self.package(cases, catalog='v4')
+        with self.broken_parser():
+            r = self.extract(pkg)
+        self.assertEqual((r.written, len(r.failed), r.fallback_used), (3, 0, 3))
+        for addr, raw in cases.items():
+            with open(os.path.join(self.tracks, 'Foo.Bar', A.chart_target(addr)[1]), 'rb') as f:
+                self.assertEqual(f.read(), raw, addr)
+        self.assertTrue(any('改用 UnityPy' in m for m in self.logs))
+
+    def test_without_unitypy_the_original_error_surfaces_with_install_hint(self):
+        pkg = self.package({IN: chart_json('in')}, catalog='v4')
+        with self.broken_parser(), mock.patch.object(A, '_read_with_unitypy', return_value=None), \
+                mock.patch.object(A, '_unitypy_installed', return_value=False):
+            with self.assertRaises(A.PackageError) as cm:
+                self.extract(pkg)
+        self.assertIn('自带解析器不认识这个版本', str(cm.exception))   # 报的是自带解析器的错误
+        self.assertIn('pip install UnityPy', str(cm.exception))      # 并且告诉用户有这条退路
+
+    def test_hint_is_not_shown_when_unitypy_is_already_installed(self):
+        pkg = self.package({IN: chart_json('in')}, catalog='v4')
+        with self.broken_parser(), mock.patch.object(A, '_read_with_unitypy', return_value=None), \
+                mock.patch.object(A, '_unitypy_installed', return_value=True):
+            with self.assertRaises(A.PackageError) as cm:
+                self.extract(pkg)
+        self.assertNotIn('pip install UnityPy', str(cm.exception))
+
+    def test_missing_unitypy_module_means_no_fallback(self):
+        with mock.patch.dict(sys.modules, {'UnityPy': None}):  # import UnityPy 会抛 ImportError
+            self.assertIsNone(A._read_with_unitypy(b'whatever'))
+
+    def test_empty_result_from_own_parser_also_triggers_fallback(self):
+        pkg = self.package({IN: chart_json('in')}, catalog='v4')
+        calls = []
+
+        def empty(*_a, **_k):
+            return []
+
+        def fake_unitypy(data):
+            calls.append(len(data))
+            return [('Chart_IN', chart_json('from-unitypy').encode())]
+
+        with mock.patch.object(A, 'read_text_assets', empty), mock.patch.object(A, '_read_with_unitypy', fake_unitypy):
+            r = self.extract(pkg)
+        self.assertEqual((r.written, r.fallback_used, len(calls)), (1, 1, 1))
+        self.assertEqual(json.loads(self.read('Foo.Bar', 'Chart_IN.json'))['tag'], 'from-unitypy')
 
 
 class TestProgressAndCancel(Base):
