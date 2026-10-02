@@ -1357,12 +1357,14 @@ class MainPage(ScrollArea):
                      parent=self.window(), position=InfoBarPosition.TOP, duration=3000)
 
     def _apk_failed(self, msg: str):
-        first = msg.strip().splitlines()[0] if msg.strip() else '未知错误'
+        lines = msg.strip().splitlines()
+        first = lines[0] if lines else '未知错误'
         self._apk_set_bar(self.apk_progress.value() / 1000, True)  # 条变红, 停在出错的位置
         self.apk_status.setText('失败: ' + first)
         self.log('提取/解包失败:\n' + msg)
-        InfoBar.error('提取/解包失败', first[:200], parent=self.window(),
-                      position=InfoBarPosition.TOP, duration=8000)
+        more = '(详细诊断信息见"日志"页)' if len(lines) > 1 else ''
+        InfoBar.error('提取/解包失败', first[:200] + more, parent=self.window(),
+                      position=InfoBarPosition.TOP, duration=10000)
 
     def _apk_finished(self):
         self._apk_set_running(False)

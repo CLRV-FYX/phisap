@@ -1,5 +1,7 @@
 import json
+import re
 import struct
+from dataclasses import dataclass, field
 from io import BytesIO
 from base64 import b64decode
 from binary_reader import BinaryReader
@@ -16,14 +18,199 @@ def detect_catalog_version(data: dict) -> str:
     return 'v3'
 
 
+_PREFIX_ID_RE = re.compile(r'^(\d+)[#:](.*)$', re.DOTALL)
+TRACK_PREFIX = 'Assets/Tracks/'
+
+
+def expand_internal_id(raw, prefixes: list) -> str | None:
+    """展开 m_InternalIds 里的条目。
+
+    新版 Addressables 会把路径前缀抽到 m_InternalIdPrefixes 里, 条目写成 "<前缀序号>#<余下部分>"
+    (实际抓到的 Phigros 目录里也见过用冒号的写法), 不展开的话取到的"文件名"会带着 "0#" 这样的前缀。
+    """
+    if not isinstance(raw, str):
+        return None
+    m = _PREFIX_ID_RE.match(raw)
+    if m and int(m.group(1)) < len(prefixes) and isinstance(prefixes[int(m.group(1))], str):
+        return prefixes[int(m.group(1))] + m.group(2)
+    return raw
+
+
+def bundle_basename(path: str) -> str:
+    return re.split(r'[\\/]', path)[-1]
+
+
+@dataclass
+class TrackEntry:
+    """catalog 里 Assets/Tracks 下的一个资源, 以及它可能所在的 bundle 文件名(可信度从高到低)"""
+    asset_path: str
+    bundles: list = field(default_factory=list)
+
+
+def _read_key_at(blob: bytes, pos: int):
+    """读一个键; 认不得的类型返回 None(不抛异常: 键表里夹着别的类型的键是正常的)"""
+    try:
+        typ = blob[pos]
+        pos += 1
+        if typ in (0, 1):
+            length = struct.unpack_from('<I', blob, pos)[0]
+            raw = blob[pos + 4:pos + 4 + length]
+            return raw.decode('utf-8' if typ == 0 else 'utf-16le', 'replace')
+        if typ == 4:
+            return struct.unpack_from('<I', blob, pos)[0]
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def parse_track_entries(data: dict) -> tuple:
+    """直接按 Addressables 的表结构读出 Assets/Tracks 下的资源和它们的 bundle 文件名。
+
+    返回 (entries: list[TrackEntry], stats: dict)。旧版/新版 catalog 的表结构是同一套:
+      m_KeyDataString    键表(字符串/整数)
+      m_BucketDataString 键下标 -> (键在键表里的偏移, 条目下标列表)
+      m_EntryDataString  条目表, 每条 7 个 int32: internalId, provider, dependencyKey, depHash, data,
+                         primaryKey, resourceType
+      m_InternalIds(+m_InternalIdPrefixes)  每个条目真正的加载路径
+    资源条目的 dependencyKey 指向 bundle 的键, bundle 在磁盘上的真实文件名只能从它的 internalId
+    (加载路径)里取 basename: 从 Phigros 4.0.0 起键里的 bundle 名(<hash>_<file>.bundle)和真实文件名不再一致,
+    直接拿键当文件名就一个 bundle 也对不上。
+    """
+    key_blob = b64decode(data['m_KeyDataString'])
+    bucket_blob = b64decode(data['m_BucketDataString'])
+    entry_blob = b64decode(data['m_EntryDataString'])
+    prefixes = data.get('m_InternalIdPrefixes') or []
+    raw_ids = data.get('m_InternalIds') or []
+    internal_ids = [expand_internal_id(x, prefixes) or '' for x in raw_ids]
+
+    # 桶表: 第 i 个桶对应第 i 个键
+    buckets: list = []  # [(键偏移, [条目下标])]
+    count = struct.unpack_from('<I', bucket_blob, 0)[0]
+    pos = 4
+    for _ in range(count):
+        offset, n = struct.unpack_from('<II', bucket_blob, pos)
+        pos += 8
+        buckets.append((offset, list(struct.unpack_from(f'<{n}I', bucket_blob, pos))))
+        pos += 4 * n
+
+    keys = [_read_key_at(key_blob, off) for off, _ in buckets]
+    if sum(k is None for k in keys) > len(keys) // 2:
+        # 偏移对不上: 退回按顺序读(键表开头是个键的个数)
+        keys = []
+        pos = 4
+        for _ in range(struct.unpack_from('<I', key_blob, 0)[0]):
+            k = _read_key_at(key_blob, pos)
+            if k is None:
+                break
+            keys.append(k)
+            length = struct.unpack_from('<I', key_blob, pos + 1)[0] if isinstance(k, str) else 4
+            pos += 1 + 4 + (length if isinstance(k, str) else 0)
+
+    # 条目表: 开头 4 字节是个数, 之后每条 28 字节
+    n_entries = struct.unpack_from('<I', entry_blob, 0)[0]
+    base = 4 if 4 + 28 * n_entries <= len(entry_blob) else max(len(entry_blob) - 28 * n_entries, 0)
+    entries = [struct.unpack_from('<7i', entry_blob, base + 28 * i) for i in range(n_entries)
+               if base + 28 * (i + 1) <= len(entry_blob)]
+
+    # 主键下标 -> 以它为主键的条目(bundle 自己的条目: 主键就是 bundle 的键)
+    by_primary: dict = {}
+    for e in entries:
+        by_primary.setdefault(e[5], []).append(e)
+
+    def bundle_names(dep_key: int) -> list:
+        names: list = []
+
+        def add(name):
+            if isinstance(name, str) and name.endswith('.bundle') and name not in names:
+                names.append(name)
+
+        # 1. 正解: 资源条目的 dependencyKey 指向 bundle 的键, 以这个键为主键的条目就是 bundle 自己的条目,
+        #    它的 internalId 指向 m_InternalIds 里的真实加载路径(取 basename 才是磁盘上的文件名)
+        for e in by_primary.get(dep_key, []):
+            if 0 <= e[0] < len(internal_ids):
+                add(bundle_basename(internal_ids[e[0]]))
+        # 2. 同一件事换个路: 依赖键的桶里列出的条目
+        if 0 <= dep_key < len(buckets):
+            for ei in buckets[dep_key][1]:
+                if 0 <= ei < len(entries) and 0 <= entries[ei][0] < len(internal_ids):
+                    add(bundle_basename(internal_ids[entries[ei][0]]))
+        # 3. 经验做法: bundle 条目排在最前面时, 键下标 == 加载路径下标
+        if 0 <= dep_key < len(internal_ids):
+            add(bundle_basename(internal_ids[dep_key]))
+        # 4. 最后才是键本身(旧版 Phigros 里它就是文件名)
+        if 0 <= dep_key < len(keys):
+            add(keys[dep_key])
+        return names
+
+    out: list = []
+    for internal_id, _provider, dep_key, _hash, _data, primary_key, _rtype in entries:
+        if not 0 <= primary_key < len(keys):
+            continue
+        asset = keys[primary_key]
+        if not isinstance(asset, str) or not asset.startswith(TRACK_PREFIX):
+            continue
+        out.append(TrackEntry(asset, bundle_names(dep_key)))
+
+    str_keys = [k for k in keys if isinstance(k, str)]
+    dirs: dict = {}
+    for k in str_keys:
+        if '/' in k:
+            head = '/'.join(k.split('/')[:2])
+            dirs[head] = dirs.get(head, 0) + 1
+    stats = {
+        'keys': len(keys), 'entries': len(entries), 'internal_ids': len(raw_ids),
+        'bundle_ids': sum(1 for x in internal_ids if x.endswith('.bundle')), 'prefixes': len(prefixes),
+        'track_assets': len(out),
+        'asset_samples': [e.asset_path for e in out[:3]],
+        'bundle_samples': [n for e in out[:3] for n in e.bundles[:2]],
+        # 以下几项只给诊断用: 资源路径对不上时, 看一眼 catalog 里到底有些什么键
+        'key_samples': str_keys[:6],
+        'top_dirs': sorted(dirs.items(), key=lambda kv: -kv[1])[:5],
+    }
+    return out, stats
+
+
+class _NoCatalog:
+    fname_map: dict = {}
+
+
 def load_catalog(data: dict):
     """解析catalog.json，自动识别格式版本。
 
-    返回带有fname_map属性的对象：{bundle文件名: 资产路径(Assets/Tracks/...)}
+    返回带有这些属性的对象:
+      fname_map      {bundle文件名: 资产路径(Assets/Tracks/...)}  (老接口, 一个 bundle 只对应一个资产)
+      track_entries  [TrackEntry]  每个资产 -> 候选 bundle 文件名(按可信度排序), 一个 bundle 里有多个资产也不会丢
+      stats          诊断用的统计(键/条目/加载路径的个数, 样例)
+    两套解析谁出错都不致命, 只要有一套读出东西就行; 都读不出来才抛异常。
     """
-    if detect_catalog_version(data) == 'legacy':
-        return Catalog(data)
-    return CatalogV3(data)
+    cat = None
+    first_error = None
+    try:
+        cat = Catalog(data) if detect_catalog_version(data) == 'legacy' else CatalogV3(data)
+    except Exception as e:  # noqa: BLE001
+        first_error = e
+    track: list = []
+    stats: dict = {}
+    try:
+        track, stats = parse_track_entries(data)
+    except Exception as e:  # noqa: BLE001
+        first_error = first_error or e
+    if cat is None and not track:
+        raise first_error if first_error is not None else ValueError('catalog 里没有可用的表')
+    if cat is None:
+        cat = _NoCatalog()
+        cat.fname_map = {}
+    # 老接口读出来的 (bundle -> 资产) 也并进来: 新解析器没认出来的资产靠它兜底, 认出来的把它的 bundle 名当作备选
+    by_asset = {e.asset_path: e for e in track}
+    for bundle, asset in cat.fname_map.items():
+        if asset in by_asset:
+            if bundle not in by_asset[asset].bundles:
+                by_asset[asset].bundles.append(bundle)
+        else:
+            by_asset[asset] = TrackEntry(asset, [bundle])
+    cat.track_entries = list(by_asset.values())
+    cat.stats = stats
+    return cat
 
 
 class Catalog:
@@ -135,7 +322,8 @@ class CatalogV3:
         data_key = b64decode(data['m_KeyDataString'])
         data_bucket = b64decode(data['m_BucketDataString'])
         data_entry = b64decode(data['m_EntryDataString'])
-        internal_ids = data.get('m_InternalIds', [])
+        prefixes = data.get('m_InternalIdPrefixes') or []
+        internal_ids = [expand_internal_id(x, prefixes) or '' for x in data.get('m_InternalIds', [])]
 
         def read_key(pos: int):
             typ = data_key[pos]
@@ -170,7 +358,7 @@ class CatalogV3:
                 continue
             value = output[entry][0]
             if isinstance(value, str) and value.endswith('.bundle') and len(value) != 32 + 7:
-                value = internal_ids[entry].rsplit('/', 1)[-1]
+                value = bundle_basename(internal_ids[entry])
             output[i] = (key, value)
 
         fname_map: dict[str, str] = {}
@@ -188,4 +376,5 @@ class CatalogV3:
         self.fname_map = fname_map
 
 
-__all__ = ['Catalog', 'CatalogV3', 'load_catalog', 'detect_catalog_version']
+__all__ = ['Catalog', 'CatalogV3', 'TrackEntry', 'load_catalog', 'detect_catalog_version', 'parse_track_entries',
+           'expand_internal_id', 'bundle_basename']

@@ -426,6 +426,107 @@ def catalog_legacy(pairs: list[tuple[str, str]]) -> dict:
     }
 
 
+def catalog_v4(pairs: list[tuple[str, str]], *, key_style: str = 'hash_file', prefix_sep: str | None = '#',
+               bundles_first: bool = True, noise_keys: bool = True, guid_keys: bool = True,
+               bad_bucket_offsets: bool = False) -> dict:
+    """按 Addressables 真实的表结构拼的 catalog(Phigros 4.0.0 的样子)。pairs = [(资产路径, 磁盘上真实的 bundle 文件名)]。
+
+    和 catalog_v3(沿用 tests/test_catalog.py 的简化编码)不同, 这里是真实布局:
+      键表: 开头 4 字节键个数, 之后是顺序排列的键(0=ascii, 1=utf16, 4=整数); 桶表按偏移指回键表
+      条目表: 开头 4 字节个数, 每条 7 个 int32: internalId, provider, dependencyKey, depHash, data, primaryKey, resourceType
+      资源条目的 dependencyKey 指向 bundle 的键; bundle 的真实文件名只在它自己条目的加载路径(m_InternalIds)里
+    key_style   bundle 键的写法: 'hash_file' = <哈希>_<真实文件名>.bundle(4.0.0 起, 和磁盘文件名不一致),
+                'plain' = 键就是真实文件名(旧版)
+    prefix_sep  m_InternalIds 用前缀压缩时的分隔符('#' 是 Addressables 的写法, ':' 是见过的另一种), None = 不压缩
+    bundles_first  True = bundle 条目排在前面(键下标 == 加载路径下标, "经验做法"碰巧成立);
+                   False = 资源条目在前, 这时只有按"依赖键的桶 -> bundle 条目 -> 加载路径"取才是对的
+    guid_keys   每个资源条目除了地址键还登记一个 32 位十六进制的 Unity GUID 键(真实 catalog 里都有),
+                它们会让后面的键下标和条目下标错位
+    bad_bucket_offsets  桶表里的键偏移全是垃圾: 只能靠键表自己的顺序读键, 桶->条目的关系也不可信
+    """
+    runtime = '{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/'
+    prefixes = [runtime, 'Assets/Tracks/'] if prefix_sep else []
+
+    def internal_id(path: str) -> str:
+        if prefix_sep:
+            for i, pre in enumerate(prefixes):
+                if path.startswith(pre):
+                    return f'{i}{prefix_sep}{path[len(pre):]}'
+        return path
+
+    bundle_keys: dict[str, str] = {}
+    for _asset, real in pairs:
+        if real not in bundle_keys:
+            digest = hashlib.md5(real.encode()).hexdigest()
+            bundle_keys[real] = real if key_style == 'plain' else f'{digest}_{real}'
+    uniq_bundles = list(bundle_keys)
+
+    # 条目: (主键字符串, 加载路径, 依赖键字符串或 None)
+    bundle_entries = [(bundle_keys[r], runtime + r, None) for r in uniq_bundles]
+    asset_entries = [(a, a, bundle_keys[r]) for a, r in pairs]
+    entries_spec = bundle_entries + asset_entries if bundles_first else asset_entries + bundle_entries
+
+    keys: list = []
+    key_index: dict = {}
+
+    def kidx(k):
+        if k not in key_index:
+            key_index[k] = len(keys)
+            keys.append(k)
+        return key_index[k]
+
+    guid_of: dict[str, str] = {}
+    for pk, _iid, dep in entries_spec:  # 键按条目顺序登记: 主键先于依赖键
+        kidx(pk)
+        if guid_keys and dep is not None:  # 只有资源条目(有依赖)才有 GUID
+            guid_of[pk] = hashlib.md5(('guid:' + pk).encode()).hexdigest()
+            kidx(guid_of[pk])
+        if dep is not None:
+            kidx(dep)
+    if noise_keys:  # 夹几个不是字符串的键(整数键、utf16 键), 解析器必须跳得过去
+        for n in (7, 4096, 'Ünïcode-键'):
+            kidx(n)
+
+    internal_ids: list[str] = []
+    entry_blob = bytearray()
+    entry_blob += struct.pack('<I', len(entries_spec))
+    entry_keys: list[list[int]] = [[] for _ in keys]
+    for ei, (pk, iid, dep) in enumerate(entries_spec):
+        internal_ids.append(internal_id(iid))
+        entry_blob += struct.pack('<7i', len(internal_ids) - 1, 0, -1 if dep is None else key_index[dep], 0, -1,
+                                  key_index[pk], 0)
+        entry_keys[key_index[pk]].append(ei)
+        if pk in guid_of:
+            entry_keys[key_index[guid_of[pk]]].append(ei)
+
+    key_blob = bytearray(struct.pack('<I', len(keys)))
+    offsets = []
+    for k in keys:
+        offsets.append(len(key_blob))
+        if isinstance(k, int):
+            key_blob += b'\x04' + struct.pack('<I', k)
+        elif k.isascii():
+            key_blob += b'\x00' + struct.pack('<I', len(k)) + k.encode()
+        else:
+            enc = k.encode('utf-16le')
+            key_blob += b'\x01' + struct.pack('<I', len(enc)) + enc
+    bucket_blob = bytearray(struct.pack('<I', len(keys)))
+    for i in range(len(keys)):
+        bucket_blob += struct.pack('<II', 0x7FFFFF00 if bad_bucket_offsets else offsets[i], len(entry_keys[i])) + b''.join(
+            struct.pack('<I', e) for e in entry_keys[i])
+
+    out = {
+        'm_LocatorId': 'AddressablesMainContentCatalog',
+        'm_KeyDataString': base64.b64encode(bytes(key_blob)).decode(),
+        'm_BucketDataString': base64.b64encode(bytes(bucket_blob)).decode(),
+        'm_EntryDataString': base64.b64encode(bytes(entry_blob)).decode(),
+        'm_InternalIds': internal_ids,
+    }
+    if prefix_sep:
+        out['m_InternalIdPrefixes'] = prefixes
+    return out
+
+
 # ---------------------------------------------------------------- APK / OBB
 
 def build_apk(path: str, members: dict[str, bytes], *, stored_ext: tuple[str, ...] = ('.bundle',)) -> str:
@@ -442,6 +543,20 @@ def chart_json(tag: str = 'x', n_lines: int = 3) -> str:
     return json.dumps({'formatVersion': 3, 'offset': 0.0, 'tag': tag,
                        'judgeLineList': [{'bpm': 120.0, 'notesAbove': [], 'notesBelow': []}
                                          for _ in range(n_lines)]}, ensure_ascii=False)
+
+
+def _catalog_for(kind: str, pairs: list[tuple[str, str]]) -> dict:
+    """kind: 'v3' / 'legacy' / 'v4' / 'v4:plain' / 'v4:colon' / 'v4:nocompress' / 'v4:assets_first'"""
+    if kind == 'v3':
+        return catalog_v3(pairs)
+    if kind == 'legacy':
+        return catalog_legacy(pairs)
+    if kind.startswith('v4'):
+        opts = kind.split(':')[1:]
+        return catalog_v4(pairs, key_style='plain' if 'plain' in opts else 'hash_file',
+                          prefix_sep=None if 'nocompress' in opts else (':' if 'colon' in opts else '#'),
+                          bundles_first='assets_first' not in opts)
+    raise ValueError(kind)
 
 
 def make_package(path: str, charts: dict[str, str], *, catalog: str = 'v3',
@@ -462,7 +577,6 @@ def make_package(path: str, charts: dict[str, str], *, catalog: str = 'v3',
     if extra_bundles:
         members.update(extra_bundles)
     if catalog_member:
-        cat = catalog_v3(pairs) if catalog == 'v3' else catalog_legacy(pairs)
-        members[catalog_member] = json.dumps(cat).encode('utf-8')
+        members[catalog_member] = json.dumps(_catalog_for(catalog, pairs)).encode('utf-8')
     build_apk(path, members)
     return names

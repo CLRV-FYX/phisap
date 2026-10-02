@@ -38,6 +38,9 @@ OBB_ROOTS = ('/sdcard/Android/obb', '/storage/emulated/0/Android/obb')
 DISK_MARGIN = 256 * 1024 * 1024  # 磁盘空间检查时额外留的余量
 CATALOG_MEMBER = 'assets/aa/catalog.json'
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)  # Windows 下别弹黑框; 其它系统恒为 0
+# Phigros 4.0.0 起第九章的隐藏曲(c9s.*)用 AES-256-CBC 整包加密, 文件开头是这 8 个字节; 密码是游戏里解谜的答案,
+# 这些 bundle 不在 Assets/Tracks 下, 一般碰不到, 碰到了就明确说一声而不是报"解析失败"
+ENCRYPTED_MAGIC = bytes.fromhex('47a9c97dbeefc3e4')
 
 ProgressFn = Callable[[int, int, str], None]
 LogFn = Callable[[str], None]
@@ -715,6 +718,7 @@ class ExtractResult:
     unchanged: int = 0
     skipped: int = 0                                      # 已存在且选了"不覆盖"
     failed: list[tuple[str, str]] = field(default_factory=list)
+    encrypted: list[str] = field(default_factory=list)    # 整包加密的(第九章隐藏曲), 没有密码解不了, 已跳过
     songs: set[str] = field(default_factory=set)
     elapsed: float = 0.0
 
@@ -735,6 +739,8 @@ class ExtractResult:
             detail.append(f'跳过已有 {self.skipped}')
         if detail:
             parts.append('(' + ', '.join(detail) + ')')
+        if self.encrypted:
+            parts.append(f', {len(self.encrypted)} 份是加密的已跳过')
         if self.failed:
             parts.append(f', {len(self.failed)} 份失败')
         return ''.join(parts)
@@ -780,11 +786,16 @@ def describe_bundle(data: bytes) -> str:
         return '头部无法解析'
 
 
+def _norm_asset_name(name: str) -> str:
+    return re.sub(r'\s*#\s*\d+$', '', name.strip()).lower()
+
+
 def _pick_text(assets: list[tuple[str, str]], stem: str) -> str:
+    """名字和资产路径主干一致的优先(忽略大小写和 3.20.0 的 " #编号"); 没有同名的, bundle 里只有一个就用它"""
     if not assets:
         raise ValueError('bundle 里没有 TextAsset')
     for name, text in assets:
-        if name.lower() == stem.lower():
+        if _norm_asset_name(name) == _norm_asset_name(stem):
             return text
     if len(assets) == 1:
         return assets[0][1]
@@ -795,6 +806,17 @@ def _check_chart_text(text: str) -> None:
     s = text.strip().lstrip('\ufeff')
     if not (s.startswith('{') and s.endswith('}')):
         raise ValueError('解出来的内容不像谱面 JSON(可能是游戏版本太新或资源已加密)')
+
+
+def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, tries: int = 3) -> bytes:
+    """读 zip 里的一个成员。大文件偶尔会读到 CRC 校验失败(拷贝/存储介质的偶发问题), 重试几次再放弃"""
+    for attempt in range(tries):
+        try:
+            return zf.read(info)
+        except (zipfile.BadZipFile, OSError):
+            if attempt == tries - 1:
+                raise
+    raise AssertionError('unreachable')
 
 
 def _open_archives(paths: Sequence[str]) -> list[zipfile.ZipFile]:
@@ -836,9 +858,37 @@ def _has_binary_catalog(zips: Sequence[zipfile.ZipFile]) -> bool:
     return any(i.filename.lower().endswith('catalog.bin') for z in zips for i in z.infolist())
 
 
+def _sample(items, n: int = 4) -> str:
+    items = list(items)
+    text = ', '.join(str(x) for x in items[:n])
+    return text + (f' …(共 {len(items)} 个)' if len(items) > n else '') if items else '(无)'
+
+
+def _diagnose(catalog, bundles: dict, chart_assets: list, unresolved: list) -> str:
+    """解不出谱面时附上的诊断信息: 用户把日志发过来, 不用再要 APK 就能看出是哪一步对不上"""
+    st = getattr(catalog, 'stats', None) or {}
+    lines = ['诊断信息(请连同日志一起发给作者):']
+    if st:
+        lines.append(f'- catalog: 键 {st.get("keys")}, 条目 {st.get("entries")}, 加载路径 {st.get("internal_ids")}'
+                     f'(其中 .bundle {st.get("bundle_ids")}, 前缀表 {st.get("prefixes")}), '
+                     f'Assets/Tracks 下的资源 {st.get("track_assets")}')
+        if st.get('key_samples'):
+            lines.append('- catalog 里的键(例): ' + _sample(st['key_samples'], 6))
+        if st.get('top_dirs'):
+            lines.append('- 键的路径前缀分布: ' + ', '.join(f'{k}×{v}' for k, v in st['top_dirs']))
+    else:
+        lines.append(f'- catalog 的表结构没能解析出来(旧接口读出 {len(getattr(catalog, "fname_map", {}))} 条 bundle 映射)')
+    lines.append(f'- 谱面资源 {len(chart_assets)} 个, 其中 {len(unresolved)} 个在所选文件里找不到 bundle')
+    paths = [e.asset_path for e in chart_assets] or list(st.get('asset_samples') or [])
+    lines.append('- 谱面路径(例): ' + _sample(paths))
+    lines.append('- catalog 给出的 bundle 文件名(例): ' + _sample(n for e in (unresolved or chart_assets) for n in e.bundles[:2]))
+    lines.append(f'- 所选文件里的 .bundle {len(bundles)} 个(例): ' + _sample(bundles))
+    return '\n'.join(lines)
+
+
 def scan_charts(zips: Sequence[zipfile.ZipFile], *, difficulties: Sequence[str] | None = None,
                 log: LogFn | None = None) -> list[ChartTarget]:
-    """读 catalog, 找出所有「包里有 bundle 的谱面」。找不到就抛带指引的 PackageError"""
+    """读 catalog, 找出所有「包里有 bundle 的谱面」。找不到就抛带指引和诊断信息的 PackageError"""
     log = log or _noop
     found = _find_catalog(zips)
     if found is None:
@@ -854,7 +904,7 @@ def scan_charts(zips: Sequence[zipfile.ZipFile], *, difficulties: Sequence[str] 
     from catalog import load_catalog  # 延迟导入
 
     try:
-        fname_map = load_catalog(data).fname_map
+        catalog = load_catalog(data)
     except Exception as e:  # noqa: BLE001 - catalog 格式五花八门, 统一给个能看懂的说明
         raise PackageError(f'catalog.json 的格式不认识({type(e).__name__}: {e})。'
                            f'可能是游戏更新后改了格式, 需要更新 phisap。') from None
@@ -872,23 +922,39 @@ def scan_charts(zips: Sequence[zipfile.ZipFile], *, difficulties: Sequence[str] 
                            'Google Play 版的资源在 OBB 数据包里, 请把 OBB 一起选上。')
     want = {d.upper() for d in difficulties} if difficulties else None
     targets = []
+    chart_assets = []   # catalog 里所有谱面资源(不管 bundle 在不在所选文件里)
+    unresolved = []     # 其中找不到 bundle 的
     seen: dict[tuple[str, str], str] = {}
-    for bundle, asset_path in fname_map.items():
-        spec = chart_target(asset_path)
-        if spec is None or bundle not in bundles:
+    for entry in catalog.track_entries:
+        spec = chart_target(entry.asset_path)
+        if spec is None:
             continue
         sid, name = spec
         if want is not None and chart_difficulty_tag(name) not in want:
             continue
+        chart_assets.append(entry)
+        # 候选名按可信度排好了(bundle 的加载路径 > 经验下标 > 键本身), 取第一个在所选文件里真有的
+        bundle = next((b for b in entry.bundles if b in bundles), None)
+        if bundle is None:
+            unresolved.append(entry)
+            continue
         if (sid, name) in seen:  # 规范化后重名(例如 Chart_AT.json 和 Chart_AT #123.json 同时存在)
-            log(f'注意: {sid}/{name} 在 catalog 里出现了多次({seen[(sid, name)]} 与 {asset_path}), 后者会覆盖前者')
-        seen[(sid, name)] = asset_path
+            log(f'注意: {sid}/{name} 在 catalog 里出现了多次({seen[(sid, name)]} 与 {entry.asset_path}), 后者会覆盖前者')
+        seen[(sid, name)] = entry.asset_path
         idx, info = bundles[bundle]
-        targets.append(ChartTarget(asset_path, bundle, sid, name, idx, info))
+        targets.append(ChartTarget(entry.asset_path, bundle, sid, name, idx, info))
     if not targets:
-        raise PackageError('catalog 里没有可识别的谱面(Assets/Tracks/<歌曲>/Chart_*.json)。'
-                           '可能是游戏更新后改了资源结构, 或者选的文件不对。')
-    log(f'catalog 里有 {len(fname_map)} 条资源, 其中 {len(targets)} 份谱面的 bundle 在所选文件里')
+        diag = _diagnose(catalog, bundles, chart_assets, unresolved)
+        for line in diag.splitlines():
+            log(line)
+        if chart_assets:
+            raise PackageError(f'catalog 里有 {len(chart_assets)} 份谱面, 但所选文件里一个对应的 bundle 都没找到'
+                               f'(bundle 文件名对不上)。Google Play 版请把 OBB 一起选上; 都选了还不行就是游戏更新后改了命名规则。\n' + diag)
+        raise PackageError('catalog里没有可识别的谱面(Assets/Tracks/<歌曲>/Chart_*.json)。'
+                           '可能是游戏更新后改了资源结构, 或者选的文件不对。\n' + diag)
+    if unresolved:
+        log(f'有 {len(unresolved)} 份谱面在 catalog 里, 但所选文件里找不到它们的 bundle(可能在没选的文件里), 已跳过')
+    log(f'catalog 里有 {len(chart_assets)} 份谱面, 其中 {len(targets)} 份的 bundle 在所选文件里')
     return targets
 
 
@@ -918,16 +984,25 @@ def extract_charts(archives: Sequence[str], tracks_dir: str = DEFAULT_TRACKS_DIR
         meter = Meter(progress, total, unit='items')
         done_bytes = 0
         first_error = ''
+        last_bundle, last_assets, payload = None, [], b''
         for index, t in enumerate(targets, 1):
             if cancel is not None and cancel.is_set():
                 log(f'已取消: 解包了 {result.total} 份谱面')
                 raise Cancelled()
             detail = f'解包谱面 {index}/{len(targets)} · {t.song_id}/{t.file_name}'
             meter.update(done_bytes, detail)
-            payload = b''
             try:
-                payload = zips[t.archive].read(t.member)
-                text = _pick_text(read_text_assets(payload, t.member.filename), t.stem)
+                if t.bundle != last_bundle:  # 同一个 bundle 里有几份谱面时只读一次、解析一次
+                    last_bundle, last_assets, payload = None, [], b''
+                    payload = _read_member(zips[t.archive], t.member)
+                    if payload.startswith(ENCRYPTED_MAGIC):
+                        result.encrypted.append(t.asset_path)
+                        log(f'跳过 {t.asset_path}: bundle 是整包加密的(第九章隐藏曲), 需要游戏里解谜的密码')
+                        done_bytes += max(t.member.file_size, 1)
+                        continue
+                    last_assets = read_text_assets(payload, t.member.filename)
+                    last_bundle = t.bundle
+                text = _pick_text(last_assets, t.stem)
                 _check_chart_text(text)
                 status = write_chart(tracks_dir, t.song_id, t.file_name, text.encode('utf-8'), overwrite=overwrite)
             except Exception as e:  # noqa: BLE001 - 单个坏 bundle 不能拖垮整批
@@ -961,6 +1036,29 @@ def extract_charts(archives: Sequence[str], tracks_dir: str = DEFAULT_TRACKS_DIR
         log(f'……还有 {len(result.failed) - 5} 份失败')
     log('解包完成: ' + result.summary() + f', 用时 {format_duration(result.elapsed)}')
     return result
+
+
+def inspect_archives(archives: Sequence[str]) -> str:
+    """只看不写: 报告所选文件里的 catalog 和谱面 bundle 能不能对上(命令行 inspect 用)。
+    解不出谱面时把这段输出发给作者, 比描述现象有用得多"""
+    lines = ['文件: ' + ', '.join(f'{os.path.basename(p)}({format_size(_size_or_zero(p))})' for p in archives)]
+    zips = _open_archives(archives)
+    try:
+        found = _find_catalog(zips)
+        lines.append('catalog: ' + (f'{archives[found[0]]} 里的 {found[1].filename}({format_size(found[1].file_size)})'
+                                    if found else '没有找到'))
+        try:
+            targets = scan_charts(zips, log=lines.append)
+        except PackageError as e:
+            lines.append('扫描失败: ' + str(e))
+        else:
+            lines.append(f'可解包的谱面 {len(targets)} 份, 例: ' + _sample(f'{t.song_id}/{t.file_name}' for t in targets))
+            heads = [describe_bundle(zips[t.archive].read(t.member)) for t in targets[:3]]
+            lines.append('bundle 头部(例): ' + _sample(heads, 3))
+    finally:
+        for z in zips:
+            z.close()
+    return '\n'.join(lines)
 
 
 def find_local_archives(apk_dir: str = DEFAULT_APK_DIR) -> list[str]:
@@ -1035,6 +1133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser('devices', help='列出已连接的设备')
     p_pull = sub.add_parser('pull', help='只提取 APK/OBB')
     add_device_args(p_pull)
+    p_insp = sub.add_parser('inspect', help='只看不写: 检查 APK/OBB 里的 catalog 和谱面 bundle 对不对得上(解包失败时用)')
+    p_insp.add_argument('files', nargs='+', help='APK / OBB 文件(可以多个)')
     p_ext = sub.add_parser('extract', help='解包本地的 APK/OBB')
     p_ext.add_argument('files', nargs='+', help='APK / OBB 文件(可以多个)')
     p_ext.add_argument('--tracks', default=DEFAULT_TRACKS_DIR, help='谱面库目录')
@@ -1056,6 +1156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 say(f'{d.serial}\t{d.state}')
             if not devs:
                 say('(没有设备)')
+            return 0
+        if args.cmd == 'inspect':
+            say(inspect_archives(args.files))
             return 0
         if args.cmd == 'extract':
             r = extract_charts(args.files, args.tracks, overwrite=not args.no_overwrite,

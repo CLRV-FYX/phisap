@@ -21,7 +21,7 @@ for _p in (ROOT, HERE):
 
 import apk_tools as A  # noqa: E402
 from unity_fixtures import (build_apk, build_bundle, build_serialized_file, bundle_name_for,  # noqa: E402
-                            catalog_v3, chart_json, make_chart_bundle, make_package)
+                            catalog_v3, catalog_v4, chart_json, make_chart_bundle, make_package)
 
 HAVE_LZ4 = importlib.util.find_spec('lz4') is not None
 
@@ -216,8 +216,13 @@ class TestWriteChart(Base):
 # ---------------------------------------------------------------- 解包主流程
 
 class TestExtractBasics(Base):
-    def test_both_catalog_formats(self):
-        for fmt in ('v3', 'legacy'):
+    def test_all_catalog_formats(self):
+        """v3 / legacy 是仓库里原有的两种; v4* 是按 Addressables 真实表结构拼的 Phigros 4.0.0 的样子:
+        键里的 bundle 名(<哈希>_<文件名>.bundle)和磁盘文件名不一致, 加载路径用前缀压缩(# 或 :),
+        bundle 条目在前/在后, 带不带 GUID 键。以前 4.0.0 一个 bundle 也对不上,
+        界面报 "catalog里没有可识别的谱面"。"""
+        for fmt in ('v3', 'legacy', 'v4', 'v4:plain', 'v4:colon', 'v4:nocompress', 'v4:assets_first',
+                    'v4:colon:assets_first', 'v4:plain:nocompress'):
             with self.subTest(catalog=fmt):
                 self.tracks = os.path.join(self.tmp, f'Tracks_{fmt}')
                 pkg = self.package({IN: chart_json('in'), AT: chart_json('at'), SP: chart_json('sp')},
@@ -226,6 +231,43 @@ class TestExtractBasics(Base):
                 self.assertEqual((r.written, r.total, len(r.failed)), (3, 3, 0))
                 self.assertEqual(self.listing(), {'Baz.Qux.1': ['Chart.json'], 'Foo.Bar': ['Chart_AT.json', 'Chart_IN.json']})
                 self.assertEqual(json.loads(self.read('Foo.Bar', 'Chart_AT.json'))['tag'], 'at')
+
+    def test_v4_catalog_with_many_songs_and_all_difficulties(self):
+        charts = {f'Assets/Tracks/Song{i:02d}.Artist.0/Chart_{d}.json': chart_json(f'{i}{d}')
+                  for i in range(12) for d in ('EZ', 'HD', 'IN', 'AT')}
+        charts['Assets/Tracks/Song00.Artist.0/Chart_Legacy.json'] = chart_json('legacy')
+        charts['Assets/Tracks/Song00.Artist.0/music.wav'] = 'RIFF'
+        pkg = self.package(charts, catalog='v4')
+        r = self.extract(pkg)
+        self.assertEqual((r.written, len(r.failed), len(r.songs)), (49, 0, 12))
+        self.assertEqual(json.loads(self.read('Song07.Artist', 'Chart_HD.json'))['tag'], '7HD')
+        self.assertEqual(sorted(os.listdir(os.path.join(self.tracks, 'Song00.Artist'))),
+                         ['Chart_AT.json', 'Chart_EZ.json', 'Chart_HD.json', 'Chart_IN.json', 'Chart_Legacy.json'])
+
+    def test_one_bundle_holding_two_charts_is_parsed_once(self):
+        shared = 'f' * 32 + '.bundle'
+        sf = build_serialized_file([('Chart_EZ', chart_json('ez')), ('Chart_HD', chart_json('hd'))])
+        bundle = build_bundle({'CAB-shared': sf}, compression='lz4')
+        pairs = [('Assets/Tracks/S.A.0/Chart_EZ.json', shared), ('Assets/Tracks/S.A.0/Chart_HD.json', shared)]
+        pkg = os.path.join(self.tmp, 'shared.apk')
+        build_apk(pkg, {'assets/aa/catalog.json': json.dumps(catalog_v4(pairs)).encode(),
+                        'assets/aa/Android/' + shared: bundle})
+        calls = []
+        original = A.read_text_assets
+
+        def counting(*a, **k):
+            calls.append(1)
+            return original(*a, **k)
+
+        A.read_text_assets = counting
+        try:
+            r = self.extract(pkg)
+        finally:
+            A.read_text_assets = original
+        self.assertEqual((r.written, len(r.failed)), (2, 0))
+        self.assertEqual(len(calls), 1)  # 同一个 bundle 只解析一次
+        self.assertEqual(json.loads(self.read('S.A', 'Chart_EZ.json'))['tag'], 'ez')
+        self.assertEqual(json.loads(self.read('S.A', 'Chart_HD.json'))['tag'], 'hd')
 
     def test_non_chart_assets_and_hidden_folders_ignored(self):
         pkg = self.package({IN: chart_json('in'), 'Assets/Tracks/#Hidden/Chart_IN.json': chart_json('h'),
@@ -391,6 +433,53 @@ class TestFailures(Base):
         with self.assertRaisesRegex(A.PackageError, '全部解包失败'):
             self.extract(bad)
 
+    def test_encrypted_bundle_is_skipped_not_failed(self):
+        """4.0.0 第九章隐藏曲的 bundle 是整包 AES 加密的(文件头 47A9C97DBEEFC3E4), 没有密码解不了;
+        要明确说"加密了, 已跳过", 不能算成解析失败(那样用户会以为程序坏了)"""
+        pkg = self.package({IN: chart_json('in'), HD: chart_json('hd')}, catalog='v4')
+        secret = rewrite_zip(pkg, os.path.join(self.tmp, 'secret.apk'),
+                             {self.names[HD]: A.ENCRYPTED_MAGIC + os.urandom(500)})
+        r = self.extract(secret)
+        self.assertEqual((r.written, len(r.failed), r.encrypted), (1, 0, [HD]))
+        self.assertIn('1 份是加密的已跳过', r.summary())
+        self.assertTrue(any('整包加密' in m for m in self.logs))
+        self.assertEqual(self.listing(), {'Foo.Bar': ['Chart_IN.json']})
+
+    def test_everything_encrypted_is_not_an_error(self):
+        pkg = self.package({HD: chart_json('hd')}, catalog='v4')
+        secret = rewrite_zip(pkg, os.path.join(self.tmp, 'secret.apk'), {self.names[HD]: A.ENCRYPTED_MAGIC + b'x' * 64})
+        r = self.extract(secret)
+        self.assertEqual((r.total, len(r.failed), len(r.encrypted)), (0, 0, 1))
+
+    def test_zip_read_is_retried_on_crc_errors(self):
+        pkg = self.package({IN: chart_json('in')}, catalog='v4')
+        original = zipfile.ZipFile.read
+        calls = {'n': 0}
+
+        def flaky(self_, name, *a, **k):
+            if str(getattr(name, 'filename', name)).endswith('.bundle'):
+                calls['n'] += 1
+                if calls['n'] <= 2:
+                    raise zipfile.BadZipFile('Bad CRC-32 for file')
+            return original(self_, name, *a, **k)
+
+        zipfile.ZipFile.read = flaky
+        try:
+            r = self.extract(pkg)
+        finally:
+            zipfile.ZipFile.read = original
+        self.assertEqual((r.written, len(r.failed)), (1, 0))
+        self.assertEqual(calls['n'], 3)  # 失败两次, 第三次成功
+
+        calls['n'] = -100  # 一直失败: 重试 3 次后记成这一份失败, 不是整个任务崩掉
+        self.tracks = os.path.join(self.tmp, 'T2')
+        zipfile.ZipFile.read = flaky
+        try:
+            with self.assertRaisesRegex(A.PackageError, '全部解包失败'):
+                self.extract(pkg)
+        finally:
+            zipfile.ZipFile.read = original
+
     def test_non_json_text_is_rejected(self):
         pkg = self.package({IN: 'this is not json', HD: chart_json('hd')})
         r = self.extract(pkg)
@@ -491,6 +580,46 @@ class TestFailures(Base):
         pkg = self.package({'Assets/Tracks/Foo.Bar.0/music.wav': 'RIFF'})
         with self.assertRaisesRegex(A.PackageError, '没有可识别的谱面'):
             self.extract(pkg)
+
+    def test_bundle_names_not_matching_gives_actionable_diagnostics(self):
+        """catalog 里的谱面一个 bundle 也对不上时: 说清楚是文件名对不上, 并把两边的样例都列出来,
+        用户把日志发过来就能看出命名规则怎么变的"""
+        pkg = self.package({IN: chart_json('in'), HD: chart_json('hd')}, catalog='v4')
+        renamed = os.path.join(self.tmp, 'renamed.apk')
+        with zipfile.ZipFile(pkg) as zin, zipfile.ZipFile(renamed, 'w') as zout:
+            for n in zin.namelist():
+                data = zin.read(n)
+                if n.endswith('.bundle'):  # 磁盘文件名变了, 和 catalog 里记的任何一个名字都对不上
+                    head, base = n.rsplit('/', 1)
+                    n = f'{head}/zz_{base}'
+                zout.writestr(zipfile.ZipInfo(n), data)
+        with self.assertRaises(A.PackageError) as cm:
+            self.extract(renamed)
+        msg = str(cm.exception)
+        self.assertIn('catalog 里有 2 份谱面', msg)
+        self.assertIn('bundle 文件名对不上', msg)
+        self.assertIn('诊断信息', msg)
+        self.assertIn(IN, msg)                                   # 谱面路径样例
+        self.assertIn('zz_', msg)                                # 所选文件里的 bundle 名样例
+        self.assertIn(self.names[IN], msg)                       # catalog 给出的 bundle 名样例
+        self.assertIn('Assets/Tracks', msg)
+        self.assertTrue(any('诊断信息' in m for m in self.logs))  # 同样的内容也写进了日志
+
+    def test_assets_under_another_prefix_gives_key_samples(self):
+        """谱面不在 Assets/Tracks 下(游戏改了资源结构)时, 诊断里要列出 catalog 键的样例和路径前缀分布"""
+        pkg = self.package({'Assets/Charts/Foo.Bar.0/Chart_IN.json': chart_json('in')}, catalog='v4')
+        with self.assertRaises(A.PackageError) as cm:
+            self.extract(pkg)
+        msg = str(cm.exception)
+        self.assertIn('没有可识别的谱面', msg)
+        self.assertIn('Assets/Charts', msg)  # 键样例/前缀分布里能看到真实的目录
+
+    def test_partly_unresolved_charts_are_skipped_with_a_note(self):
+        pkg = self.package({IN: chart_json('in'), HD: chart_json('hd')}, catalog='v4')
+        partial = rewrite_zip(pkg, os.path.join(self.tmp, 'partial.apk'), {self.names[HD]: None})  # 少一个 bundle
+        r = self.extract(partial)
+        self.assertEqual((r.written, len(r.failed)), (1, 0))
+        self.assertTrue(any('找不到它们的 bundle' in m for m in self.logs))
 
     def test_nothing_written_outside_tracks_dir(self):
         evil = {'Assets/Tracks/../../evil/Chart_IN.json': chart_json('e'),
