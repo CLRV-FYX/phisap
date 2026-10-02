@@ -9,6 +9,7 @@ from enum import Enum
 from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, distance_of, recalc_pos, _edge_safe,
                         MAX_POINTERS, note_point, hold_point, flick_path, flick_time_shift,
                         FLICK_START, FLICK_END, FLICK_RADIUS)
+from .relay import HoldTrack, plan_hold_relays
 from chart import Chart
 from note import NoteType
 
@@ -214,6 +215,9 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
         frames[milliseconds].append(FrameEvent(action, point, id))
 
     current_event_id = 0
+    holds_meta: dict[int, tuple] = {}
+    hold_pids: dict[int, int] = {}
+    heads: list[tuple[int, object, object]] = []
 
     console.print('开始规划')
 
@@ -230,6 +234,7 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
 
             match event.type:
                 case NoteType.TAP:
+                    heads.append((ms, line, event))
                     add_frame_event(ms, FrameEventAction.TAP, recalc_pos((px, py), sa, ca), current_event_id)
                 case NoteType.DRAG:
                     add_frame_event(ms, FrameEventAction.DRAG, recalc_pos((px, py), sa, ca), current_event_id)
@@ -250,6 +255,11 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                     # hold_point: 音符越界时沿垂直方向夹到屏幕边缘, 手指位置连续,
                     # 不会在判定线瞬移出屏幕时被要求1ms内跳几百像素(见 algo_base.hold_point)
                     head = hold_point(line, event, ms)
+                    heads.append((ms, line, event))
+                    holds_meta[current_event_id] = (
+                        line, event, ms, hold_ms,
+                        tuple(hold_point(line, event, ms + offset) for offset in range(1, max(hold_ms, 0) + 1)),
+                        head)
                     add_frame_event(ms, FrameEventAction.HOLD_START, head, current_event_id)
                     # 按住期间每毫秒跟随判定线(屏幕外映射时使用该时刻的角度, 而不是按下时的角度)
                     # (位置不变或变化很小的毫秒不发送MOVE, 见thin_path)
@@ -325,6 +335,7 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
                 case FrameEventAction.HOLD_START:
                     pid, _, _ = pointers.acquire(event)
                     add_touch_event(ms, event.point, TouchAction.DOWN, pid)
+                    hold_pids[event.id] = pid
                     down_positions[event.point] = pid
                     is_keyframe = True
 
@@ -336,5 +347,10 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS) -> d
     if pointers.overflow:
         console.print(f'[yellow]警告: 有{len(pointers.overflow)}个时刻需要同时按下超过{max_pointers}个触点'
                       f'(首次出现在{pointers.overflow[0]}ms), 超出部分可能漏判[/yellow]')
+    tracks = [HoldTrack(hold_pids[eid], *meta) for eid, meta in holds_meta.items() if eid in hold_pids]
+    if tracks:
+        # 只从预算内的 id 里找空闲手指, 接力不会把同时按下的触点数顶过上限
+        plan_hold_relays(tracks, result, list(range(1000, 1000 + max_pointers)), heads,
+                         PID_REUSE_COOLDOWN_MS, console)
     console.print('规划完毕.')
     return result

@@ -658,7 +658,8 @@ def invalidate_plan_cache(chart_path: str) -> int:
         return 0
     for name in names:
         m = _PLAN_CACHE_RE.search(name)
-        if m and name[:m.start()] == stem:
+        # Chart_AT.ans.v12.json 和 Chart_AT.algored.p16.ans.v13.json 都算这张谱的缓存
+        if m and (name[:m.start()] == stem or name.startswith(stem + '.')):
             _remove_quiet(os.path.join(folder, name))
             removed += 1
     return removed

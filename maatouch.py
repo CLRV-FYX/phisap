@@ -31,12 +31,15 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import socket
 import struct
 import subprocess
 import threading
 import time
+
+from control import ControlChannelDead
 
 from algo.algo_base import TouchAction
 
@@ -164,6 +167,11 @@ class MaaTouchController:
             raise MaaTouchError(f'找不到 adb, 请把 adb 加入 PATH: {e}') from e
         self._stdin = self._proc.stdin
         self._stdout = self._proc.stdout
+        # 用线程读 stdout, 不要对管道做 select: Windows 上 select 只能等套接字,
+        # 对管道会立刻失败, banner 永远读不到, 空转到超时。
+        self._lines: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(target=self._read_stdout, name='maatouch-stdout', daemon=True)
+        self._reader.start()
         try:
             self._read_banner()
         except Exception:
@@ -209,37 +217,43 @@ class MaaTouchController:
         self.device_width, self.device_height = w, h
         self.log(f'[maatouch] 已连接, 屏幕 {w}x{h}, 最多同时 {self.max_pointers} 个触点')
 
+    def _read_stdout(self) -> None:
+        try:
+            while True:
+                raw = self._stdout.readline() if self._stdout is not None else b''
+                if not raw:
+                    self._lines.put(None)
+                    return
+                self._lines.put(raw.decode('utf-8', 'replace'))
+        except Exception:
+            self._lines.put(None)
+
     def _readline(self, deadline: float) -> str | None:
-        """带超时读一行(用 select 避免永久阻塞)。"""
-        import select
+        """带超时读一行。读动作在 _read_stdout 线程里, 这里只等队列。"""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
         try:
-            r, _, _ = select.select([self._stdout], [], [], min(remaining, 0.5))
-        except (OSError, ValueError):
+            return self._lines.get(timeout=min(remaining, 0.5))
+        except queue.Empty:
             return None
-        if not r:
-            return None
-        try:
-            raw = self._stdout.readline()
-        except (OSError, ValueError):
-            return None
-        if not raw:
-            return None
-        return raw.decode('utf-8', 'replace')
 
     # ---- 触控 ----
     def _write(self, text: str) -> None:
+        # 主动 close 之后的写入丢掉(收尾路径会再写一次 r)。通道还开着却写失败,
+        # 必须抛出去, 否则播放循环会一直把事件倒进一个已经死掉的管道。
         if self._closed or self._stdin is None:
             return
         data = text.encode('ascii', 'replace')
         with self._write_lock:
+            if self._closed or self._stdin is None:
+                return
             try:
                 self._stdin.write(data)
                 self._stdin.flush()
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
                 self._closed = True
+                raise ControlChannelDead(f'MaaTouch 写入失败, 触控通道已断开: {e}') from e
 
     def touch_many(self, events) -> None:
         """把同一时刻的多个事件合并成一次下发(和 DeviceController.touch_many 同语义)。"""
@@ -319,13 +333,14 @@ class MaaTouchController:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        # 先抬起所有触点, 避免手指卡在屏幕上
+        # 先抬起所有触点, 避免手指卡在屏幕上。_closed 要放在这次写入之后,
+        # 否则 reset 会被 _write 直接丢掉。
         try:
             self.reset_all()
             time.sleep(0.02)
         except Exception:
             pass
+        self._closed = True
         try:
             if self._stdin is not None:
                 self._stdin.close()
