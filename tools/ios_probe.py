@@ -372,7 +372,7 @@ def exp_start(r: Runner, repeats: int = 20, big: int = 0, gap_s: float = 1.2) ->
             'sync': None if sync is None else {'rtt_min': sync.rtt_min, 'spread': sync.spread, 'n': sync.n}}
 
 
-def exp_touches(r: Runner, counts=(1, 2, 3, 4, 5, 6, 7, 8, 10, 12), hold_ms: int = 700) -> dict:
+def exp_touches(r: Runner, counts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), hold_ms: int = 700) -> dict:
     w, h = r.viewport()
     rows = []
     for m in counts:
@@ -512,7 +512,7 @@ EXPERIMENTS: dict[str, Callable] = {'timing': exp_timing, 'start': exp_start, 't
 DEFAULT_EXPERIMENTS = [k for k in EXPERIMENTS if k != 'longhold']       # longhold 要人配合, 不放进 all
 
 
-def run_experiments(r: Runner, names: list[str], repeats: int = 20, big: int = 400, log=print) -> dict:
+def run_experiments(r: Runner, names: list[str], repeats: int = 20, big: int = 900, log=print) -> dict:
     out: dict = {}
     for name in names:
         log(f'[probe] 实验 {name} ...')
@@ -646,7 +646,7 @@ def main(argv=None) -> None:
     sp.add_argument('--experiments', default='all',
                     help='all(不含longhold) 或逗号分隔: ' + ','.join(EXPERIMENTS))
     sp.add_argument('--repeat', type=int, default=20, help='start实验的重复次数')
-    sp.add_argument('--big', type=int, default=400, help='start实验"大请求体"里额外的tap数')
+    sp.add_argument('--big', type=int, default=900, help='start实验"大请求体"里额外的tap数(一首歌约400~1100个输入源)')
     sp.add_argument('--wait', type=float, default=180.0, help='等探针页连接的秒数')
     sp.add_argument('--out', default='probe_result.json')
     sp = sub.add_parser('report')

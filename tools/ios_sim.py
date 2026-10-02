@@ -12,6 +12,7 @@
   floor   最短接触时间: iOS可能丢弃过短的接触(SideTap作者提到), 若每次tap必须按住T毫秒才可靠,
           触点占用时间变长, 密集处触点更不够用 —— 看T=5(现在)/40/80/125ms时结果掉多少。
   payload 一首歌转成W3C actions有多大(能不能一次请求发完): 触点数、条目数、JSON体积。
+  demand  谱面本身需要几个触点: tap/长条头到来时同时被占着的触点数分布(USB鼠标这类单指针设备够不够用)。
 
 用法:
     python tools/ios_sim.py timing <谱面.json>... [--pointers 10] [--layout k,n] [--jobs 2]
@@ -21,6 +22,8 @@
     python tools/ios_sim.py caps   <谱面.json>... [--caps 5,6,8,10,16] [--quick] [--jobs 2]
     python tools/ios_sim.py floor  <谱面.json>... [--floors 5,40,80,125] [--caps 5,10] [--jobs 2]
     python tools/ios_sim.py payload <谱面.json>... [--pointers 10] [--tolerance 3]
+    python tools/ios_sim.py demand  <谱面.json>... [--jobs 2]
+timing/jitter/caps/floor 都可以加 --fps 120 看高刷屏(比如 iPad Pro 的 ProMotion)下的结果。
 谱面可以是官方格式或RPE格式。输出是markdown表格, 末尾的汇总行把所有谱面合在一起算。
 """
 from __future__ import annotations
@@ -28,10 +31,12 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import os
 import random
 import sys
 import time
+from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
@@ -47,9 +52,11 @@ import algo.algo3f as algo3f  # noqa: E402
 from algo.ios_actions import build_actions, count_items, fit_mapping, peak_pointers, split_lives  # noqa: E402
 from chart import Chart  # noqa: E402
 from judge_sim import simulate  # noqa: E402
+from note import NoteType  # noqa: E402
 from rpe import detect_kind, rpe_to_official_v3  # noqa: E402
 
 KINDS = ('tap', 'drag', 'hold', 'flick')
+DEFAULT_LAYOUT_FROM = 11      # 触点上限 >= 这个数时直接用 algo3f 的默认布局(iPad 的上限是11), 更少的才搜索布局
 
 
 def load_chart(path: str) -> Chart:
@@ -129,7 +136,7 @@ def plan_layout(chart: Chart, cap: int, k: int, n: int):
     return ans, stats['dropped']
 
 
-def best_layout(chart: Chart, cap: int, quick: bool = False, seed: int = 1):
+def best_layout(chart: Chart, cap: int, quick: bool = False, seed: int = 1, fps: float = 60.0):
     """搜索布局, 返回 (score, (k, n), 规划); 一个都放不下返回 None"""
     best = None
     for k, n in layouts_for(cap, quick):
@@ -137,7 +144,7 @@ def best_layout(chart: Chart, cap: int, quick: bool = False, seed: int = 1):
         if res is None:
             continue
         ans, _ = res
-        sc = score(simulate(chart, ans, fps=60, seed=seed, phigros=True))
+        sc = score(simulate(chart, ans, fps=fps, seed=seed, phigros=True))
         key = (sc['perfect'], -sc['badmiss'])
         if best is None or key > best[0]:
             best = (key, sc, (k, n), ans)
@@ -147,7 +154,7 @@ def best_layout(chart: Chart, cap: int, quick: bool = False, seed: int = 1):
 # ---------------------------------------------------------------- 各命令的单谱面工作函数(给进程池用)
 
 def work_timing(args):
-    path, pointers, offsets, jitters, layout = args
+    path, pointers, offsets, jitters, layout, fps = args
     chart = load_chart(path)
     if layout is None:
         ans = algo3f.solve(chart, quiet(), pointers)
@@ -161,7 +168,7 @@ def work_timing(args):
         for off in offsets:
             # jitter_ms=J: 每批事件额外延迟 U[0, J], 均值J/2; 先整体提前J/2, 等价于 偏差off + 抖动±J/2
             plan = shifted(ans, off - j // 2)
-            out[(off, j)] = score(simulate(chart, plan, fps=60, seed=1, phigros=True, jitter_ms=float(j)))
+            out[(off, j)] = score(simulate(chart, plan, fps=fps, seed=1, phigros=True, jitter_ms=float(j)))
     return path, out
 
 
@@ -179,28 +186,28 @@ def jitter_plan(ans: dict, sd: float, offset: int, seed: int = 1) -> dict:
 
 
 def work_jitter(args):
-    path, pointers, sigmas, offset, layout = args
+    path, pointers, sigmas, offset, layout, fps = args
     chart = load_chart(path)
     if layout is None:
         ans = algo3f.solve(chart, quiet(), pointers)
     else:
         ans = plan_layout(chart, pointers, *layout)[0]
-    return path, {sd: score(simulate(chart, jitter_plan(ans, sd, offset), fps=60, seed=1, phigros=True))
+    return path, {sd: score(simulate(chart, jitter_plan(ans, sd, offset), fps=fps, seed=1, phigros=True))
                   for sd in sigmas}
 
 
 def work_caps(args):
-    path, caps, quick = args
+    path, caps, quick, fps = args
     chart = load_chart(path)
     n_notes = sum(len(line.notes) for line in chart.judge_lines)
     out = {}
     for cap in caps:
-        if cap >= 16:
+        if cap >= DEFAULT_LAYOUT_FROM:
             ans = algo3f.solve(chart, quiet(), cap)
-            sc = score(simulate(chart, ans, fps=60, seed=1, phigros=True))
+            sc = score(simulate(chart, ans, fps=fps, seed=1, phigros=True))
             out[cap] = (sc, ('默认', ''), peak_pointers(split_lives(ans)))
             continue
-        res = best_layout(chart, cap, quick)
+        res = best_layout(chart, cap, quick, fps=fps)
         if res is None:
             out[cap] = None
             continue
@@ -210,7 +217,7 @@ def work_caps(args):
 
 
 def work_floor(args):
-    path, floors, caps, quick = args
+    path, floors, caps, quick, fps = args
     chart = load_chart(path)
     out = {}
     saved = algo2.MAX_RELEASE_MS
@@ -218,11 +225,51 @@ def work_floor(args):
         for floor in floors:
             algo2.MAX_RELEASE_MS = floor        # tap 按下后 floor ms 才抬起(触点占用变长)
             for cap in caps:
-                res = best_layout(chart, cap, quick)
+                res = best_layout(chart, cap, quick, fps=fps)
                 out[(floor, cap)] = None if res is None else (res[0], res[1])
     finally:
         algo2.MAX_RELEASE_MS = saved
     return path, out
+
+
+def work_demand(path):
+    """谱面本身需要多少个触点: 每个 tap/长条头到来时, 同时占着触点的 tap/长条有几个(含它自己)。
+    单指针设备(比如USB鼠标)只有1个; 长条按住期间触点被钉在长条上, 别处的音符就够不着。"""
+    chart = load_chart(path)
+    spans, holds, kinds = [], [], {'tap': 0, 'hold': 0, 'drag': 0, 'flick': 0}
+    all_times = []
+    for line in chart.judge_lines:
+        for n in line.notes:
+            t = round(line.seconds(n.time) * 1000)
+            all_times.append((t, n.type))
+            if n.type == NoteType.HOLD:
+                end = t + math.ceil(line.seconds(n.hold) * 1000) + algo2.MAX_RELEASE_MS
+                spans.append((t, end))
+                holds.append((t, end))
+                kinds['hold'] += 1
+            elif n.type == NoteType.TAP:
+                spans.append((t, t + algo2.MAX_RELEASE_MS))
+                kinds['tap'] += 1
+            elif n.type == NoteType.DRAG:
+                kinds['drag'] += 1
+            else:
+                kinds['flick'] += 1
+    starts = sorted(a for a, _ in spans)
+    ends = sorted(b for _, b in spans)
+    demand = [bisect_right(starts, a) - bisect_right(ends, a) for a, _ in spans]
+    hold_starts = sorted(a for a, _ in holds)
+    hold_ends = sorted(b for _, b in holds)
+    # 长条按住期间到达的音符(不含长条自己的头): 到达时刻落在某个长条的 (头, 尾) 内
+    during = 0
+    for t, typ in all_times:
+        active = bisect_right(hold_starts, t - 1) - bisect_right(hold_ends, t)
+        if active > 0:
+            during += 1
+    n_th = len(spans) or 1
+    return path, {'notes': sum(kinds.values()), **kinds, 'peak': max(demand, default=0),
+                  'ge2': sum(d >= 2 for d in demand) / n_th, 'ge3': sum(d >= 3 for d in demand) / n_th,
+                  'ge5': sum(d >= 5 for d in demand) / n_th,
+                  'during_hold': during / max(len(all_times), 1)}
 
 
 def work_payload(args):
@@ -254,7 +301,7 @@ def cmd_timing(a) -> None:
     offsets = [int(x) for x in a.offsets.split(',')]
     jitters = [int(x) for x in a.jitters.split(',')]
     layout = None if a.layout is None else tuple(int(x) for x in a.layout.split(','))
-    results = run_pool(work_timing, [(p, a.pointers, offsets, jitters, layout) for p in a.charts], a.jobs)
+    results = run_pool(work_timing, [(p, a.pointers, offsets, jitters, layout, a.fps) for p in a.charts], a.jobs)
     total = {}
     for _, out in results:
         for key, sc in out.items():
@@ -274,7 +321,7 @@ def cmd_timing(a) -> None:
 def cmd_jitter(a) -> None:
     sigmas = [float(x) for x in a.sigmas.split(',')]
     layout = None if a.layout is None else tuple(int(x) for x in a.layout.split(','))
-    results = run_pool(work_jitter, [(p, a.pointers, sigmas, a.offset, layout) for p in a.charts], a.jobs)
+    results = run_pool(work_jitter, [(p, a.pointers, sigmas, a.offset, layout, a.fps) for p in a.charts], a.jobs)
     total = {}
     for _, out in results:
         for sd, sc in out.items():
@@ -288,7 +335,7 @@ def cmd_jitter(a) -> None:
 
 def cmd_caps(a) -> None:
     caps = [int(x) for x in a.caps.split(',')]
-    results = run_pool(work_caps, [(p, caps, a.quick) for p in a.charts], a.jobs)
+    results = run_pool(work_caps, [(p, caps, a.quick, a.fps) for p in a.charts], a.jobs)
     rows, total = [], {}
     for path, n_notes, out in results:
         row = [chart_name(path), str(n_notes)]
@@ -309,7 +356,7 @@ def cmd_caps(a) -> None:
 def cmd_floor(a) -> None:
     floors = [int(x) for x in a.floors.split(',')]
     caps = [int(x) for x in a.caps.split(',')]
-    results = run_pool(work_floor, [(p, floors, caps, a.quick) for p in a.charts], a.jobs)
+    results = run_pool(work_floor, [(p, floors, caps, a.quick, a.fps) for p in a.charts], a.jobs)
     total = {}
     for _, out in results:
         for key, r in out.items():
@@ -318,6 +365,17 @@ def cmd_floor(a) -> None:
     print('### 最短接触时间 (每次tap至少按住T毫秒; 格内: Perfect占比 (Bad+Miss个数), 最优布局)\n')
     print(table(['T \\ 触点上限'] + [f'{c}指' for c in caps],
                 [[f'{f}ms' + (' (现在)' if f == 5 else '')] + [cell(total.get((f, c))) for c in caps] for f in floors]))
+
+
+def cmd_demand(a) -> None:
+    results = run_pool(work_demand, list(a.charts), a.jobs)
+    rows = [[chart_name(p), str(r['notes']), f"{r['tap']}/{r['hold']}/{r['drag']}/{r['flick']}",
+             f"{100 * r['ge2']:.0f}%", f"{100 * r['ge3']:.0f}%", f"{100 * r['ge5']:.0f}%", str(r['peak']),
+             f"{100 * r['during_hold']:.0f}%"] for p, r in results]
+    print('### 谱面本身需要多少个触点(只数 tap 和长条, 黄键/红键另算)\n')
+    print('"≥N个": 这个 tap/长条头到来的时候, 手指同时被 tap/长条占着的个数(含它自己)不小于 N 的占比; '
+          '"长条期间": 在某个长条按住期间到达的音符占所有音符的比例(单指针设备此时那根手指被钉在长条上)。\n')
+    print(table(['谱面', '音符数', 'tap/长条/黄键/红键', '≥2个', '≥3个', '≥5个', '峰值', '长条期间'], rows))
 
 
 def cmd_payload(a) -> None:
@@ -333,10 +391,12 @@ def cmd_payload(a) -> None:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('timing', 'jitter', 'caps', 'floor', 'payload'):
+    for name in ('timing', 'jitter', 'caps', 'floor', 'payload', 'demand'):
         sp = sub.add_parser(name)
         sp.add_argument('charts', nargs='+')
         sp.add_argument('--jobs', type=int, default=1, help='并行进程数(每张谱面一个任务)')
+        if name != 'payload':
+            sp.add_argument('--fps', type=float, default=60.0, help='游戏帧率(iPad Pro 的 ProMotion 屏可以试 120)')
         if name == 'jitter':
             sp.add_argument('--pointers', type=int, default=10)
             sp.add_argument('--sigmas', default='0,5,10,15,20,30,40')
@@ -357,7 +417,8 @@ def main(argv=None) -> None:
             sp.add_argument('--pointers', type=int, default=10)
             sp.add_argument('--tolerance', type=float, default=3.0)
     a = ap.parse_args(argv)
-    {'timing': cmd_timing, 'jitter': cmd_jitter, 'caps': cmd_caps, 'floor': cmd_floor, 'payload': cmd_payload}[a.cmd](a)
+    {'timing': cmd_timing, 'jitter': cmd_jitter, 'caps': cmd_caps, 'floor': cmd_floor, 'payload': cmd_payload,
+     'demand': cmd_demand}[a.cmd](a)
 
 
 if __name__ == '__main__':

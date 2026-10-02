@@ -209,18 +209,34 @@ def life_to_source(life: Life, source_id: str, start_ms: int, mapping: Mapping,
 
 
 def build_actions(ans: dict[int, list[VirtualTouchEvent]], mapping: Mapping, start_ms: int | None = None,
-                  min_contact_ms: int = 0, tolerance: float = 3.0) -> dict:
+                  min_contact_ms: int = 0, tolerance: float = 3.0,
+                  start_tap: tuple[float, float] | None = None, start_delay_ms: int = 0,
+                  start_contact_ms: int = 60) -> dict:
     """整张规划 -> POST /session/<id>/actions 的请求体 {'actions': [...]}。
 
     start_ms: 时间零点(默认是第一个事件的时刻)。设备收到请求、开始回放的那一刻对应这个零点。
     min_contact_ms: 每次接触至少持续这么久(iOS可能丢弃过短的接触, 要真机测, 见docs); 0=不加长。
-    tolerance: 轨迹精简误差(像素, 规划坐标系), 0=逐毫秒全发。"""
+    tolerance: 轨迹精简误差(像素, 规划坐标系), 0=逐毫秒全发。
+    start_tap: 规划坐标系里的一个点(Phigros的开始键, Android的"计时器同步"点的是屏幕中心)。给了就在记录的零点
+        先点一下这里, 整首歌从偏移 start_delay_ms 起开始(规划里的时刻0 = 记录偏移 start_delay_ms)。
+        点开始键和第一个音符之间的间隔完全由记录内部的偏移决定, 不受"请求发出 -> 第一个事件"的延迟波动影响,
+        这和 Android 的"点一下屏幕, 再等固定的开始延迟"是同一个做法。此时 start_ms 参数无效。
+    start_delay_ms: 见 start_tap; 必须不小于规划里最早事件的负时刻(有些谱面第一个音符之前就有扫屏触点按下)。"""
     lives = split_lives(ans)
-    if not lives:
-        return {'actions': []}
-    base = lives[0].t0 if start_ms is None else start_ms
-    return {'actions': [life_to_source(lf, f'p{i}', base, mapping, min_contact_ms, tolerance)
-                        for i, lf in enumerate(lives)]}
+    if start_tap is None:
+        if not lives:
+            return {'actions': []}
+        base = lives[0].t0 if start_ms is None else start_ms
+        return {'actions': [life_to_source(lf, f'p{i}', base, mapping, min_contact_ms, tolerance)
+                            for i, lf in enumerate(lives)]}
+    base = -int(start_delay_ms)
+    if lives and lives[0].t0 < base:
+        raise ValueError(f'start_delay_ms={start_delay_ms} 太小: 规划里最早的事件在 {lives[0].t0}ms, '
+                         f'需要 start_delay_ms >= {-lives[0].t0}')
+    tap = Life(-1, base, base + max(int(start_contact_ms), 0), ((base, start_tap),))
+    sources = [life_to_source(tap, 'start', base, mapping, 0, 0.0)]
+    sources += [life_to_source(lf, f'p{i}', base, mapping, min_contact_ms, tolerance) for i, lf in enumerate(lives)]
+    return {'actions': sources}
 
 
 def count_items(body: dict) -> int:

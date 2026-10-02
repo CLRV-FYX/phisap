@@ -196,6 +196,62 @@ class StructureTest(unittest.TestCase):
         self.assertEqual(hold_polyline(pts), ((0, (0.0, 0.0)), (4, (1.0, 0.0)), (99, (1.0, 0.0)), (100, (50.0, 0.0))))
 
 
+class StartTapTest(unittest.TestCase):
+    """开始键和整首歌放进同一条记录: 它们之间的间隔由记录内部的偏移决定, 不受"请求->第一个事件"的延迟波动影响
+    (Android 的计时器同步也是"点一下屏幕, 再等固定的开始延迟")"""
+
+    @staticmethod
+    def offset_of_first_down(src):
+        total = 0
+        for it in src['actions']:
+            if it['type'] == 'pointerDown':
+                return total
+            total += it.get('duration', 0)
+
+    def test_start_tap_comes_first_and_the_song_follows_after_the_delay(self):
+        ans = plan((1000, 1, DOWN, (100.0, 200.0)), (1005, 1, UP, (100.0, 200.0)),
+                   (1600, 2, DOWN, (300.0, 400.0)), (1650, 2, UP, (300.0, 400.0)))
+        body = build_actions(ans, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=2300)
+        self.assertEqual([s['id'] for s in body['actions']], ['start', 'p0', 'p1'])
+        start, first, second = body['actions']
+        self.assertEqual(self.offset_of_first_down(start), 0)                  # 开始键在记录的零点
+        self.assertEqual((start['actions'][0]['x'], start['actions'][0]['y']), (640.0, 360.0))
+        self.assertEqual(self.offset_of_first_down(first), 2300 + 1000)         # 规划时刻0 = 记录偏移 start_delay_ms
+        self.assertEqual(self.offset_of_first_down(second), 2300 + 1600)
+        back = replay_actions(body)
+        downs = sorted(ms for ms, evs in back.items() for e in evs if e.action == DOWN)
+        self.assertEqual(downs, [0, 3300, 3900])
+
+    def test_the_start_tap_does_not_depend_on_start_ms(self):
+        ans = plan((1000, 1, DOWN, (100.0, 200.0)), (1005, 1, UP, (100.0, 200.0)))
+        a = build_actions(ans, IDENTITY, start_ms=123, start_tap=(640.0, 360.0), start_delay_ms=500)
+        b = build_actions(ans, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=500)
+        self.assertEqual(a, b)
+
+    def test_negative_event_times_need_a_big_enough_delay(self):
+        ans = plan((-400, 1, DOWN, (100.0, 200.0)), (2000, 1, UP, (100.0, 200.0)))      # 第一个音符之前就按下的扫屏触点
+        body = build_actions(ans, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=1000)
+        self.assertEqual(self.offset_of_first_down(body['actions'][1]), 600)
+        with self.assertRaises(ValueError):
+            build_actions(ans, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=300)
+
+    def test_start_tap_alone_for_an_empty_plan(self):
+        body = build_actions({}, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=1000, start_contact_ms=80)
+        self.assertEqual([s['id'] for s in body['actions']], ['start'])
+        self.assertEqual(body['actions'][0]['actions'][2], {'type': 'pause', 'duration': 80})
+
+    def test_whole_song_judging_is_unchanged_by_the_prelude(self):
+        # 整首歌前面多一次开始键点击(时间上早了 start_delay_ms), 把还原出来的事件整体移回去之后判定结果一样
+        chart = teleport_chart()
+        ans = algo3f.solve(chart, quiet(), 16)
+        delay = 2500
+        body = build_actions(ans, IDENTITY, start_tap=(640.0, 360.0), start_delay_ms=delay)
+        back = replay_actions(body)
+        song = {ms - delay: [e for e in evs if e.pointer != 0] for ms, evs in back.items()}     # 源0是开始键
+        song = {ms: evs for ms, evs in song.items() if evs}
+        self.assertEqual(non_perfect(simulate(chart, song, fps=60, seed=1, phigros=True)), {})
+
+
 class RoundTripTest(unittest.TestCase):
     @staticmethod
     def position_at(events, pid, t):

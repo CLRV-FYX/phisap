@@ -103,6 +103,39 @@ class CommandsTest(unittest.TestCase):
         import algo.algo2 as algo2
         self.assertEqual(algo2.MAX_RELEASE_MS, 5)  # 用完恢复, 不污染别的测试
 
+    def test_demand_table_counts_simultaneous_pointers(self):
+        out = self.run_cli('demand', self.path)
+        self.assertIn('≥2个', out)
+        self.assertIn('长条期间', out)
+        self.assertIn('small', out)
+        # 这张小谱面里 tap 都是单个出现的, 没有两个 tap/长条头同时被占着
+        _, r = S.work_demand(self.path)
+        self.assertEqual((r['tap'], r['hold'], r['drag'], r['flick']), (3, 1, 2, 2))
+        self.assertEqual(r['ge2'], 0.0)             # 没有两个 tap/长条头同时被占着
+        self.assertEqual(r['peak'], 1)
+
+    def test_demand_sees_chords_and_holds(self):
+        # 3个同一时刻的tap + 一个长条按住期间到达的tap
+        notes = [note(64, x, 1) for x in (-3.0, 0.0, 3.0)] + [note(96, 0.0, 3, 32.0), note(112, 2.0, 1)]
+        path = os.path.join(self.tmp.name, 'chord.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'formatVersion': 3, 'offset': 0.0, 'judgeLineList': [line_dict(notes)]}, f)
+        _, r = S.work_demand(path)
+        self.assertEqual(r['peak'], 3)
+        self.assertAlmostEqual(r['ge2'], 4 / 5)      # 3个同一时刻的tap各占3个, 长条按住期间的tap占2个(长条+它自己)
+        self.assertAlmostEqual(r['ge3'], 3 / 5)
+        self.assertAlmostEqual(r['during_hold'], 1 / 5)   # 只有 t=112 的tap落在长条(96~)按住期间
+
+    def test_fps_option_is_accepted(self):
+        out = self.run_cli('caps', self.path, '--caps', '5', '--quick', '--fps', '120')
+        self.assertIn('5指', out)
+        out = self.run_cli('jitter', self.path, '--sigmas', '0', '--offset=-10', '--fps', '120')
+        self.assertIn('| 0 |', out)
+
+    def test_large_caps_use_the_default_layout(self):
+        out = self.run_cli('caps', self.path, '--caps', '11', '--quick')
+        self.assertIn('默认', out)
+
     def test_payload_table(self):
         out = self.run_cli('payload', self.path, '--pointers', '10')
         self.assertIn('actions条目', out)
