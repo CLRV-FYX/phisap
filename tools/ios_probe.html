@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>phisap iOS probe</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #101418; color: #cfe3ff; font: 14px/1.4 -apple-system, sans-serif;
+               touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+               overscroll-behavior: none; overflow: hidden; }
+  #hud { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; pointer-events: none;
+         white-space: pre; font-variant-numeric: tabular-nums; }
+  #hud b { color: #7cf29a; }
+  #inset { position: fixed; left: 0; top: 0; width: 0; height: 0; visibility: hidden;
+           padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  .dot { position: fixed; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; background: #ff5d73;
+         pointer-events: none; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="inset"></div>
+<div id="hud">phisap iOS probe
+
+连接中...</div>
+<script>
+'use strict';
+// 在iPhone的Safari里打开本页并保持在前台(设置里把自动锁定改成永不)。
+// 页面只做一件事: 给每个触点事件打上页面时间戳(DOMHighResTimeStamp, 毫秒)并回传给电脑上的 ios_probe.py。
+const state = { down: 0, up: 0, move: 0, cancel: 0, maxActive: 0, seq: 0 };
+const active = new Map();
+let batch = [];
+let pings = [];
+let hello = null;
+const dots = new Map();
+
+function insets() {
+  const cs = getComputedStyle(document.getElementById('inset'));
+  return { top: parseFloat(cs.paddingTop) || 0, right: parseFloat(cs.paddingRight) || 0,
+           bottom: parseFloat(cs.paddingBottom) || 0, left: parseFloat(cs.paddingLeft) || 0 };
+}
+
+function describe() {
+  return { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,
+           sw: screen.width, sh: screen.height, orientation: (screen.orientation && screen.orientation.type) || '',
+           ua: navigator.userAgent, insets: insets(), pointerEvents: 'PointerEvent' in window,
+           maxTouchPoints: navigator.maxTouchPoints, timeOrigin: performance.timeOrigin };
+}
+
+function render() {
+  document.getElementById('hud').innerHTML =
+    'phisap iOS probe\n\n' +
+    '按下 <b>' + state.down + '</b>   抬起 <b>' + state.up + '</b>   移动 <b>' + state.move + '</b>   取消 <b>' + state.cancel + '</b>\n' +
+    '当前触点 <b>' + active.size + '</b>   历史最多同时 <b>' + state.maxActive + '</b>\n\n' +
+    window.innerWidth + ' x ' + window.innerHeight + ' pt  @' + window.devicePixelRatio + 'x';
+}
+
+function record(type, e) {
+  const t = e.timeStamp;
+  if (type === 'down') {
+    active.set(e.pointerId, true);
+    state.down++;
+  } else if (type === 'up' || type === 'cancel') {
+    active.delete(e.pointerId);
+    state[type]++;
+  } else {
+    state.move++;
+  }
+  state.maxActive = Math.max(state.maxActive, active.size);
+  let co = 1;
+  if (type === 'move' && e.getCoalescedEvents) {
+    try { co = e.getCoalescedEvents().length || 1; } catch (err) { co = 1; }
+  }
+  batch.push({ t: t, now: performance.now(), type: type, id: e.pointerId, x: e.clientX, y: e.clientY,
+               n: active.size, co: co, s: state.seq++ });
+  if (type === 'down') {
+    const d = document.createElement('div');
+    d.className = 'dot';
+    document.body.appendChild(d);
+    dots.set(e.pointerId, d);
+  }
+  const d2 = dots.get(e.pointerId);
+  if (d2) {
+    d2.style.left = e.clientX + 'px';
+    d2.style.top = e.clientY + 'px';
+    if (type === 'up' || type === 'cancel') { d2.remove(); dots.delete(e.pointerId); }
+  }
+}
+
+for (const [name, type] of [['pointerdown', 'down'], ['pointermove', 'move'], ['pointerup', 'up'], ['pointercancel', 'cancel']]) {
+  window.addEventListener(name, (e) => { record(type, e); e.preventDefault(); }, { capture: true, passive: false });
+}
+// touch事件只用来阻止滚动/缩放, 计数以pointer事件为准
+for (const name of ['touchstart', 'touchmove', 'touchend', 'touchcancel', 'gesturestart', 'gesturechange']) {
+  window.addEventListener(name, (e) => e.preventDefault(), { passive: false });
+}
+
+async function flush() {
+  if (!batch.length && !pings.length && hello === null) return;
+  const body = JSON.stringify({ events: batch, pings: pings, hello: hello });
+  batch = [];
+  pings = [];
+  hello = null;
+  try {
+    await fetch('/log', { method: 'POST', body: body, headers: { 'Content-Type': 'application/json' }, keepalive: true });
+  } catch (err) { /* 网络抖动: 丢这一批, 电脑端会发现序号不连续 */ }
+}
+
+async function pingOnce() {
+  const t1 = performance.now();
+  try {
+    const r = await fetch('/ping?_=' + Math.random(), { cache: 'no-store' });
+    const j = await r.json();
+    const t2 = performance.now();
+    pings.push([t1, t2, j.host]);
+  } catch (err) { /* ignore */ }
+}
+
+async function pingBurst(n, gap) {
+  for (let i = 0; i < n; i++) {
+    await pingOnce();
+    await new Promise((r) => setTimeout(r, gap));
+  }
+}
+
+(async function main() {
+  hello = describe();
+  render();
+  setInterval(render, 100);
+  setInterval(flush, 120);
+  await pingBurst(40, 25);
+  setInterval(() => pingBurst(5, 40), 4000);
+  window.addEventListener('resize', () => { hello = describe(); });
+})();
+</script>
+</body>
+</html>
