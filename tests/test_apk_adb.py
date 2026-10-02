@@ -309,6 +309,25 @@ class TestAdbQueries(BaseCase):
         with self.assertRaises(A.AdbError):
             dev2.adb('A').shell('pm list packages')
 
+    def test_local_platform_tools_is_added_to_path(self):
+        cwd = os.getcwd()
+        exe = 'adb.exe' if os.name == 'nt' else 'adb'
+        try:
+            os.chdir(self.tmp)
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['/usr/bin', '/bin'])}):
+                self.assertIsNone(A.add_local_adb_to_path())  # 没有 platform-tools: 什么都不改
+                self.assertEqual(os.environ['PATH'], os.pathsep.join(['/usr/bin', '/bin']))
+                os.makedirs('platform-tools')
+                open(os.path.join('platform-tools', exe), 'wb').close()
+                folder = A.add_local_adb_to_path()
+                self.assertEqual(folder, os.path.abspath('platform-tools'))
+                self.assertEqual(os.environ['PATH'].split(os.pathsep)[0], folder)  # 放在最前面
+                before = os.environ['PATH']
+                A.add_local_adb_to_path()  # 重复调用不会重复添加
+                self.assertEqual(os.environ['PATH'], before)
+        finally:
+            os.chdir(cwd)
+
     def test_find_adb_prefers_env(self):
         with mock.patch.dict(os.environ, {'PHISAP_ADB': '/opt/x/adb'}):
             self.assertEqual(A.find_adb(), '/opt/x/adb')

@@ -2080,6 +2080,7 @@ def agreement(parent=None) -> bool:
 
 if __name__ == '__main__':
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    apk_tools.add_local_adb_to_path()  # phisap 目录下的 platform-tools/adb 让整个程序都能用上
     sys.excepthook = _report_crash
 
     app = QApplication(sys.argv)

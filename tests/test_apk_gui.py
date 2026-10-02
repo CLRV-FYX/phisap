@@ -165,6 +165,12 @@ class TestStatic(unittest.TestCase):
         playing = ast.dump(_method(cls, '_apk_playing'))
         self.assertTrue('_running' in playing and '_vauto_waiting' in playing)
 
+    def test_entry_point_adds_local_platform_tools_to_path(self):
+        src = _src()
+        tail = src[src.index("if __name__ == '__main__':"):]
+        self.assertIn('apk_tools.add_local_adb_to_path()', tail)
+        self.assertLess(tail.index('add_local_adb_to_path'), tail.index('QApplication('))  # 要赶在任何 adb 调用之前
+
     def test_ez_difficulty_is_recognised(self):
         """下载器和难度下拉框都有 EZ, chart_difficulty 以前却不认, EZ 谱面永远选不到"""
         for node in ast.walk(_tree()):

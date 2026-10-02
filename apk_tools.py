@@ -175,6 +175,21 @@ def find_adb() -> str:
     return 'adb'
 
 
+def add_local_adb_to_path() -> str | None:
+    """当前目录(phisap 目录)下有 platform-tools/adb(.exe) 时, 把它加进本进程的 PATH 最前面。
+
+    程序里 scrcpy / MaaTouch / 设备检测都是直接写 'adb' 去调用的, 只靠 find_adb 的本地兜底只管得了
+    提取/解包; 加进 PATH 之后整个程序都能用上放在 phisap 目录里的 adb。返回加进去的目录, 没有就返回 None。
+    """
+    folder = os.path.abspath('platform-tools')
+    if not os.path.isfile(os.path.join(folder, 'adb.exe' if os.name == 'nt' else 'adb')):
+        return None
+    paths = os.environ.get('PATH', '').split(os.pathsep)
+    if folder not in paths:
+        os.environ['PATH'] = os.pathsep.join([folder] + [p for p in paths if p])
+    return folder
+
+
 def _explain(args: Sequence[str], returncode: int, detail: str) -> str:
     detail = (detail or '').strip()
     hint = ''

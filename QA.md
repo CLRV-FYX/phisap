@@ -73,7 +73,7 @@ iPad 的同时触点上限约 11(iPhone 是 5), 走 WDA 批量回放: algo3f 默
 
 
 # Q: 怎么从手机里提取 Phigros 的安装包, 再解包出官谱? 进度条在哪?
-A: 在"曲目"页, "曲目"和"在线谱面下载"之间有一组"从游戏安装包提取谱面"。前提: 手机打开了 USB 调试并装着 Phigros, 电脑上有 adb(Android platform-tools 加进 PATH, 或者把 `platform-tools` 文件夹直接放在 phisap 目录里, 也可以设环境变量 `PHISAP_ADB`)。
+A: 在"曲目"页, "曲目"和"在线谱面下载"之间有一组"从游戏安装包提取谱面"。前提: 手机打开了 USB 调试并装着 Phigros, 电脑上有 adb(Android platform-tools 加进 PATH, 或者把 `platform-tools` 文件夹直接放在 phisap 目录里 —— 程序启动时会把它加进 PATH, scrcpy / MaaTouch / 设备检测也会用它; 想指定别的 adb 可以设环境变量 `PHISAP_ADB`, 只对提取/解包生效)。
 
 - **提取并解包**: 一条龙。先用 adb 把 `pm path` 列出的全部 APK(base + 各分包)和 `/sdcard/Android/obb/<包名>/` 下的 OBB 拉到 `./Assets/APK/<包名>/`, 再解包。要拉 OBB 是因为 Google Play 版的资源(含谱面)放在 OBB 里、APK 本身很小; TapTap 版没有 OBB, 资源直接在 APK 里(两三个 GB)。设备下拉框里选了哪台就用哪台, 没选且只连着一台时自动用那一台。
 - **仅提取安装包** / **解包已提取的文件**: 把一条龙拆成两步。**选择 APK/OBB 解包…** 可以自己选文件(比如别人给你的 APK; Google Play 版请把 OBB 一起选上, catalog 和资源分在不同文件里没关系)。
