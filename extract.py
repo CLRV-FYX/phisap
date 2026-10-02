@@ -1,5 +1,8 @@
+import lzma
 import os.path
 import pathlib
+import re
+from struct import unpack
 from typing import IO, Optional
 
 from enum import Enum
@@ -120,6 +123,14 @@ COMMON_STRINGS = {
 }
 
 
+def _check_count(what: str, n: int, reader: BinaryReader) -> int:
+    """条目数不可能比整份数据的字节数还多; 数据损坏时数量字段会是个离谱的值,
+    不拦住的话下面的 for 循环要空转几十亿次(读到末尾只会返回 0), 线程就卡死了。"""
+    if n < 0 or n > len(reader):
+        raise ValueError(f'数据损坏: {what}数量异常({n})')
+    return n
+
+
 class TypeTreeNode:
     type_: str
     name: str
@@ -137,6 +148,9 @@ class TypeTreeNode:
 class TypeTree:
     nodes: list[TypeTreeNode]
     string_buffer: bytes
+
+
+_WARNED_CLASS_IDS: set[int] = set()
 
 
 class ClassID(Enum):
@@ -173,7 +187,11 @@ class ClassID(Enum):
         try:
             return cls(id)
         except ValueError:
-            print('未知的ClassID:', id)
+            # 每个未知 ID 只提示一次: 解包上千个 bundle 时同一个 ID 会反复出现, 不能刷屏
+            # (集合放在模块级: Enum 类体里的普通属性会被当成枚举成员)
+            if id not in _WARNED_CLASS_IDS:
+                _WARNED_CLASS_IDS.add(id)
+                print('未知的ClassID:', id)
             return ClassID.UNKNOWN
 
 
@@ -283,7 +301,7 @@ class SerializedFile:
             self.enable_type_tree = reader.boolean
 
         # types
-        types_count = reader.i32
+        types_count = _check_count('类型', reader.i32, reader)
         self.types = []
         for _ in range(types_count):
             self.types.append(self._read_serialized_type(reader, False))
@@ -293,7 +311,7 @@ class SerializedFile:
             self.big_id_enabled = bool(reader.i32)
 
         # objects
-        object_count = reader.i32
+        object_count = _check_count('对象', reader.i32, reader)
         self.object_infos = []
         for _ in range(object_count):
             obj_info = ObjectInfo()
@@ -340,7 +358,7 @@ class SerializedFile:
 
         # scripts
         if self.file_header.version >= 11:
-            script_count = reader.i32
+            script_count = _check_count('脚本类型', reader.i32, reader)
             self.script_types = []
 
             for _ in range(script_count):
@@ -356,7 +374,7 @@ class SerializedFile:
                 self.script_types.append(script_type)
 
         # externals
-        external_count = reader.i32
+        external_count = _check_count('外部引用', reader.i32, reader)
         self.externals = []
         for _ in range(external_count):
             external = FileIdentifier()
@@ -372,7 +390,8 @@ class SerializedFile:
 
         # ref types
         if self.file_header.version >= 20:
-            self.ref_types = [self._read_serialized_type(reader, True) for _ in range(reader.i32)]
+            self.ref_types = [self._read_serialized_type(reader, True)
+                              for _ in range(_check_count('引用类型', reader.i32, reader))]
 
         if self.file_header.version >= 5:
             self.user_information = reader.cstr()
@@ -406,8 +425,8 @@ class SerializedFile:
             t.type_tree = TypeTree()
             t.type_tree.nodes = []
             if version >= 12 or version == 10:
-                nodes_count = reader.i32
-                length = reader.i32
+                nodes_count = _check_count('类型树节点', reader.i32, reader)
+                length = _check_count('类型树字符串表长度', reader.i32, reader)
 
                 for _ in range(nodes_count):
                     node = TypeTreeNode()
@@ -473,7 +492,7 @@ class SerializedFile:
                     t.namespace = reader.cstr()
                     t.asm_name = reader.cstr()
                 else:
-                    t.type_dependencies = [reader.i32 for _ in range(reader.u32)]
+                    t.type_dependencies = [reader.i32 for _ in range(_check_count('类型依赖', reader.u32, reader))]
 
         return t
 
@@ -644,7 +663,10 @@ class FileReader(BinaryReader):
         self.skip(4)
 
         if version >= 22:
-            if file_size < 48:
+            # 格式 22(Unity 2022.1+)起头部变宽, 前面那个 u32 的 file_size/data_offset 恒为 0,
+            # 真值在后面的 u64 里。以前这里拿 u32 的 file_size < 48 判断, 对 22 以上的文件
+            # 永远返回 False, 整份资产文件被当成"资源文件"跳过, 表现为解出来 0 个谱面。
+            if length < 48:
                 return False
             self.skip(4)
             file_size = self.u64
@@ -655,43 +677,93 @@ class FileReader(BinaryReader):
 
         return True
 
-def lz4_decompress(data: bytes) -> bytearray:
-    result = bytearray()
-    reader = BinaryReader(data, big_endian=False)
-    data_size = len(data)
-    while True:
-        token = reader.u8
+try:  # 装了 lz4 库就用它(C 实现, 快几十倍); 没装就用下面的纯 Python 版本
+    from lz4.block import decompress as _lz4_c_decompress
+except ImportError:  # pragma: no cover - 取决于环境里装没装 lz4
+    _lz4_c_decompress = None
 
-        # read literal
-        literal_length = token >> 4
-        if literal_length == 15:
-            while (add := reader.u8) == 255:
-                literal_length += 255
-            else:
-                literal_length += add
-        result.extend(reader.read(literal_length))
 
-        if reader.pos == data_size:
-            break
+def lz4_decompress_py(data) -> bytearray:
+    """纯 Python 的 LZ4 块解压(不依赖 lz4 库)。
 
-        # read match copy operation
-        offset = reader.u16
-        if offset == 0:
-            continue
-        match_length = token & 0b1111
-        if match_length == 15:
-            while (add := reader.u8) == 255:
-                match_length += 255
-            else:
-                match_length += add
-        match_length += 4
+    旧实现逐字节 append 复制匹配, 大谱面(几 MB)要好几秒; 这里改成切片复制,
+    重叠匹配(偏移小于匹配长度)用「重复模式」一次性展开, 速度快一个数量级。
+    数据损坏/被截断时抛 ValueError, 而不是悄悄返回一份残缺数据。
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        data = bytes(data)
+    n = len(data)
+    out = bytearray()
+    i = 0
+    try:
+        while i < n:
+            token = data[i]
+            i += 1
+            literal = token >> 4
+            if literal == 15:
+                while True:
+                    b = data[i]
+                    i += 1
+                    literal += b
+                    if b != 255:
+                        break
+            if literal:
+                if i + literal > n:
+                    raise ValueError('LZ4 数据被截断(字面量越界)')
+                out += data[i:i + literal]
+                i += literal
+            if i >= n:
+                break  # 最后一个序列只有字面量, 没有匹配
+            offset = data[i] | (data[i + 1] << 8)
+            i += 2
+            if offset == 0 or offset > len(out):
+                raise ValueError(f'LZ4 数据损坏(非法偏移 {offset})')
+            match = token & 15
+            if match == 15:
+                while True:
+                    b = data[i]
+                    i += 1
+                    match += b
+                    if b != 255:
+                        break
+            match += 4
+            begin = len(out) - offset
+            if offset >= match:
+                out += out[begin:begin + match]
+            else:  # 重叠复制: 把最近 offset 个字节当模式重复
+                pattern = out[begin:]
+                q, r = divmod(match, offset)
+                out += pattern * q + pattern[:r]
+    except IndexError:
+        raise ValueError('LZ4 数据被截断') from None
+    return out
 
-        # supporting overlap copy
-        begin = len(result) - offset
-        for i in range(match_length):
-            result.append(result[begin + i])
 
-    return result
+def lz4_decompress(data, uncompressed_size: int | None = None) -> bytearray:
+    """LZ4 块解压。给出解压后大小且装了 lz4 库时走 C 实现, 否则走纯 Python 实现。"""
+    if _lz4_c_decompress is not None and uncompressed_size:
+        try:
+            return bytearray(_lz4_c_decompress(bytes(data), uncompressed_size=uncompressed_size))
+        except Exception:
+            pass  # 交给纯 Python 版再试一次, 它能给出更明确的错误
+    return lz4_decompress_py(data)
+
+
+def lzma_decompress_unity(data, uncompressed_size: int | None = None) -> bytes:
+    """Unity 的 LZMA 块: 5 字节头(props + 小端字典大小) + 没有长度字段的裸 LZMA1 数据。"""
+    if len(data) < 5:
+        raise ValueError('LZMA 数据太短')
+    props = data[0]
+    if props >= 9 * 5 * 5:
+        raise ValueError(f'LZMA 参数非法(props={props})')
+    dict_size = max(unpack('<I', bytes(data[1:5]))[0], 4096)
+    lc = props % 9
+    props //= 9
+    lp = props % 5
+    pb = props // 5
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
+        {'id': lzma.FILTER_LZMA1, 'dict_size': dict_size, 'lc': lc, 'lp': lp, 'pb': pb}])
+    return decoder.decompress(bytes(data[5:]), max_length=uncompressed_size or -1)
 
 
 class BundleFile:
@@ -737,6 +809,8 @@ class BundleFile:
         elif signature in ['UnityWeb', 'UnityRaw'] and self.header.version != 6:
             raise RuntimeError('not supported')
         elif signature == 'UnityFS' or (signature in ['UnityWeb', 'UnityRaw'] and self.header.version == 6):
+            if len(reader) - reader.pos < 20:  # i64 + 3 个 u32
+                raise ValueError('bundle 头部被截断')
             self.header.size = reader.i64
             self.header.compressed_blocks_info_size = reader.u32
             self.header.uncompressed_blocks_info_size = reader.u32
@@ -744,33 +818,40 @@ class BundleFile:
             if signature != 'UnityFS':
                 reader.skip(1)
 
-            if self.header.version >= 7:
+            flags = self.header.flags
+            unity = self._parse_unity_version(self.header.unity_revision)
+            new_flags = self._uses_new_flags(unity)
+            # 同一个标志位在新旧 Unity 里含义不同: 旧版 0x200 = 加密, 新版 0x400 = 加密、
+            # 0x200 = 「块信息之后要补齐到 16 字节」。必须按引擎版本区分, 否则新版 bundle 会被
+            # 误判成加密, 或者漏掉补齐导致后面整段数据错位。
+            if flags & (0x400 if new_flags else 0x200):
+                raise RuntimeError('这个 AssetBundle 被加密了(没有解密密钥), 无法解包')
+
+            # 头部之后补齐到 16 字节: 格式版本 >= 7, 或者 Unity 2019.4.15+
+            # (有的游戏在这些引擎版本里写的还是格式版本 6, 但数据其实已经对齐了)
+            if self.header.version >= 7 or (unity[0] == 2019 and unity >= (2019, 4, 15)):
                 reader.align(16)
 
-            if self.header.flags & 0x80:
+            info_size = self.header.compressed_blocks_info_size
+            if flags & 0x80:  # 块信息放在文件末尾
                 position = reader.pos
-                reader.pos = -self.header.compressed_blocks_info_size
-                block_info_bytes = reader.read(self.header.compressed_blocks_info_size)
+                if len(reader) - info_size < position:
+                    raise ValueError('bundle 文件被截断(放不下块信息)')
+                reader.pos = len(reader) - info_size
+                block_info_bytes = reader.read(info_size)
                 reader.pos = position
             else:
-                block_info_bytes = reader.read(self.header.compressed_blocks_info_size)
+                block_info_bytes = reader.read(info_size)
+            if len(block_info_bytes) != info_size:
+                raise ValueError('bundle 文件被截断(块信息不完整)')
 
-            uncompressed_size = self.header.uncompressed_blocks_info_size
-
-            match self.header.flags & 0x3F:
-                case 1:  # LZMA
-                    raise RuntimeError('LZMA unsupported')
-                case 2 | 3:  # LZ4 | LZ4HC
-                    uncompressed_data = lz4_decompress(block_info_bytes)
-                    if len(uncompressed_data) != uncompressed_size:
-                        raise RuntimeError('lz4 decompression error: size not correct')
-                case _:
-                    uncompressed_data = bytes(block_info_bytes)
+            uncompressed_data = self._decompress(
+                block_info_bytes, self.header.uncompressed_blocks_info_size, flags)
 
             with BinaryReader(uncompressed_data) as uc_reader:
                 _uncompressed_data_hash = uc_reader.read(16)
                 self.blocks_info = []
-                for _ in range(uc_reader.i32):
+                for _ in range(_check_count('数据块', uc_reader.i32, uc_reader)):
                     block = self.StorageBlock()
                     block.uncompressed_size = uc_reader.u32
                     block.compressed_size = uc_reader.u32
@@ -778,7 +859,7 @@ class BundleFile:
                     self.blocks_info.append(block)
 
                 self.directory_info = []
-                for _ in range(uc_reader.i32):
+                for _ in range(_check_count('目录项', uc_reader.i32, uc_reader)):
                     node = self.Node()
                     node.offset = uc_reader.i64
                     node.size = uc_reader.i64
@@ -786,20 +867,16 @@ class BundleFile:
                     node.path = uc_reader.cstr()
                     self.directory_info.append(node)
 
+            if new_flags and flags & 0x200:  # BlockInfoNeedPaddingAtStart
+                reader.align(16)
+
             block_stream = bytearray()
 
             for block in self.blocks_info:
-                match block.flags & 0x3F:
-                    case 1:  # LZMA
-                        raise RuntimeError('LZMA unsupported')
-                    case 2 | 3:  # LZ4 | LZ4HC
-                        block_stream.extend(
-                            lz4_decompress(
-                                reader.read(block.compressed_size)
-                            )
-                        )
-                    case _:  # raw
-                        block_stream.extend(reader.read(block.compressed_size))
+                chunk = reader.read(block.compressed_size)
+                if len(chunk) != block.compressed_size:
+                    raise ValueError('bundle 文件被截断(数据块不完整)')
+                block_stream.extend(self._decompress(chunk, block.uncompressed_size, block.flags))
 
             with BinaryReader(block_stream) as s_reader:
                 self.files = []
@@ -809,6 +886,34 @@ class BundleFile:
                     s_reader.pos = node.offset
                     file.stream = s_reader.read(node.size)
                     self.files.append(file)
+
+
+    @staticmethod
+    def _parse_unity_version(revision: str) -> tuple[int, int, int]:
+        m = re.match(r'(\d+)\.(\d+)\.(\d+)', revision or '')
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+
+    @staticmethod
+    def _uses_new_flags(v: tuple[int, int, int]) -> bool:
+        """Unity 2020.3.34 / 2021.3.2 / 2022.1.1 起, 头部标志位的含义换了一套"""
+        old = (v < (2020,)
+               or (v[0] == 2020 and v < (2020, 3, 34))
+               or (v[0] == 2021 and v < (2021, 3, 2))
+               or (v[0] == 2022 and v < (2022, 1, 1)))
+        return not old
+
+    @staticmethod
+    def _decompress(data: bytes, uncompressed_size: int, flags: int) -> bytes:
+        match flags & 0x3F:
+            case 1:  # LZMA
+                out = lzma_decompress_unity(data, uncompressed_size)
+            case 2 | 3:  # LZ4 | LZ4HC
+                out = lz4_decompress(data, uncompressed_size)
+            case _:  # 不压缩
+                return bytes(data)
+        if len(out) != uncompressed_size:
+            raise RuntimeError(f'解压后的大小不对: 期望 {uncompressed_size}, 实际 {len(out)}(压缩方式 {flags & 0x3F})')
+        return out
 
 
 class AssetsManager:

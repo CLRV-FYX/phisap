@@ -17,7 +17,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-GROUPS = ('song_group', 'plan_group', 'dev_group', 'dl_group', 'setting_group', 'play_group')
+GROUPS = ('song_group', 'apk_group', 'plan_group', 'dev_group', 'dl_group', 'setting_group', 'play_group')
 PAGES = ('p_song', 'p_plan', 'p_play', 'p_log')
 SIGNALS = ('playback_finished.connect(self._reset_go)',
            'vauto_abort.connect(self._vauto_abort)',

@@ -72,14 +72,16 @@ class BinaryReader:
     def bcstr(self) -> bytes:
         barr = bytearray()
         while (b := self._stream.read(1)) != b'\0':
+            if not b:
+                # 读到数据末尾还没遇到 \0: 数据被截断或已损坏。
+                # 以前这里会死循环(read 在末尾永远返回 b'', 而 b'' != b'\0'),
+                # 解包遇到坏文件整个线程就卡死, 取消也没用。
+                raise EOFError('读到数据末尾仍未遇到字符串结束符(数据被截断或已损坏)')
             barr += b
         return bytes(barr)
 
     def cstr(self) -> str:
-        barr = bytearray()
-        while (b := self._stream.read(1)) != b'\0':
-            barr += b
-        return barr.decode()
+        return self.bcstr().decode()
 
     def bcstrl(self, max_size: int) -> bytes:
         barr = bytearray()

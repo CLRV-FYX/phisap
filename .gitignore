@@ -17,3 +17,6 @@ __pycache__/
 # 官谱样例数据(游戏版权素材，不入库，仅本地开发验证用)
 samples/chart_at_*.json
 samples/rpe_chart_at_*.json
+
+# 手动放在这里的 Android platform-tools(adb), apk_tools 会自动找到它
+/platform-tools/

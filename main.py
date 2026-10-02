@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from threading import Thread
@@ -24,10 +25,10 @@ from qfluentwidgets import (
     PrimaryPushButton, PushButton, ToolButton, SwitchButton,
     SearchLineEdit, PlainTextEdit,
     TransparentToolButton,
-    ComboBox, DoubleSpinBox, CheckBox,
+    ComboBox, DoubleSpinBox, CheckBox, LineEdit,
     SettingCardGroup, SettingCard, Pivot,
     InfoBar, InfoBarPosition,
-    IndeterminateProgressBar,
+    IndeterminateProgressBar, ProgressBar,
     ScrollArea,
     setTheme, Theme, setThemeColor,
 )
@@ -43,11 +44,12 @@ from control import DeviceController, max_touch_points, VIDEO_MAX_FPS
 from player import run_player, raise_timer_resolution
 from rpe import detect_kind, rpe_to_official_v3
 from downloader import Downloader, SOURCES, DEFAULT_SOURCE
+import apk_tools
 
 
 ALGORITHMS = ('algo3', 'algo3f', 'algo1', 'algo2')
 
-_KNOWN_DIFFICULTIES = ('SPB', 'INB', 'HDB', 'ATB', 'SP', 'IN', 'HD', 'AT', 'DT')
+_KNOWN_DIFFICULTIES = ('SPB', 'INB', 'HDB', 'ATB', 'SP', 'IN', 'HD', 'AT', 'DT', 'EZ')
 _CHART_TOKEN_RE = re.compile(r'chart[_\s\-#]?([a-z]+)', re.IGNORECASE)
 
 
@@ -198,6 +200,44 @@ class PlanThread(QThread):
             self.finished_ok.emit(self.plan_path, ans)
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+# ============== APK 提取/解包线程 ==============
+class ApkTaskThread(QThread):
+    '''后台执行 apk_tools 的任务(adb 提取 APK/OBB、解包谱面)。
+
+    任务函数形如 task(progress, cancel, log), 在这个线程里跑; 进度、日志、结果、失败原因
+    全部通过信号回到GUI线程, 线程里绝不碰控件。progress 的第一个参数是完成比例
+    (0~1, 总量未知时是 -1): 总量可能超过 2GB, 不能用 int 信号(C int 会溢出)。
+    '''
+    progress = pyqtSignal(float, str)
+    log_line = pyqtSignal(str)
+    finished_ok = pyqtSignal(object)
+    cancelled = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _on_progress(self, done, total, text):
+        self.progress.emit(done / total if total else -1.0, text)
+
+    def run(self):
+        try:
+            result = self._task(self._on_progress, self.cancel_event, self.log_line.emit)
+        except apk_tools.Cancelled:
+            self.cancelled.emit()
+        except apk_tools.ApkToolError as e:
+            self.failed.emit(str(e))  # 已经是写给用户看的说明, 不用堆栈
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+        else:
+            self.finished_ok.emit(result)
 
 
 # 手动开始时, 打歌时钟比"现在"提前这么多(秒)。注入触控有延迟(经 adb 转发 +
@@ -464,6 +504,65 @@ class MainPage(ScrollArea):
         btn_row.addStretch(1)
         song_group.vBoxLayout.addLayout(btn_row)
         p_song.addWidget(song_group)
+
+        # ---- 从游戏安装包提取谱面(adb 提取 APK/OBB + 解包, 都带进度条) ----
+        apk_group = SettingCardGroup('从游戏安装包提取谱面')
+        self.apk_card = SettingCard(
+            FIF.PHONE, '从手机提取并解包',
+            '用 adb 提取 Phigros 的 APK 和 OBB(Google Play 版的谱面在 OBB 里), 再解包进谱面库')
+        self.apk_pkg_edit = LineEdit()
+        self.apk_pkg_edit.setText(apk_tools.PHIGROS_PACKAGE)
+        self.apk_pkg_edit.setPlaceholderText('Phigros 包名')
+        self.apk_pkg_edit.setToolTip('一般不用改; 设备上找不到这个包名时, 会自动找名字里带 phigros 的应用')
+        self.apk_pkg_edit.setFixedWidth(260)
+        self.apk_card.hBoxLayout.addWidget(self.apk_pkg_edit, 0, Qt.AlignRight)
+        self.apk_card.hBoxLayout.addSpacing(16)
+        apk_group.addSettingCard(self.apk_card)
+
+        self.apk_overwrite_cb = CheckBox('覆盖已有的同名谱面')
+        self.apk_overwrite_cb.setChecked(True)
+        self.apk_overwrite_cb.setToolTip('谱面内容变了(游戏更新了)时, 对应的规划缓存会自动作废')
+        self.apk_delete_cb = CheckBox('解包成功后删除提取出来的 APK/OBB')
+        self.apk_delete_cb.setToolTip('安装包有几个 GB, 删掉省空间; 之后想再解包就得重新提取')
+        apk_opt_row = QHBoxLayout()
+        apk_opt_row.setSpacing(24)
+        apk_opt_row.addWidget(self.apk_overwrite_cb)
+        apk_opt_row.addWidget(self.apk_delete_cb)
+        apk_opt_row.addStretch(1)
+        apk_group.vBoxLayout.addLayout(apk_opt_row)
+        apk_group.vBoxLayout.addSpacing(6)
+
+        apk_btn_row = QHBoxLayout()
+        apk_btn_row.setSpacing(8)
+        self.apk_all_btn = PrimaryPushButton(FIF.DOWNLOAD, '提取并解包')
+        self.apk_all_btn.clicked.connect(self._apk_pull_and_extract)
+        self.apk_pull_btn = PushButton(FIF.PHONE, '仅提取安装包')
+        self.apk_pull_btn.clicked.connect(self._apk_pull_only)
+        self.apk_pick_btn = PushButton(FIF.FOLDER, '选择 APK/OBB 解包…')
+        self.apk_pick_btn.clicked.connect(self._apk_pick_and_extract)
+        self.apk_local_btn = PushButton(FIF.SYNC, '解包已提取的文件')
+        self.apk_local_btn.clicked.connect(self._apk_extract_local)
+        self.apk_cancel_btn = PushButton(FIF.CANCEL, '取消')
+        self.apk_cancel_btn.setEnabled(False)
+        self.apk_cancel_btn.clicked.connect(self._apk_cancel)
+        for b in (self.apk_all_btn, self.apk_pull_btn, self.apk_pick_btn, self.apk_local_btn):
+            apk_btn_row.addWidget(b)
+        apk_btn_row.addStretch(1)
+        apk_btn_row.addWidget(self.apk_cancel_btn)
+        apk_group.vBoxLayout.addLayout(apk_btn_row)
+        apk_group.vBoxLayout.addSpacing(8)
+
+        # 进度条按千分比走: 总量(安装包可能超过 2GB)不适合直接塞进 int
+        self.apk_progress = ProgressBar()
+        self.apk_progress.setRange(0, 1000)
+        self.apk_progress.setValue(0)
+        self.apk_progress.hide()
+        apk_group.vBoxLayout.addWidget(self.apk_progress)
+        self.apk_status = CaptionLabel('')
+        self.apk_status.setWordWrap(True)
+        self.apk_status.hide()
+        apk_group.vBoxLayout.addWidget(self.apk_status)
+        p_song.addWidget(apk_group)
 
         # ---- 规划组 ----
         plan_group = SettingCardGroup('规划')
@@ -1085,6 +1184,197 @@ class MainPage(ScrollArea):
         self._dl_dlt.done.connect(after)
         self._dl_dlt.start()
 
+    # ---- 从游戏安装包提取谱面 (adb 提取 APK/OBB + 解包, 都带进度条) ----
+    # 耗时操作都在 ApkTaskThread 里跑。任务函数(下面各处的 task)只能用从界面读出来的普通值
+    # (包名/序列号/开关), 进度、日志、结果全部走信号回到GUI线程, 绝不在线程里碰控件。
+    def _apk_busy(self) -> bool:
+        t = getattr(self, '_apk_thread', None)
+        return t is not None and t.isRunning()
+
+    def _apk_playing(self) -> bool:
+        '''正在演奏, 或者正在等视觉检测开始演奏'''
+        return bool(self._running or getattr(self, '_vauto_waiting', False))
+
+    def _apk_can_start(self) -> bool:
+        '''能不能启动提取/解包。演奏期间不行: 拉文件占满 USB 带宽、纯 Python 解包又会和演奏线程抢
+        GIL, 都会让触控延迟抖动; 而且任务结束时刷新曲目列表会重置难度/规划, 把"停止演奏"按钮禁用掉。'''
+        if self._apk_busy():
+            return False
+        if self._apk_playing():
+            InfoBar.warning('正在演奏', '演奏时不能提取/解包(会让触控延迟抖动), 请先停止演奏',
+                            parent=self.window(), position=InfoBarPosition.TOP, duration=4000)
+            return False
+        return True
+
+    def _apk_serial(self):
+        '''设备下拉框里选中的序列号; 空的话交给 apk_tools 现查(只有一台设备时自动选它)'''
+        return self.devices_box.currentText().strip() or None
+
+    def _apk_package(self) -> str:
+        return self.apk_pkg_edit.text().strip() or apk_tools.PHIGROS_PACKAGE
+
+    def _apk_set_running(self, running: bool):
+        for b in (self.apk_all_btn, self.apk_pull_btn, self.apk_pick_btn, self.apk_local_btn):
+            b.setEnabled(not running)
+        self.apk_pkg_edit.setEnabled(not running)
+        self.apk_cancel_btn.setEnabled(running)
+
+    def _apk_set_bar(self, frac: float, error: bool = False):
+        self.apk_progress.setValue(int(max(0.0, min(frac, 1.0)) * 1000))
+        try:
+            self.apk_progress.setError(error)
+        except AttributeError:  # 老版本 qfluentwidgets 没有错误态
+            pass
+
+    def _apk_begin(self, task, first_text: str):
+        '''启动一个后台任务, 同时把进度条亮出来'''
+        if self._apk_busy():
+            return
+        self._apk_set_running(True)
+        self._apk_set_bar(0.0)
+        self.apk_progress.show()
+        self.apk_status.setText(first_text)
+        self.apk_status.show()
+        t = ApkTaskThread(task)
+        t.progress.connect(self._apk_on_progress)
+        t.log_line.connect(self.log)
+        t.finished_ok.connect(self._apk_done)
+        t.cancelled.connect(self._apk_cancelled)
+        t.failed.connect(self._apk_failed)
+        t.finished.connect(self._apk_finished)
+        self._apk_thread = t
+        t.start()
+
+    def _apk_pull_and_extract(self):
+        if not self._apk_can_start():
+            return
+        serial, package = self._apk_serial(), self._apk_package()
+        overwrite = self.apk_overwrite_cb.isChecked()
+        delete = self.apk_delete_cb.isChecked()
+
+        def task(progress, cancel, log):
+            adb = apk_tools.Adb(apk_tools.pick_serial(apk_tools.list_devices(), serial))
+            return apk_tools.pull_and_extract(
+                adb.serial, package, overwrite=overwrite, delete_archives=delete,
+                progress=progress, cancel=cancel, log=log, adb=adb)
+
+        self.log(f'开始: 从设备提取 {package} 并解包谱面')
+        self._apk_begin(task, '正在连接设备…')
+
+    def _apk_pull_only(self):
+        if not self._apk_can_start():
+            return
+        serial, package = self._apk_serial(), self._apk_package()
+
+        def task(progress, cancel, log):
+            adb = apk_tools.Adb(apk_tools.pick_serial(apk_tools.list_devices(), serial))
+            return apk_tools.pull_package(adb, package, progress=progress, cancel=cancel, log=log)
+
+        self.log(f'开始: 从设备提取 {package} 的 APK/OBB')
+        self._apk_begin(task, '正在连接设备…')
+
+    def _apk_pick_and_extract(self):
+        if not self._apk_can_start():
+            return
+        start = apk_tools.DEFAULT_APK_DIR if os.path.isdir(apk_tools.DEFAULT_APK_DIR) else '.'
+        files, _ = QFileDialog.getOpenFileNames(
+            self, '选择 Phigros 的 APK / OBB(Google Play 版请把 OBB 一起选上)', start,
+            'Android 安装包 (*.apk *.obb);;所有文件 (*)')
+        if files:
+            self._apk_extract(files)
+
+    def _apk_extract_local(self):
+        if not self._apk_can_start():
+            return
+        files = apk_tools.find_local_archives()
+        if not files:
+            InfoBar.warning('没有找到已提取的安装包',
+                            f'{apk_tools.DEFAULT_APK_DIR} 里没有 APK/OBB。请先点"仅提取安装包", 或者选择文件解包',
+                            parent=self.window(), position=InfoBarPosition.TOP, duration=5000)
+            return
+        self._apk_extract(files)
+
+    def _apk_extract(self, files):
+        files = list(files)
+        overwrite = self.apk_overwrite_cb.isChecked()
+
+        def task(progress, cancel, log):
+            return apk_tools.extract_charts(files, overwrite=overwrite, progress=progress, cancel=cancel, log=log)
+
+        self.log('开始解包: ' + ', '.join(os.path.basename(f) for f in files))
+        self._apk_begin(task, '正在读取 catalog…')
+
+    def _apk_cancel(self):
+        t = getattr(self, '_apk_thread', None)
+        if t is not None and t.isRunning():
+            t.cancel()
+            self.apk_cancel_btn.setEnabled(False)
+            self.apk_status.setText('正在取消…')
+
+    def _apk_on_progress(self, frac: float, text: str):
+        if frac >= 0:
+            self.apk_progress.setValue(int(min(frac, 1.0) * 1000))
+        self.apk_status.setText(text)
+
+    def _apk_done(self, result):
+        self._apk_set_bar(1.0)
+        if isinstance(result, apk_tools.PullResult):
+            folder = os.path.dirname(result.files[0]) if result.files else apk_tools.DEFAULT_APK_DIR
+            msg = f'已提取 {len(result.files)} 个文件({apk_tools.format_size(result.total_bytes)}), 保存在 {folder}'
+            self.apk_status.setText(msg)
+            self.log(msg)
+            InfoBar.success('安装包已提取', msg + '。接着点"解包已提取的文件"提取谱面',
+                            parent=self.window(), position=InfoBarPosition.TOP, duration=6000)
+            return
+        ext = result.extract if isinstance(result, apk_tools.PipelineResult) else result
+        summary = ext.summary()
+        self.apk_status.setText('完成: ' + summary)
+        cur_diff = self.diff_box.currentText()
+        playing = self._apk_playing()
+        if not playing:
+            self.refresh_songs()
+        else:
+            self.log('正在演奏, 暂不刷新曲目列表; 演奏结束后点搜索栏旁边的刷新按钮即可看到新谱面')
+        if not playing and self.song_box.currentText():
+            # refresh_songs 只刷新曲目列表, 不会更新难度下拉框(谱库原来是空的话, 选中了第一首歌
+            # 难度却是空的); 谱面被更新时界面里挂着的旧规划也已经作废。重新载入一遍当前曲目,
+            # 并尽量保留用户原来选的难度。播放中不能动: 这会把"停止演奏"按钮禁用掉。
+            self.song_selected(self.song_box.currentText())
+            if cur_diff and self.diff_box.findText(cur_diff) >= 0 and self.diff_box.currentText() != cur_diff:
+                self.diff_box.setCurrentText(cur_diff)
+        if ext.overwritten:
+            self.log(f'有 {ext.overwritten} 份谱面内容发生了变化, 它们的旧规划缓存已作废, 请重新规划')
+        if ext.failed:
+            InfoBar.warning('解包完成, 但有失败', summary + '(失败原因见日志)',
+                            parent=self.window(), position=InfoBarPosition.TOP, duration=8000)
+        else:
+            InfoBar.success('解包完成', summary, parent=self.window(), position=InfoBarPosition.TOP, duration=6000)
+
+    def _apk_cancelled(self):
+        self.apk_status.setText('已取消')
+        self.log('已取消')
+        InfoBar.info('已取消', '已写入的谱面保留, 没传完的文件已清理',
+                     parent=self.window(), position=InfoBarPosition.TOP, duration=3000)
+
+    def _apk_failed(self, msg: str):
+        first = msg.strip().splitlines()[0] if msg.strip() else '未知错误'
+        self._apk_set_bar(self.apk_progress.value() / 1000, True)  # 条变红, 停在出错的位置
+        self.apk_status.setText('失败: ' + first)
+        self.log('提取/解包失败:\n' + msg)
+        InfoBar.error('提取/解包失败', first[:200], parent=self.window(),
+                      position=InfoBarPosition.TOP, duration=8000)
+
+    def _apk_finished(self):
+        self._apk_set_running(False)
+
+    def _apk_shutdown(self):
+        '''退出前让后台的提取/解包收尾(会停掉 adb、清掉没传完的半截文件)。
+        QThread 在运行中被销毁会直接崩溃, 所以必须等它结束。'''
+        t = getattr(self, '_apk_thread', None)
+        if t is not None and t.isRunning():
+            t.cancel()
+            t.wait(5000)
+
     def import_songs(self):
         files, _ = QFileDialog.getOpenFileNames(self, '选择谱面 JSON', '', 'JSON Files (*.json)')
         if not files:
@@ -1251,6 +1541,10 @@ class MainPage(ScrollArea):
         self._start_playback(manual=False)
 
     def run(self):
+        if self._apk_busy():
+            InfoBar.warning('正在提取/解包', '请等它完成, 或点"取消"后再开始演奏(传文件会让触控延迟抖动)',
+                            parent=self.window(), duration=4000)
+            return
         if not self._raw_ans:
             if self.plan_path and os.path.exists(self.plan_path):
                 with open(self.plan_path, 'r', encoding='utf-8') as f:
@@ -1743,6 +2037,7 @@ class MainPage(ScrollArea):
             pass
 
     def closeEvent(self, ev):
+        self._apk_shutdown()
         try:
             self.save_cache()
         except Exception:
@@ -1760,6 +2055,15 @@ class Window(MSFluentWindow):
 
         self.main_page = MainPage(self)
         self.addSubInterface(self.main_page, FIF.APPLICATION, '主界面')
+
+    def closeEvent(self, e):
+        # MainPage 是子控件, 关主窗口时它自己的 closeEvent 不会被调用, 所以由主窗口转交。
+        # 这里只收尾后台任务, 不碰 MainPage.closeEvent 里的 save_cache。
+        try:
+            self.main_page._apk_shutdown()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
 
 def agreement(parent=None) -> bool:
