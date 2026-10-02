@@ -24,7 +24,7 @@ from bisect import bisect_left
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from algo.algo_base import TouchAction  # noqa: E402
+from algo.algo_base import TouchAction, pause_presses  # noqa: E402
 from note import NoteType  # noqa: E402
 
 LIMIT_PERFECT = 0.08
@@ -386,7 +386,9 @@ def main():
                'algo3f': algo.algo3f.solve}
     for name in algos:
         ans = solvers[name](chart, Console(file=io.StringIO()), 16)
-        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width, strict_flick=strict, phigros=phigros))}')
+        presses = len(pause_presses(ans))
+        print(f'{name}: {summary(simulate(chart, ans, fps=fps, width_px=width, strict_flick=strict, phigros=phigros))}'
+              f' | 暂停键区域内的按下/抬起: {presses}次')
 
 
 if __name__ == '__main__':

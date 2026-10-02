@@ -11,8 +11,12 @@ import json
 
 
 # 左上角暂停按钮的触发区(1280x720坐标)。在这里"点一下"(按下再抬起)会让游戏暂停,
-# 所以任何只按一下就抬起的触点(扫屏/滑键触点的按下、长条接力触点)都不能落在这里。
+# 所以任何触点都不能在这里按下/抬起: 扫屏/滑键触点的按下位置、长条接力触点是挑着位置放的;
+# 蓝键/黄键/长条/红键本来按音符的位置点, 音符落在这个区域里时, 沿垂直于判定线的方向平移到区域外
+# (垂直判定: 触点在判定线方向上的投影不变, 判定结果不变), 见 avoid_pause_button。
 PAUSE_BUTTON_BOX = (160.0, 160.0)
+# 平移出暂停键区域时多走这么远(像素), 抵消坐标取整/缩放带来的误差
+PAUSE_EXIT_MARGIN = 8.0
 
 
 # Android 系统允许同时存在的最大触点数(MotionEvent 硬上限)。
@@ -30,7 +34,8 @@ MAX_POINTERS = 16
 # v10: 长条触点越界时沿垂直方向夹到屏幕边缘, 不再跳到"垂直弦中点"(手指位置连续)
 # v11: 长条判定线瞬移时加接力触点(整体时间偏差容忍度从±40ms扩到±90ms, 见 algo/relay.py);
 #      flick很密的谱面自动增加滑键触点, 排不下的flick推迟/短划(见 algo3.solve_with)
-PLAN_CACHE_SUFFIX = '.ans.v11.json'
+# v12: 音符落在左上角暂停键区域时, 触点沿垂直于判定线的方向平移到区域外(见 avoid_pause_button)
+PLAN_CACHE_SUFFIX = '.ans.v12.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -52,7 +57,7 @@ def in_screen(pos: tuple[float, float]) -> bool:
     return (0 <= x <= 1280) and (0 <= y <= 720)
 
 
-def recalc_pos(position: tuple[float, float], sa: float, ca: float) -> tuple[float, float]:
+def recalc_pos(position: tuple[float, float], sa: float, ca: float, avoid_pause: bool = True) -> tuple[float, float]:
     """重新计算坐标
     一些情况下，note会在屏幕的外侧判定。点名批评Nhelv。
     也就是说，此时横坐标会在[0, 1280]的范围外，或者纵坐标会在[0, 720]的范围外。
@@ -62,11 +67,19 @@ def recalc_pos(position: tuple[float, float], sa: float, ca: float) -> tuple[flo
     为了简化这个问题，我们将矩形视作一条线，这条线过矩形的终点且与矩形的两高平行。
     这条线必与屏幕对应的矩形相交，且绝大部分情况下有两个交点。
     我们取这两个交点的中心点作为我们操作note的位置。
+    结果落在左上角暂停键区域里时, 再沿垂直于判定线的方向平移到区域外(avoid_pause_button)。
     :param position: 坐标
     :param sa: sin(angle) 判定线偏移角度的正弦值
     :param ca: cos(angle) 判定线偏移角度的余弦值
+    :param avoid_pause: 是否避开暂停键(调用方自己处理暂停键时传False)
     :return: 重新计算后的坐标
     """
+    pos = _recalc_on_screen(position, sa, ca)
+    return avoid_pause_button(pos, sa, ca) if avoid_pause else pos
+
+
+def _recalc_on_screen(position: tuple[float, float], sa: float, ca: float) -> tuple[float, float]:
+    """recalc_pos 的屏幕外映射部分(不考虑暂停键)"""
     if in_screen(position):
         return position
 
@@ -142,14 +155,14 @@ def hold_point(line, note, ms: float, time_shift: float = 0.0) -> tuple[float, f
     pos, sa, ca = note_state(line, note, ms, time_shift)
     x, y = pos
     if in_screen(pos):
-        return pos
+        return avoid_pause_button(pos, sa, ca)
     lo, hi = _perpendicular_room(x, y, -sa, ca)
     lo, hi = lo + 1, hi - 1
     if lo > hi:
         # 垂直方向在屏幕内没有余量(几乎擦着角落过去), 退回原来的弦中点
         return recalc_pos(pos, sa, ca)
     s = min(max(0.0, lo), hi)
-    return clamp_to_screen((x - sa * s, y + ca * s))
+    return avoid_pause_button(clamp_to_screen((x - sa * s, y + ca * s)), sa, ca)
 
 
 def flick_time_shift(line, note, console=None) -> float:
@@ -187,6 +200,101 @@ def _perpendicular_room(bx: float, by: float, nx: float, ny: float) -> tuple[flo
     return (lo, hi) if lo <= hi else (0.0, 0.0)
 
 
+def in_pause_box(pos: tuple[float, float]) -> bool:
+    """pos 是否落在左上角暂停键的触发区(PAUSE_BUTTON_BOX)里"""
+    return pos[0] < PAUSE_BUTTON_BOX[0] and pos[1] < PAUSE_BUTTON_BOX[1]
+
+
+def _pause_cut(bx: float, by: float, nx: float, ny: float) -> tuple[float, float] | None:
+    """直线 (bx, by) + s*(nx, ny) 落在【暂停键区域外扩 PAUSE_EXIT_MARGIN】里的 s 区间(开区间), 不经过则返回 None"""
+    lo, hi = -math.inf, math.inf
+    for p, d, limit in ((bx, nx, PAUSE_BUTTON_BOX[0] + PAUSE_EXIT_MARGIN),
+                        (by, ny, PAUSE_BUTTON_BOX[1] + PAUSE_EXIT_MARGIN)):
+        if abs(d) < 1e-9:
+            if p >= limit:
+                return None
+            continue
+        t = (limit - p) / d
+        if d > 0:
+            hi = min(hi, t)
+        else:
+            lo = max(lo, t)
+    return (lo, hi) if lo < hi else None
+
+
+def pause_free_intervals(bx: float, by: float, nx: float, ny: float, lo: float, hi: float
+                         ) -> list[tuple[float, float, str]]:
+    """[lo, hi] 里不碰暂停键区域的 s 区间: [(下界, 上界, 标签)]。
+
+    垂直线经过暂停键区域时会被切成两段: 'low'(s较小的一侧)和'high'(s较大的一侧), 两侧都没有余量
+    (整条线都在暂停键区域里)则返回空表; 不经过暂停键区域时只有一段, 标签'all'。"""
+    cut = _pause_cut(bx, by, nx, ny)
+    if cut is None:
+        return [(lo, hi, 'all')]
+    a, b = cut
+    out = []
+    if lo <= a:
+        out.append((lo, min(a, hi), 'low'))
+    if b <= hi:
+        out.append((max(b, lo), hi, 'high'))
+    return out
+
+
+def avoid_pause_button(pos: tuple[float, float], sa: float, ca: float) -> tuple[float, float]:
+    """触点位置 pos 落在左上角暂停键区域时, 沿垂直于判定线的方向平移到区域外, 否则原样返回。
+
+    垂直判定: 判定只看触点在判定线方向上的投影, 与垂直方向的高度无关(见 tools/judge_sim.py 的
+    local_x), 所以沿垂直方向平移不改变投影、不影响判定。平移取最近的出口(两个方向里短的那个),
+    并且保持在屏幕内; 判定线擦着屏幕角落、垂直线整段都在暂停键区域里(躲不开)时, 取离屏幕角落最远的一端。
+    sa/ca: 该时刻判定线角度的sin/cos(与 note_state 的返回值一致), 垂直方向是 (-sa, ca)。"""
+    if not in_pause_box(pos):
+        return pos
+    x, y = pos
+    nx, ny = -sa, ca
+    room_lo, room_hi = _perpendicular_room(x, y, nx, ny)
+    lo, hi = room_lo + 1, room_hi - 1
+    if lo > hi:
+        return pos
+    free = pause_free_intervals(x, y, nx, ny, lo, hi)
+    if free:
+        s = min((min(max(0.0, l), h) for l, h, _ in free), key=abs)
+    else:
+        # 躲不开: 取弦的两端(屏幕边缘)里离屏幕角落远的一端, clamp_to_screen 负责留出边距
+        s = max((room_lo, room_hi), key=lambda v: (x + nx * v) ** 2 + (y + ny * v) ** 2)
+    return clamp_to_screen((x + nx * s, y + ny * s))
+
+
+def _flick_side(lo: float, hi: float, bx: float, by: float, nx: float, ny: float, radius: float) -> str | None:
+    """整段滑动让出暂停键的哪一侧: 优先能滑满 radius 的一侧, 其次是离音符本身更近的一侧"""
+    free = pause_free_intervals(bx, by, nx, ny, lo, hi)
+    if len(free) <= 1:
+        return free[0][2] if free else None
+
+    def key(f):
+        l, h, _ = f
+        r = min(radius, max(0.0, (h - l) / 2))
+        c = min(max(0.0, l + r), h - r) if h - l >= 2 * r else (l + h) / 2
+        return -r, abs(c)
+
+    return min(free, key=key)[2]
+
+
+def _flick_interval(lo: float, hi: float, bx: float, by: float, nx: float, ny: float,
+                    side: str | None) -> tuple[float, float]:
+    """这一毫秒滑动可用的 s 区间: 去掉暂停键区域后取 side 那一侧(没有就取最长的一段);
+    整条垂直线都在暂停键区域里(躲不开)时不管暂停键"""
+    if lo > hi:
+        return lo, hi
+    free = pause_free_intervals(bx, by, nx, ny, lo, hi)
+    if not free:
+        return lo, hi
+    for l, h, tag in free:
+        if tag == side:
+            return l, h
+    l, h, _ = max(free, key=lambda f: f[1] - f[0])
+    return l, h
+
+
 def flick_path(line, note, center_ms: int, start: int, end: int, radius: float,
                time_shift: float = 0.0, reverse: bool = False) -> list[tuple[float, float]]:
     """flick的滑动轨迹: 返回 center_ms+start ... center_ms+end 每毫秒的位置。
@@ -194,19 +302,25 @@ def flick_path(line, note, center_ms: int, start: int, end: int, radius: float,
     每一毫秒都按该时刻判定线的实际位置/角度计算(判定线在移动或旋转时手指跟着走),
     并沿垂直于判定线的方向滑过 2*radius 的距离(不改变在判定线方向上的投影, 所以不影响判定)。
     靠近屏幕边缘时, 整段轨迹沿垂直方向平移到屏幕内(而不是被截断在边缘上导致滑不动)。
+    靠近左上角时, 整段轨迹同样沿垂直方向平移到暂停键区域外(整段只选暂停键的一侧, 不会中途换边)。
     reverse: 反方向滑动
     """
-    path = []
     duration = end - start
+    samples = []
     for offset in range(start, end + 1):
         (x, y), sa, ca = note_state(line, note, center_ms + offset, time_shift)
-        bx, by = recalc_pos((x, y), sa, ca)
+        bx, by = recalc_pos((x, y), sa, ca, avoid_pause=False)
         nx, ny = -sa, ca   # 垂直于判定线的方向
         lo, hi = _perpendicular_room(bx, by, nx, ny)
-        lo, hi = lo + 1, hi - 1
+        samples.append((bx, by, nx, ny, lo + 1, hi - 1))
+    bx, by, nx, ny, lo, hi = samples[len(samples) // 2]
+    side = None if lo > hi else _flick_side(lo, hi, bx, by, nx, ny, radius)
+    path = []
+    for i, (bx, by, nx, ny, lo, hi) in enumerate(samples):
+        lo, hi = _flick_interval(lo, hi, bx, by, nx, ny, side)
         r = min(radius, max(0.0, (hi - lo) / 2))
         c = min(max(0.0, lo + r), hi - r) if hi - lo >= 2 * r else (lo + hi) / 2
-        s = c + r * (1 - 2 * (offset - start) / duration) * (-1 if reverse else 1)
+        s = c + r * (1 - 2 * i / duration) * (-1 if reverse else 1)
         path.append(clamp_to_screen((bx + nx * s, by + ny * s)))
     return path
 
@@ -278,6 +392,24 @@ def thin_path(points, start: tuple[float, float] | None = None, min_step: float 
     return keep
 
 
+def pause_presses(events) -> list[tuple[int, VirtualTouchEvent]]:
+    """规划结果里落在暂停键区域里的按下/抬起事件: [(ms, 事件)]。
+
+    只数DOWN和UP(会触发暂停的是按在暂停键上); 扫屏触点只是从暂停键上面划过去(MOVE)不算。
+    avoid_pause_button 躲得开的情况下结果应该为空, 它也是测试和警告用的独立检查。"""
+    return [(ms, e) for ms in sorted(events) for e in events[ms]
+            if e.action != TouchAction.MOVE and in_pause_box(e.pos)]
+
+
+def warn_pause_presses(events, console) -> int:
+    """规划结果里有触点按在/抬在暂停键区域里时输出警告, 返回次数"""
+    hits = pause_presses(events)
+    if hits:
+        console.print(f'[yellow]警告: 有{len(hits)}次按下/抬起落在左上角暂停键区域里(首次在{hits[0][0]}ms): '
+                      f'判定线贴着屏幕左上角, 沿垂直方向也躲不开, 这些时刻可能会暂停游戏[/yellow]')
+    return len(hits)
+
+
 # 扫屏触点(algo3/algo3f)使用的指针id下限, 普通触点的id都小于它
 SWEEP_POINTER_BASE_MIN = 2000
 
@@ -337,4 +469,5 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
            'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'FLICK_START', 'FLICK_END', 'FLICK_RADIUS', 'thin_path', 'first_note_ms', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
-           'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH', 'PAUSE_BUTTON_BOX']
+           'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH', 'PAUSE_BUTTON_BOX', 'PAUSE_EXIT_MARGIN', 'in_pause_box',
+           'avoid_pause_button', 'pause_free_intervals', 'pause_presses', 'warn_pause_presses']

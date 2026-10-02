@@ -8,7 +8,7 @@ from collections import defaultdict
 from chart import Chart
 from note import NoteType
 from .algo_base import (TouchAction, VirtualTouchEvent, thin_path, recalc_pos, _edge_safe, MAX_POINTERS, note_point,
-                        hold_point, flick_path, flick_time_shift,
+                        hold_point, flick_path, flick_time_shift, pause_presses, warn_pause_presses,
                         FLICK_START, FLICK_END, FLICK_RADIUS)
 from .relay import HoldTrack, plan_hold_relays, pool_peak
 
@@ -311,9 +311,11 @@ class PointerAllocator:
 
 
 def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stats: dict | None = None,
-          relay: bool = True) -> defaultdict[int, list[VirtualTouchEvent]]:
+          relay: bool = True, warn_pause: bool = True) -> defaultdict[int, list[VirtualTouchEvent]]:
     """stats: 传入一个dict就会被填上 dropped(因触点不足而丢掉的音符数) 和
-    pool_peak(tap/hold池里同时按着或在冷却的触点数峰值, 即至少需要多少个触点), 不影响规划结果。
+    pool_peak(tap/hold池里同时按着或在冷却的触点数峰值, 即至少需要多少个触点)、
+    pause_presses(按下/抬起落在暂停键区域里的次数, 躲得开时为0), 不影响规划结果。
+    warn_pause: 有按下/抬起落在暂停键区域里时输出警告(被algo3调用时由algo3统一检查)。
     relay: 判定线瞬移的长条是否加接力触点(见 relay.py)。"""
     frames = Frames()
     holds: dict[tuple[int, int], tuple] = {}   # tag -> (line, note, 按下时刻, 持续时间, 路径, 按下位置)
@@ -366,6 +368,10 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
         tracks = [HoldTrack(allocator.hold_pointer[tag], *info[:2], info[2], info[3], info[4], info[5])
                   for tag, info in holds.items() if tag in allocator.hold_pointer]
         plan_hold_relays(tracks, events, pool, heads, PID_REUSE_COOLDOWN_MS, console)
+    if warn_pause:
+        warn_pause_presses(events, console)
+    if stats is not None:
+        stats['pause_presses'] = len(pause_presses(events))
     return events
 
 

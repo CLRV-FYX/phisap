@@ -29,7 +29,7 @@ import math
 from collections import defaultdict
 from typing import NamedTuple
 
-from .algo_base import JUDGE_HALF_WIDTH, PAUSE_BUTTON_BOX, TouchAction, VirtualTouchEvent, _edge_safe, note_state
+from .algo_base import JUDGE_HALF_WIDTH, TouchAction, VirtualTouchEvent, _edge_safe, in_pause_box, note_state
 
 RELAY_LEAD_MS = 45        # 接力触点比瞬移提前这么久按在新位置
 RELAY_LAG_MS = 30         # 主手指在旧位置多留这么久
@@ -85,10 +85,6 @@ def _room(pos: tuple[float, float], n: tuple[float, float], margin: float):
     return (lo, hi) if lo <= hi else None
 
 
-def _in_pause_box(p: tuple[float, float]) -> bool:
-    return p[0] < PAUSE_BUTTON_BOX[0] and p[1] < PAUSE_BUTTON_BOX[1]
-
-
 def helper_position(line, note, ms: float, pos: tuple[float, float]) -> tuple[float, float] | None:
     """接力触点按下的位置: 把 pos 沿垂直于判定线的方向挪(不改变沿判定线方向的投影, 判定不受影响),
     挪到离屏幕边缘至少 EDGE_INSET 并避开左上角暂停按钮的地方(做不到就退一步: 只要在屏幕内);
@@ -107,9 +103,9 @@ def helper_position(line, note, ms: float, pos: tuple[float, float]) -> tuple[fl
                             key=lambda v: abs(v - s0))
         for sv in candidates or [s0]:
             cand = (pos[0] + n[0] * sv, pos[1] + n[1] * sv)
-            if not _in_pause_box(cand):
+            if not in_pause_box(cand):
                 return cand
-    return None if _in_pause_box(pos) else pos
+    return None if in_pause_box(pos) else pos
 
 
 def find_teleports(track: HoldTrack) -> list[tuple[int, tuple, tuple]]:

@@ -41,7 +41,8 @@ from chart import Chart
 from note import NoteType
 from . import algo2
 from .algo_base import (FLICK_END, FLICK_RADIUS, FLICK_START, JUDGE_HALF_WIDTH, MAX_POINTERS, PAUSE_BUTTON_BOX,
-                        SWEEP_POINTER_BASE_MIN, TouchAction, VirtualTouchEvent, flick_path, flick_time_shift)
+                        PAUSE_EXIT_MARGIN, SWEEP_POINTER_BASE_MIN, TouchAction, VirtualTouchEvent, flick_path,
+                        flick_time_shift, in_pause_box, warn_pause_presses)
 
 SWEEP_X_MIN = 20.0
 SWEEP_X_MAX = 1260.0
@@ -60,6 +61,7 @@ DOWN_GUARD = 300         # 扫屏触点按下时, 前后这么多ms内的tap/hol
 DOWN_SEARCH = 2000       # 找不到安全的按下时机时, 最多提前这么多ms
 SAFE_MARGIN = 30.0
 SETTLE_MS = 40           # 按下后先静止这么久(超过30fps的一帧)再开始扫动, 保证"按下"这一帧的位置是安全的
+SAFE_END_SEARCH = 400    # 扫屏触点抬起时正好在暂停键区域里, 最多往后推迟这么久(ms)再抬起(扫一趟只要约100ms)
 
 
 class Sweeper(NamedTuple):
@@ -158,12 +160,20 @@ def _safe_values(heads, t: int, sw: Sweeper) -> list[float]:
     for i in range(63):
         v = sw.lo + (sw.hi - sw.lo) * i / 62
         x, y = sw.point(v)
-        if x < PAUSE_BUTTON_BOX[0] and y < PAUSE_BUTTON_BOX[1]:
+        if in_pause_box((x, y)):
             continue
         if all(abs((x - cx) * ca + (y - cy) * sa - nx) > JUDGE_HALF_WIDTH + SAFE_MARGIN
                for cx, cy, ca, sa, nx in frames):
             out.append(v)
     return out
+
+
+def _outside_pause(sw: Sweeper, v: float) -> float:
+    """把扫动坐标 v 推到暂停键区域外(这一行/这一列本来就不经过暂停键区域时原样返回)"""
+    if not in_pause_box(sw.point(v)):
+        return v
+    edge = PAUSE_BUTTON_BOX[0 if sw.horizontal else 1] + PAUSE_EXIT_MARGIN
+    return min(max(v, edge), sw.hi)
 
 
 def _choose_down(heads, start: int, sw: Sweeper, preferred: float) -> tuple[int, float, bool]:
@@ -173,7 +183,16 @@ def _choose_down(heads, start: int, sw: Sweeper, preferred: float) -> tuple[int,
         vs = _safe_values(heads, t, sw)
         if vs:
             return t, min(vs, key=lambda v: abs(v - preferred)), True
-    return start, preferred, False
+    # 实在找不到不碰tap/hold的位置: 至少别按在暂停键上(按暂停键会直接暂停游戏)
+    return start, _outside_pause(sw, preferred), False
+
+
+def _safe_end(sw: Sweeper, t0: int, v0: float, end: int) -> int:
+    """抬起时刻: 从 end 起往后找第一个位置不在暂停键区域里的毫秒(扫屏触点抬起时不能正好落在暂停键上)"""
+    for dt in range(SAFE_END_SEARCH + 1):
+        if not in_pause_box(sw.point(triangle(end + dt, t0, v0, sw.half_period, sw.forward, sw.lo, sw.hi))):
+            return end + dt
+    return end
 
 
 POINTER_NOTE_TYPES = (NoteType.TAP, NoteType.HOLD)
@@ -209,6 +228,7 @@ def plan_sweepers(chart: Chart, sweepers: list[Sweeper], intervals: list[list[in
                 unsafe += 1
             events[down_t].append(VirtualTouchEvent(sw.point(v0), TouchAction.DOWN, pid))
             move_t0 = down_t + SETTLE_MS
+            end = _safe_end(sw, move_t0, v0, end)
             t = move_t0 + 1 + sw.tick  # 不同触点在不同的毫秒更新, 分散发送压力
             while t < end:
                 v = triangle(t, move_t0, v0, sw.half_period, sw.forward, sw.lo, sw.hi)
@@ -279,12 +299,13 @@ def _safe_points(heads, t: int, candidates: list[tuple[float, float]]) -> list[t
             a = -line.angle(lt) * math.pi / 180
             frames.append((cx, cy, math.cos(a), math.sin(a), note.x * 72))
     return [(x, y) for x, y in candidates
-            if not (x < PAUSE_BUTTON_BOX[0] and y < PAUSE_BUTTON_BOX[1])
+            if not in_pause_box((x, y))
             and all(abs((x - cx) * ca + (y - cy) * sa - nx) > JUDGE_HALF_WIDTH + SAFE_MARGIN
                     for cx, cy, ca, sa, nx in frames)]
 
 
 _GRID = [(80.0 + 1120.0 * i / 14, 60.0 + 600.0 * j / 6) for i in range(15) for j in range(7)]
+_GRID_OUT = [p for p in _GRID if not in_pause_box(p)]   # 不在暂停键区域里的格点(找不到安全位置时的兜底)
 
 
 class _Finger:
@@ -329,7 +350,7 @@ def plan_flick_fingers(chart: Chart, count: int, console: Console | None = None,
     taken: list[tuple[float, float]] = []
     for k, f in enumerate(fingers):
         # 在不会误触tap/hold的时间和位置按下(各触点错开位置)
-        down_t, pos, safe = first_start, _GRID[(k * 37) % len(_GRID)], False
+        down_t, pos, safe = first_start, _GRID_OUT[(k * 37) % len(_GRID_OUT)], False
         for dt in range(0, DOWN_SEARCH + 1, 10):
             pts = [p for p in _safe_points(heads, first_start - dt, _GRID) if p not in taken]
             if pts:
@@ -435,7 +456,7 @@ def solve_with(chart: Chart, console: Console, max_pointers: int, sweepers: list
         extra = f'(flick很密, 滑键触点由{base}个增加到{fingers}个)' if fingers > base else ''
         console.print(f'扫屏算法: {len(sweepers)}个触点扫屏(drag), {fingers}个滑键触点(flick), {rest}个触点处理tap/hold{extra}')
         stats: dict = {}
-        ans = algo2.solve(taphold, console, rest, stats=stats)
+        ans = algo2.solve(taphold, console, rest, stats=stats, warn_pause=False)
         if not stats['dropped'] or fingers <= base:
             break
         # 理论上不会发生(tap_hold_demand 是分配器不丢音符的最少触点数); 万一丢了音符, 把名额还给tap/hold
@@ -445,6 +466,7 @@ def solve_with(chart: Chart, console: Console, max_pointers: int, sweepers: list
         ans[ms].extend(evs)
     for ms, evs in plan_flick_fingers(chart, fingers, console)[0].items():
         ans[ms].extend(evs)
+    warn_pause_presses(ans, console)
     return ans
 
 

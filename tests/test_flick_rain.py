@@ -207,7 +207,7 @@ class StatsTest(unittest.TestCase):
         chart = chart_of(holds)
         st = {}
         algo2.solve(chart, quiet(), 16, stats=st)
-        self.assertEqual(st, {'dropped': 0, 'pool_peak': 4})
+        self.assertEqual(st, {'dropped': 0, 'pool_peak': 4, 'pause_presses': 0})
         st = {}
         algo2.solve(chart, quiet(), 3, stats=st)
         self.assertEqual(st['dropped'], 1)
