@@ -96,15 +96,43 @@ def _ns(kind: int, prefix: int, uri: int) -> bytes:
     return struct.pack('<HHII', kind, 16, 24, 1) + struct.pack('<i', -1) + _u32(prefix) + _u32(uri)
 
 
+def _empty_pool() -> bytes:
+    """没有字符串的资源串池。size 和 headerSize 都必须 4 字节对齐，否则系统直接拒掉。"""
+    # stringsStart 必须落在块内。size 等于 stringsStart 时，有的系统会当成坏表。
+    return struct.pack('<HHIIIIII', 0x0001, 28, 32, 0, 0, 0, 28, 0) + b'\x00\x00\x00\x00'
+
+
+def build_arsc() -> bytes:
+    """最小资源表。Android 8 起打不开 resources.arsc 就装不上，哪怕清单不引用资源。"""
+    name = PKG.encode('utf-16-le')
+    if len(name) > 254:
+        raise RuntimeError('package name too long for resources.arsc')
+    name = name + b'\x00' * (256 - len(name))
+    type_pool = _empty_pool()
+    key_pool = _empty_pool()
+    type_strings = 288
+    key_strings = type_strings + len(type_pool)
+    pkg_size = key_strings + len(key_pool)
+    package = struct.pack('<HHI', 0x0200, 288, pkg_size) + struct.pack('<I', 0x7f) + name
+    package += struct.pack('<IIIII', type_strings, 0, key_strings, 0, 0)
+    if len(package) != 288:
+        raise RuntimeError(f'package header {len(package)}')
+    package += type_pool + key_pool
+    body = _empty_pool() + package
+    total = 12 + len(body)
+    if total % 4 or pkg_size % 4:
+        raise RuntimeError('resources.arsc is not 4-byte aligned')
+    return struct.pack('<HHI', 0x0002, 12, total) + struct.pack('<I', 1) + body
+
+
 def build_manifest() -> bytes:
-    """不引用资源，所以 APK 里不必有 resources.arsc。"""
     attrs = list(ATTR)
     strings = attrs + [
         'package', 'android', 'http://schemas.android.com/apk/res/android',
         'manifest', 'uses-sdk', 'application', 'activity', 'intent-filter', 'action', 'category',
         PKG, 'app.phisap.pocket.MainActivity', 'phisap',
         'android.intent.action.MAIN', 'android.intent.category.LAUNCHER',
-        '1', '1.0', '34', '14', '26', '28', 'true', 'false',
+        '2', '1.0', '34', '14', '26', '28', 'true', 'false',
     ]
     idx = {s: i for i, s in enumerate(strings)}
     uri = idx['http://schemas.android.com/apk/res/android']
@@ -124,7 +152,7 @@ def build_manifest() -> bytes:
     chunks = [
         _ns(0x0100, idx['android'], idx['http://schemas.android.com/apk/res/android']),
         _start(idx['manifest'], [
-            A('versionCode', '1', 'int', 1),
+            A('versionCode', '2', 'int', 2),
             A('versionName', '1.0', 'string'),
             A('compileSdkVersion', '34', 'int', 34),
             A('compileSdkVersionCodename', '14', 'string'),
@@ -251,7 +279,7 @@ def _v1_files(files: list[tuple[str, bytes]], key, cert) -> list[tuple[str, byte
     mf = manifest.encode('utf-8')
     sf_main = (
         'Signature-Version: 1.0\r\nCreated-By: phisap\r\n'
-        f'SHA-256-Digest-Manifest: {base64.b64encode(hashlib.sha256(mf).digest()).decode()}\r\n\r\n'
+        f'SHA-256-Digest-Manifest: {base64.b64encode(hashlib.sha256(mf).digest()).decode()}\r\nX-Android-APK-Signed: 2\r\n\r\n'
     )
     sf_sections = []
     for section in sections:
@@ -272,6 +300,13 @@ def _v1_files(files: list[tuple[str, bytes]], key, cert) -> list[tuple[str, byte
         ('META-INF/CERT.SF', sf),
         ('META-INF/CERT.RSA', rsa),
     ]
+
+
+def _eocd_for_digest(eocd: bytes, signing_block_off: int) -> bytes:
+    """摘要里的中央目录偏移必须写成签名块起点，不能写成签名块之后的真实偏移。"""
+    out = bytearray(eocd)
+    struct.pack_into('<I', out, 16, signing_block_off)
+    return bytes(out)
 
 
 def _v2(apk: bytes, key, cert) -> bytes:
@@ -297,7 +332,7 @@ def _v2(apk: bytes, key, cert) -> bytes:
     value_len = 4 + signers_len
     block_size = 8 + 8 + 4 + value_len + 8 + 16
     struct.pack_into('<I', eocd, 16, cd_off + block_size)
-    digest = _chunk_digest([before, central, bytes(eocd)])
+    digest = _chunk_digest([before, central, _eocd_for_digest(eocd, cd_off)])
     digest_record = _u32(4 + 4 + 32) + _u32(V2_ALG) + _lp(digest)
     digests = _lp(digest_record)
     signed = digests + certs + _u32(0)
@@ -333,7 +368,9 @@ def _verify_v2(apk: bytes, cert) -> None:
     before = apk[:block_off]
     central = apk[cd_off:eocd_off]
     eocd = apk[eocd_off:]
-    digest = _chunk_digest([before, central, eocd])
+    if struct.unpack_from('<I', eocd, 16)[0] != cd_off:
+        raise RuntimeError('eocd does not point at the central directory')
+    digest = _chunk_digest([before, central, _eocd_for_digest(eocd, block_off)])
     # Walk the v2 value and check the stored digest plus the RSA signature.
     pair_len = struct.unpack_from('<Q', apk, block_off + 8)[0]
     ident = struct.unpack_from('<I', apk, block_off + 16)[0]
@@ -368,6 +405,7 @@ def build() -> Path:
     key, cert = _load_key()
     files = [
         ('AndroidManifest.xml', build_manifest()),
+        ('resources.arsc', build_arsc()),
         ('classes.dex', build_dex()),
         ('assets/ui.html', UI.read_bytes()),
     ]
