@@ -645,6 +645,11 @@ class MainPage(ScrollArea):
         self.export_btn.clicked.connect(self.export_plan)
         self.export_btn.setEnabled(False)
         plan_btn_row.addWidget(self.export_btn)
+        self.device_export_btn = PushButton(FIF.PHONE, '导出到手机')
+        self.device_export_btn.clicked.connect(self.export_device_plan)
+        self.device_export_btn.setEnabled(False)
+        self.device_export_btn.setToolTip('给手机版导入。电脑版照常用 ADB 演奏，规划仍在这边做。')
+        plan_btn_row.addWidget(self.device_export_btn)
         plan_btn_row.addStretch(1)
         plan_group.vBoxLayout.addLayout(plan_btn_row)
         p_plan.addWidget(plan_group)
@@ -943,6 +948,7 @@ class MainPage(ScrollArea):
         self.plan_path = None
         self._raw_ans = None
         self.export_btn.setEnabled(False)
+        self.device_export_btn.setEnabled(False)
         self.go_btn.setEnabled(False)
         sid = self.song_box.currentText()
         if not sid or not diff:
@@ -967,6 +973,7 @@ class MainPage(ScrollArea):
                 self.log(f'缓存规划读取失败: {e}')
                 return
             self.export_btn.setEnabled(True)
+            self.device_export_btn.setEnabled(True)
             self.go_btn.setEnabled(self.controller is not None)
             self.log(f'已载入缓存规划: {os.path.basename(cand)}')
             # 提前在后台把坐标适配算好(要100多ms), 用户点"开始演奏"时直接取
@@ -1586,6 +1593,7 @@ class MainPage(ScrollArea):
         self.plan_path = plan_path
         self._raw_ans = ans
         self.export_btn.setEnabled(True)
+        self.device_export_btn.setEnabled(True)
         if self.controller:
             self.go_btn.setEnabled(True)
         self.log(f'规划完成: {os.path.basename(plan_path)} ({len(ans)} 个时间点)')
@@ -1607,6 +1615,28 @@ class MainPage(ScrollArea):
             import shutil
             shutil.copy(self.plan_path, fn)
             InfoBar.success('已导出', fn, parent=self.window(), duration=2000)
+
+    def export_device_plan(self):
+        '''手机版只播放，不重新规划。电脑版的 ADB 演奏不受影响。'''
+        if not self.plan_path:
+            return
+        fn, _ = QFileDialog.getSaveFileName(
+            self, '导出到手机', 'phisap-device.json', 'phisap (*.json)')
+        if not fn:
+            return
+        from device_plan import export_device_plan
+        try:
+            with open(self.plan_path, 'r', encoding='utf-8') as f:
+                ans = load_from_json(f)
+            with open(fn, 'w', encoding='utf-8') as f:
+                export_device_plan(ans, f, name=os.path.basename(self.plan_path))
+        except Exception as e:
+            self.log(f'导出到手机失败: {e}')
+            InfoBar.error('导出失败', str(e), parent=self.window(), duration=4000)
+            return
+        self.log(f'已导出手机计划: {fn}')
+        InfoBar.success('已导出到手机', '导入手机版即可。这边的 ADB 演奏不变。',
+                        parent=self.window(), duration=3000)
 
     # --- 播放 ---
     def _on_vauto_changed(self, on: bool):
