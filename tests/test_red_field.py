@@ -371,6 +371,79 @@ class AlgoredTest(unittest.TestCase):
         worst = max(worst, gap)
         self.assertLess(worst, 40, '长条中间断开超过一帧')
 
+    def test_prepress_click_does_not_steal_or_bad_a_tap(self):
+        """换手的新按下不能落进旁边 tap 的判定窗。
+
+        红场从中间赶来时仍然要先按住空位、再松开原来的。旁边的 tap 和长条在同一条
+        判定线上, 换垂线偏移躲不开, 新按下只能放到它的判定窗外面: ±80ms 会抢走,
+        再早到 180ms 是 Bad。长条头仍要留在 ±40ms 里。
+        """
+        from algo.algo_base import JUDGE_HALF_WIDTH, note_state
+        ch = chart_of(line_dict([
+            note(32.0, 0.0, n_type=3, hold=64.0),
+            note(54.4, 1.0),
+        ]))
+        ch.block_areas = [_block((0.25, 0.42), (0.75, 0.62), 0.90, 1.20)]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        line = ch.judge_lines[0]
+        hold, tap = line.notes_above
+        ms0 = round(line.seconds(hold.time) * 1000)
+        tap_ms = round(line.seconds(tap.time) * 1000)
+        end = ms0 + math.ceil(line.seconds(hold.hold) * 1000)
+        red_at = 900
+        self.assertLess(abs(tap_ms - 850), 30, tap_ms)
+        field = RedField.from_chart(ch)
+
+        downs = [(t, e.pos) for t, evs in ans.items() for e in evs if e.action == TouchAction.DOWN]
+        self.assertGreaterEqual(len(downs), 2, '红场从中间来, 要先按住新的再松原来的')
+        head = [t for t, _ in downs if abs(t - ms0) <= 40]
+        self.assertTrue(head, '长条头要留在 Perfect ±40ms')
+        tap_clicks = [t for t, pos in downs if abs(t - tap_ms) <= 40 and abs(judge_offset(line, t, pos) - tap.x * 72) < 20]
+        self.assertTrue(tap_clicks, '旁边的 tap 还要由它自己的点击打中')
+
+        def hits_tap(t, pos):
+            raw, sa, ca = note_state(line, tap, t)
+            along = (pos[0] - raw[0]) * ca + (pos[1] - raw[1]) * sa
+            dt = tap_ms - t
+            if abs(along) > JUDGE_HALF_WIDTH:
+                return False
+            return -180 <= dt <= 180
+
+        stolen = [(t, pos) for t, pos in downs if hits_tap(t, pos) and abs(t - tap_ms) > 40]
+        self.assertFalse(stolen, f'换手按下打进了 tap 的判定窗: {stolen}')
+
+        def outside(ms):
+            return [pos for pos in tl.at(ms).values()
+                    if abs(judge_offset(line, ms, pos)) < 8 and not field.contains(pos[0], pos[1], ms / 1000.0)]
+
+        self.assertTrue(outside(red_at - 40), '红场赶到之前空位上要有手指')
+        overlap = [ms for ms in range(red_at - 80, red_at) if len(tl.at(ms)) >= 2 and outside(ms)]
+        self.assertTrue(overlap, '新触点按住之后才能松开原来的')
+        gap = worst = 0
+        for ms in range(ms0, end + 1, 4):
+            if outside(ms):
+                worst = max(worst, gap)
+                gap = 0
+            else:
+                gap += 4
+        self.assertLess(max(worst, gap), 40, '躲开 tap 之后长条不能断')
+
+    def test_short_hold_is_not_skipped_to_dodge_a_later_tap(self):
+        """躲开旁边的音符不能把按下挪到长条结束之后, 否则这条长条会被跳过。"""
+        ch = chart_of(line_dict([
+            note(32.0, 0.0, n_type=3, hold=1.0),
+            note(34.2, 0.0),
+        ]))
+        ans = algored.solve(ch, quiet(), 16)
+        line = ch.judge_lines[0]
+        hold = line.notes_above[0]
+        ms0 = round(line.seconds(hold.time) * 1000)
+        downs = [(t, e.pos) for t, evs in ans.items() for e in evs if e.action == TouchAction.DOWN]
+        self.assertTrue(any(abs(t - ms0) <= 40 and abs(judge_offset(line, t, pos)) < 8 for t, pos in downs),
+                        '很短的长条也要按下, 不能为了躲开后面的 tap 跳过')
+
 
 class OffsetPlanTest(unittest.TestCase):
     def test_shift_matches_offset(self):

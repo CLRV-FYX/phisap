@@ -4,8 +4,9 @@
 所以一个音符可以点在它所在位置、垂直于判定线的任意坐标上。红场在动, 每一毫秒
 的空位不一样: 这一下没缝, 就先在 Perfect(±40ms) 里等它让开, 还没有再放到 Good(±80ms)。
 长条不能等红场盖到手指上再换: 红区从中间(或略偏两侧)长出来时, 要在它赶到之前
-先按住垂线上的空位, 新触点不松, 然后再松开原来的。同一侧还连得上的, 就提前挪过去,
-不扫过红场, 也不把判定线瞬移当成换边。
+先按住垂线上的空位, 新触点不松, 然后再松开原来的。这个新按下不能落进别的音符的
+判定窗: ±80ms 会把那个音符抢走, 再早到 180ms 是 Bad。同一侧还连得上的, 就提前挪过去,
+不扫过红场, 也不把判定线瞬移当成换边。长条头优先落在 Perfect(±40ms), 不贴 Good 外沿。
 
 扫屏(algo3/algo3f)的手指会扫过红场, 扫到的那一下是无效点击, 不能用来打这种谱。
 """
@@ -237,10 +238,20 @@ def _flick_outside(field: RedField, line, note, center_ms: int):
 # 不能等红场已经盖住再换手。
 _PRESS_LEAD_MS = 48
 _LIFT_EARLY_MS = 48
-_LOOKAHEAD_MS = 112
+# 要提前看到红场: 别的音符的 Bad 窗有 180ms, 等到只剩 112ms 再换手, 新按下已经落在窗里。
+_LOOKAHEAD_MS = 300
 _SLIDE_MAX_PX = 70.0
+_SLIDE_FALLBACK_PX = 1200.0
 _TELEPORT_PX = 80.0
 _STEP_PX = 16.0
+# 用户判定窗: Perfect ±40, Good ±80。提前按下到 180ms 是 Bad, 不是“没打到”。
+# 迟到超过 Good 的点击也躲开; 实在来不及才允许, 但绝不能落进 ±80(会抢走那个音符)。
+_STEAL_MS = 80
+_BAD_EARLY_MS = 180
+_BAD_LATE_MS = 180
+_GUARD_MARGIN_PX = 8.0
+# Good 外沿再晚一帧(60fps)就出了 ±80, 变成 Bad。长条头不要贴这条边。
+_SEEK_COMFORT_MS = 64
 
 
 def _normal(sa: float, ca: float) -> tuple[float, float]:
@@ -260,6 +271,21 @@ def _home(ivs, s: float):
     return best
 
 
+def _sample_s(iv, step: float = 24.0) -> list[float]:
+    """区间里多取几个垂线偏移。只取中心和两个唇, 会正好落进别的音符的判定带。"""
+    a, b = iv
+    span = b - a
+    if span < 8.0:
+        return []
+    guard = min(RED_CLEARANCE_PX, span / 3)
+    out = [(a + b) / 2, a + guard, b - guard]
+    s = a + guard
+    while s <= b - guard + 0.1:
+        out.append(s)
+        s += step
+    return out
+
+
 def _inset(iv, prefer: float) -> float:
     """落在区间内部, 不贴红边。prefer 已经在区间里就留在附近; 在外面就坐到中间, 不贴最近的唇。"""
     a, b = iv
@@ -272,7 +298,7 @@ def _inset(iv, prefer: float) -> float:
     return (a + b) / 2
 
 
-def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied=None):
+def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied=None, prefer_s: float = 0.0):
     """规划一条长条的手指。
 
     返回 (segments, prepress)。segments 是 [(按下时刻, 按下坐标, 之后每毫秒的坐标)]。
@@ -356,50 +382,49 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             lived += 8
         return lived
 
-    def blocked(ms: int, s: float) -> bool:
+    def guard_level(ms: int, s: float) -> int:
+        """0 干净, 1 只擦到已经过了 Good 的音符, 2 会抢走或打出 Bad。没有检查函数时当干净。"""
         if occupied is None:
-            return False
+            return 0
         return occupied(ms, pos_of(ms, s))
 
     def refuge(danger: int, avoid: float, now: int):
-        """danger 时还在的空位。优先现在就能按、而且能多留一会儿的, 不选马上又消失的窄缝。
+        """danger 时还在的空位, 而且这一下不能抢走别的音符、也不能提前打出 Bad。
 
-        空位如果会误触别的音符, 先换一个点; 全都挡了也要按, 进红场比误触更糟。
+        提前量够不够, 排在“不误触”后面。±80ms 里的点击会把那个音符判走;
+        再早到 180ms 是 Bad。全都挡了就不要按, 不能用一次 Bad 去换提前量。
+        只擦到已经过了 Good 的音符可以退而求其次, 但仍然比进红场好。
         """
         best = None
         for a, b in geom(min(danger, end_ms))[3]:
             if b - a < 8.0:
                 continue
-            for s in ((a + b) / 2, a + min(RED_CLEARANCE_PX, (b - a) / 3), b - min(RED_CLEARANCE_PX, (b - a) / 3)):
+            for s in _sample_s((a, b)):
                 if abs(s - avoid) < 10.0 and a - 2 <= avoid <= b + 2 and b - a < 120:
                     continue
-                first_safe = first_free = None
-                for t in range(max(now, click_ms), danger):
-                    if not safe_s(t, s):
+                found_at = {}
+                for t in range(max(now, click_ms), danger, 4):
+                    if not safe_s(t, s) or field.contains(*pos_of(t, s), t / 1000.0):
                         continue
-                    if first_safe is None:
-                        first_safe = t
-                    if first_free is None and not blocked(t, s):
-                        first_free = t
+                    got = guard_level(t, s)
+                    if got >= 2 or got in found_at:
+                        continue
+                    found_at[got] = t
+                    if 0 in found_at:
                         break
-                if first_safe is None:
+                if not found_at:
                     continue
-                # 提前量不够就进红场, 比误触别的音符更糟。先保证在红场前按住。
-                options = [(first_safe, True)]
-                if first_free is not None:
-                    options.append((first_free, False))
                 lived = survival(s, danger)
-                for press, hits_other in options:
+                for lvl, press in found_at.items():
                     lead = danger - press
-                    key = (0 if lead >= _PRESS_LEAD_MS else 1, 1 if hits_other else 0,
-                           -lead, -lived, -(b - a), abs(s - avoid))
-                    slot = (key, s, press)
+                    # 完全不碰到别的音符, 优先于“只擦到已经过了 Good 的”。同样干净时尽早按住。
+                    key = (lvl, 0 if lead >= _PRESS_LEAD_MS else 1, -lead, -lived, -(b - a), abs(s - avoid))
                     if best is None or key < best[0]:
-                        best = slot
+                        best = (key, s, press)
         return None if best is None else (best[1], best[2])
 
-    def slide_clear(now: int, s: float, target: float, arrive: int) -> bool:
-        if abs(target - s) > _SLIDE_MAX_PX or arrive <= now:
+    def slide_clear(now: int, s: float, target: float, arrive: int, max_px: float = _SLIDE_MAX_PX) -> bool:
+        if abs(target - s) > max_px or arrive <= now:
             return False
         steps = arrive - now
         prev = pos_of(now, s)
@@ -414,6 +439,23 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             prev = p
         return True
 
+    def slide_target(now: int, s: float, danger: int):
+        """没有不误触的新按下时, 同一只手指能不过红场滑到空位, 就滑。滑不过去也不许打出 Bad。"""
+        best = None
+        arrive = min(max(now + 1, danger - _LIFT_EARLY_MS), end_ms)
+        for a, b in geom(min(danger, end_ms))[3]:
+            if b - a < 8.0:
+                continue
+            target = (a + b) / 2
+            if abs(target - s) < 8.0:
+                continue
+            if not slide_clear(now, s, target, arrive, _SLIDE_FALLBACK_PX):
+                continue
+            key = (abs(target - s), -(b - a))
+            if best is None or key < best[0]:
+                best = (key, target)
+        return None if best is None else best[1]
+
     prepress = 0
 
     def cover(start: int, s: float, stop: int, depth: int = 0):
@@ -421,6 +463,10 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
         if start > stop or depth > 48:
             return []
         s0 = pick(start, s)
+        if s0 is not None and occupied is not None and safe_s(start, s):
+            # 收到区间内部有时会收进别的音符的判定带。传进来的点更干净就留在那儿。
+            if occupied(start, pos_of(start, s)) < occupied(start, pos_of(start, s0)):
+                s0 = s
         if s0 is None:
             nxt = None
             for t in range(start + 1, min(stop, start + 50) + 1):
@@ -439,6 +485,7 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
         prev_raw = geom(start)[0]
         cur = s0
         want = None
+        tried = None
         u = start + 1
         while u <= stop:
             raw = geom(u)[0]
@@ -458,7 +505,7 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             danger = None
             if (u & 7) == 0 or u == start + 1:
                 danger = forecast(u - 1, cur, u - 1 + _LOOKAHEAD_MS)
-            if danger is not None and danger <= stop:
+            if danger is not None and danger <= stop and want is None and tried != danger:
                 found = refuge(danger, cur, u - 1)
                 if found is not None:
                     ref_s, press = found
@@ -484,6 +531,13 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                         prepress += 1
                         segs.extend(cover(press, ref_s, stop, depth + 1))
                         return segs
+                else:
+                    # 每个能按的点都会误触。能不过红场滑走就滑, 不能滑也不打出 Bad。
+                    slid = slide_target(u - 1, cur, danger)
+                    if slid is None:
+                        tried = danger
+                    else:
+                        want = slid
             stepped = step(u, cur, want)
             if stepped is None:
                 found = refuge(min(u + 1, stop), cur, u)
@@ -509,9 +563,13 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             u += 1
         return [(start, head, pts)]
 
-    s = pick(click_ms, 0.0)
+    s = pick(click_ms, prefer_s)
     if s is None:
         return None
+    if occupied is not None and safe_s(click_ms, prefer_s):
+        # pick 会把点收进区间内部, 有时正好收进别的音符的判定带。干净的那个点还在就留在那儿。
+        if occupied(click_ms, pos_of(click_ms, prefer_s)) < occupied(click_ms, pos_of(click_ms, s)):
+            s = prefer_s
     early = forecast(click_ms, s, click_ms + _LOOKAHEAD_MS)
     if early is not None:
         found = refuge(early, s, click_ms)
@@ -524,27 +582,44 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
 
 
 def _note_guard(chart: Chart):
-    """新按下的长条触点不要落进别的音符的判定带。同一条垂线上投影不变, 挡的是别的判定线。"""
+    """新按下会不会打到别的音符。
+
+    返回 0 / 1 / 2。2 是会抢走(±80ms)或提前打出 Bad(再早到 180ms);
+    1 是只擦到已经过了 Good 的音符; 0 是干净。
+    同一条垂线上投影不变, 换偏移躲不开同一条判定线上的音符, 只能换按下时刻。
+    按下之后一两帧判定线还在动, 那两帧也要干净, 不能只看事件时间。
+    """
     items = []
     for line in chart.judge_lines:
         for n in line.notes_above + line.notes_below:
+            if n.type == NoteType.FLICK:
+                continue
             items.append((round(line.seconds(n.time) * 1000), line, n))
     items.sort(key=lambda it: it[0])
     times = [t for t, _, _ in items]
+    width = JUDGE_HALF_WIDTH + _GUARD_MARGIN_PX
 
-    def occupied(ms: int, pos, skip) -> bool:
-        lo = bisect_left(times, ms - 220)
-        hi = bisect_right(times, ms + 80)
-        for _, ol, on in items[lo:hi]:
-            if on is skip:
-                continue
-            raw, sa, ca = note_state(ol, on, ms)
-            along = (pos[0] - raw[0]) * ca + (pos[1] - raw[1]) * sa
-            if abs(along) <= JUDGE_HALF_WIDTH:
-                return True
-        return False
+    def level(ms: int, pos, skip) -> int:
+        worst = 0
+        px, py = pos
+        for sample in (ms, ms + 16, ms + 32):
+            lo = bisect_left(times, sample - _BAD_LATE_MS)
+            hi = bisect_right(times, sample + _BAD_EARLY_MS)
+            for nms, ol, on in items[lo:hi]:
+                if on is skip:
+                    continue
+                dt = nms - sample
+                raw, sa, ca = note_state(ol, on, sample)
+                along = (px - raw[0]) * ca + (py - raw[1]) * sa
+                if abs(along) > width:
+                    continue
+                if abs(dt) <= _STEAL_MS or _STEAL_MS < dt <= _BAD_EARLY_MS:
+                    return 2
+                if -_BAD_LATE_MS <= dt < -_STEAL_MS:
+                    worst = 1
+        return worst
 
-    return occupied
+    return level
 
 
 def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stats: dict | None = None,
@@ -590,21 +665,84 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
                 return t_ms, placed, sa_i, ca_i
         return None
 
+    def choose_hold_click(ms0: int, end_ms: int, guard):
+        """长条头的按下时刻和垂线偏移。
+
+        先在 Perfect(±40ms) 里找不误触的点。没有, 再放到 ±64ms, 不贴 Good 外沿
+        (60fps 一帧会把 ±80 顶出 Good, 变成 Bad)。外沿只在垂线更早一直被盖住时才用。
+        按下不能晚于长条结束。窗口里每个点都会误触, 就按原时刻按下, 不跳过。
+        """
+        def slots(t_ms):
+            raw, sa_i, ca_i = note_state(line, note, t_ms)
+            raw = hold_point(line, note, t_ms)
+            nx, ny = _normal(sa_i, ca_i)
+            out = []
+            hit = field.vertical_slot(raw[0], raw[1], sa_i, ca_i, t_ms / 1000.0, 0.0)
+            if hit is not None:
+                out.append((hit[2], (hit[0], hit[1])))
+            for clearance in (RED_CLEARANCE_PX, 0.0):
+                ivs = field.safe_intervals(raw[0], raw[1], sa_i, ca_i, t_ms / 1000.0, clearance)
+                for iv in ivs:
+                    for s in _sample_s(iv):
+                        pos = (raw[0] + nx * s, raw[1] + ny * s)
+                        if not field.contains(pos[0], pos[1], t_ms / 1000.0):
+                            out.append((s, pos))
+                if out:
+                    break
+            return out
+
+        raw0, sa0, ca0 = note_state(line, note, ms0)
+        raw0 = hold_point(line, note, ms0)
+        hit0 = field.vertical_slot(raw0[0], raw0[1], sa0, ca0, ms0 / 1000.0, 0.0)
+        if hit0 is not None and ms0 <= end_ms and guard(ms0, (hit0[0], hit0[1]), note) == 0:
+            return ms0, hit0[2]
+        near = slots(ms0)
+        clean = [s for s, pos in near if guard(ms0, pos, note) == 0]
+        if clean:
+            return ms0, min(clean, key=abs)
+        best = None
+        bands = ((0, 0, 40), (1, 44, _SEEK_COMFORT_MS), (2, _SEEK_COMFORT_MS + 4, _SEEK_MS))
+        for band, lo, hi in bands:
+            for dt in _seek_dts(hi):
+                ad = abs(dt)
+                if ad < lo or ad > hi:
+                    continue
+                t_ms = ms0 + dt
+                if t_ms > end_ms:
+                    continue
+                for s, pos in slots(t_ms):
+                    lvl = guard(t_ms, pos, note)
+                    key = (band, lvl, ad, abs(s))
+                    if best is None or key < best[0]:
+                        best = (key, t_ms, s)
+            if best is not None and best[0][0] == band and best[0][1] == 0:
+                break
+        if best is None:
+            if hit0 is not None and ms0 <= end_ms:
+                return ms0, hit0[2]
+            return None
+        return best[1], best[2]
+
     for li, line in enumerate(track(chart.judge_lines, description='统计操作帧(红场)...', console=console)):
         for ni, note in enumerate(line.notes_above + line.notes_below):
             ms = round(line.seconds(note.time) * 1000)
             alpha = -line.angle(note.time) * math.pi / 180
             if note.type == NoteType.HOLD:
                 hold_ms = math.ceil(line.seconds(note.hold) * 1000)
-                found = seek_click(ms)
-                if found is None:
+                end_ms = ms + hold_ms
+                chosen = choose_hold_click(ms, end_ms, occupied)
+                if chosen is None:
                     skipped += 1
                     continue
-                click_ms, _, _, _ = found
+                click_ms, prefer_s = chosen
+                guard = lambda t, pos, _n=note: occupied(t, pos, _n)
+                planned = _plan_hold(field, line, note, click_ms, end_ms, occupied=guard, prefer_s=prefer_s)
+                if not planned and click_ms != ms:
+                    # 为了躲开别的音符挪了时刻, 但这条长条已经结束。退回原时刻, 不能因此跳过。
+                    click_ms, prefer_s = ms, 0.0
+                    planned = _plan_hold(field, line, note, click_ms, end_ms, occupied=guard, prefer_s=prefer_s)
                 if click_ms != ms:
                     waited += 1
-                planned = _plan_hold(field, line, note, click_ms, ms + hold_ms,
-                                     occupied=lambda t, pos, _n=note: occupied(t, pos, _n))
                 if not planned:
                     skipped += 1
                     continue

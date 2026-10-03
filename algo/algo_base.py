@@ -42,7 +42,9 @@ MAX_POINTERS = 16
 #      规划窗优先 Perfect ±40ms, 最远 Good ±80ms
 # v17: 长条在红场赶到之前先按在垂线空位上, 接住之后再松开原来的触点;
 #      不再贴着红边, 也不把判定线瞬移当成扫过红场
-PLAN_CACHE_SUFFIX = '.ans.v17.json'
+# v18: 换手的新按下不再落进别的音符的判定窗(不抢判定、不打出 Bad);
+#      长条头优先 ±40ms, 不贴 Good 外沿, 免得 60fps 一帧顶出 ±80ms
+PLAN_CACHE_SUFFIX = '.ans.v18.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
