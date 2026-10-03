@@ -34,14 +34,245 @@ def sleb(n: int) -> bytes:
 
 
 def mutf8(text: str) -> bytes:
-    raw = text.encode('utf-8')
-    if b'\x00' in raw:
-        raise ValueError('NUL in string')
-    return uleb(len(raw)) + raw + b'\x00'
+    """MUTF-8。长度是 UTF-16 码元个数，不是 UTF-8 字节数。写错的话系统直接拒载 dex。"""
+    out = bytearray()
+    utf16_size = 0
+    for ch in text:
+        cp = ord(ch)
+        if cp == 0:
+            out.extend((0xC0, 0x80))
+            utf16_size += 1
+        elif cp < 0x80:
+            out.append(cp)
+            utf16_size += 1
+        elif cp < 0x800:
+            out.append(0xC0 | (cp >> 6))
+            out.append(0x80 | (cp & 0x3F))
+            utf16_size += 1
+        elif cp < 0x10000:
+            out.append(0xE0 | (cp >> 12))
+            out.append(0x80 | ((cp >> 6) & 0x3F))
+            out.append(0x80 | (cp & 0x3F))
+            utf16_size += 1
+        else:
+            cp -= 0x10000
+            for unit in (0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)):
+                out.append(0xE0 | (unit >> 12))
+                out.append(0x80 | ((unit >> 6) & 0x3F))
+                out.append(0x80 | (unit & 0x3F))
+            utf16_size += 2
+    return uleb(utf16_size) + bytes(out) + b'\x00'
 
 
 def _u16(n: int) -> int:
     return n & 0xffff
+
+
+def _uleb_at(data: bytes, off: int) -> tuple[int, int]:
+    n = s = 0
+    while True:
+        b = data[off]
+        off += 1
+        n |= (b & 0x7F) << s
+        if not b & 0x80:
+            return n, off
+        s += 7
+
+
+def _sleb_at(data: bytes, off: int) -> tuple[int, int]:
+    n = s = 0
+    while True:
+        b = data[off]
+        off += 1
+        n |= (b & 0x7F) << s
+        s += 7
+        if not b & 0x80:
+            if s < 32 and b & 0x40:
+                n |= (~0) << s
+            return n, off
+
+
+def _decode_mutf8(raw: bytes) -> str:
+    """按 MUTF-8 解出字符串，并数 UTF-16 码元。返回 (text, utf16_size)。"""
+    chars = []
+    utf16 = 0
+    i = 0
+    while i < len(raw):
+        b0 = raw[i]
+        if b0 == 0:
+            raise ValueError('interior NUL in MUTF-8')
+        if b0 < 0x80:
+            chars.append(chr(b0))
+            utf16 += 1
+            i += 1
+        elif b0 < 0xE0:
+            b1 = raw[i + 1]
+            cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+            chars.append(chr(cp))
+            utf16 += 1
+            i += 2
+        else:
+            b1 = raw[i + 1]
+            b2 = raw[i + 2]
+            cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+            chars.append(chr(cp))
+            utf16 += 1
+            i += 3
+    return ''.join(chars), utf16
+
+
+# opcode -> code units. 只覆盖组装器用到的，以及校验时必须能走完的指令。
+_OPCODE_UNITS = {
+    0x00: 1, 0x01: 1, 0x07: 1, 0x0A: 1, 0x0B: 1, 0x0C: 1, 0x0D: 1, 0x0E: 1, 0x0F: 1, 0x11: 1,
+    0x12: 1, 0x13: 2, 0x14: 3, 0x16: 2, 0x1A: 2, 0x1F: 2, 0x21: 1, 0x22: 2, 0x23: 2, 0x24: 3,
+    0x28: 1, 0x29: 2, 0x32: 2, 0x33: 2, 0x34: 2, 0x35: 2, 0x36: 2, 0x37: 2,
+    0x38: 2, 0x39: 2, 0x3A: 2, 0x3B: 2, 0x3C: 2, 0x3D: 2,
+    0x44: 2, 0x46: 2, 0x48: 2, 0x4B: 2, 0x4D: 2, 0x4F: 2,
+    0x52: 2, 0x53: 2, 0x54: 2, 0x55: 2, 0x56: 2, 0x59: 2, 0x5A: 2, 0x5B: 2, 0x5C: 2, 0x5D: 2,
+    0x60: 2, 0x61: 2, 0x62: 2, 0x67: 2, 0x68: 2, 0x69: 2,
+    0x6E: 3, 0x6F: 3, 0x70: 3, 0x71: 3, 0x72: 3, 0x74: 3, 0x75: 3, 0x76: 3, 0x77: 3, 0x78: 3,
+    0x81: 1, 0x8D: 1, 0x90: 2, 0x91: 2, 0x92: 2, 0x93: 2, 0x9B: 2, 0x9C: 2,
+    0xD0: 2, 0xD3: 2, 0xD8: 2, 0xDA: 2, 0xDD: 2, 0xDE: 2, 0xE1: 2, 0xE2: 2,
+    0x31: 2,
+}
+
+
+def audit_dex(blob: bytes) -> None:
+    """按 dex 规范检查系统会在启动前拒绝的结构错误。"""
+    if blob[:8] != b'dex\n035\x00':
+        raise RuntimeError('bad dex magic')
+    if zlib.adler32(blob[12:]) & 0xFFFFFFFF != struct.unpack_from('<I', blob, 8)[0]:
+        raise RuntimeError('dex checksum mismatch')
+    if hashlib.sha1(blob[32:]).digest() != blob[12:32]:
+        raise RuntimeError('dex signature mismatch')
+
+    def u32(off: int) -> int:
+        return struct.unpack_from('<I', blob, off)[0]
+
+    def u16(off: int) -> int:
+        return struct.unpack_from('<H', blob, off)[0]
+
+    string_ids_size, string_ids_off = u32(56), u32(60)
+    type_ids_size, type_ids_off = u32(64), u32(68)
+    proto_ids_size, proto_ids_off = u32(72), u32(76)
+    field_ids_size, field_ids_off = u32(80), u32(84)
+    method_ids_size, method_ids_off = u32(88), u32(92)
+    class_defs_size, class_defs_off = u32(96), u32(100)
+
+    strings = []
+    for i in range(string_ids_size):
+        off = u32(string_ids_off + i * 4)
+        declared, ptr = _uleb_at(blob, off)
+        end = blob.index(b'\x00', ptr)
+        text, actual = _decode_mutf8(blob[ptr:end])
+        if declared != actual:
+            raise RuntimeError(f'string {i} utf16_size {declared} != {actual}: {text[:40]!r}')
+        strings.append(text)
+    for i in range(1, len(strings)):
+        if strings[i] <= strings[i - 1]:
+            raise RuntimeError(f'strings not strictly sorted at {i}')
+
+    type_desc = [strings[u32(type_ids_off + i * 4)] for i in range(type_ids_size)]
+    type_order = [strings.index(d) for d in type_desc]
+    if type_order != sorted(type_order):
+        raise RuntimeError('type_ids not sorted')
+
+    class_idxs = [u32(class_defs_off + i * 32) for i in range(class_defs_size)]
+    if class_idxs != sorted(class_idxs) or len(set(class_idxs)) != len(class_idxs):
+        raise RuntimeError(f'class_defs not strictly sorted: {class_idxs}')
+
+    proto_keys = []
+    for i in range(proto_ids_size):
+        base = proto_ids_off + i * 12
+        ret = u32(base + 4)
+        params_off = u32(base + 8)
+        args = ()
+        if params_off:
+            n = u32(params_off)
+            args = tuple(u16(params_off + 4 + j * 2) for j in range(n))
+        proto_keys.append((ret, args))
+    if proto_keys != sorted(proto_keys) or len(set(proto_keys)) != len(proto_keys):
+        raise RuntimeError('proto_ids not strictly sorted')
+
+    field_keys = []
+    for i in range(field_ids_size):
+        base = field_ids_off + i * 8
+        field_keys.append((u16(base), u32(base + 4), u16(base + 2)))
+    if field_keys != sorted(field_keys) or len(set(field_keys)) != len(field_keys):
+        raise RuntimeError('field_ids not strictly sorted')
+
+    method_keys = []
+    for i in range(method_ids_size):
+        base = method_ids_off + i * 8
+        method_keys.append((u16(base), u32(base + 4), u16(base + 2)))
+    if method_keys != sorted(method_keys) or len(set(method_keys)) != len(method_keys):
+        raise RuntimeError('method_ids not strictly sorted')
+
+    def code_bounds(code_off: int) -> set[int]:
+        if code_off % 4:
+            raise RuntimeError(f'code item {code_off} not 4-aligned')
+        insns_size = u32(code_off + 12)
+        tries_size = u16(code_off + 6)
+        units = list(struct.unpack_from('<' + 'H' * insns_size, blob, code_off + 16))
+        bounds = set()
+        pc = 0
+        while pc < insns_size:
+            bounds.add(pc)
+            op = units[pc] & 0xFF
+            if op not in _OPCODE_UNITS:
+                raise RuntimeError(f'unknown opcode {op:#x} at {code_off}+{pc}')
+            pc += _OPCODE_UNITS[op]
+        if pc != insns_size:
+            raise RuntimeError(f'insns overshoot at {code_off}')
+        if tries_size:
+            tries_at = code_off + 16 + insns_size * 2
+            if insns_size % 2:
+                tries_at += 2
+            handlers_at = tries_at + tries_size * 8
+            list_size, ptr = _uleb_at(blob, handlers_at)
+            handler_starts = set()
+            for _ in range(list_size):
+                handler_starts.add(ptr - handlers_at)
+                size, ptr = _sleb_at(blob, ptr)
+                typed = abs(size)
+                for _ in range(typed):
+                    _, ptr = _uleb_at(blob, ptr)
+                    addr, ptr = _uleb_at(blob, ptr)
+                    if addr not in bounds:
+                        raise RuntimeError(f'catch addr {addr} not on instruction boundary')
+                if size <= 0:
+                    addr, ptr = _uleb_at(blob, ptr)
+                    if addr not in bounds:
+                        raise RuntimeError(f'catch-all {addr} not on instruction boundary')
+            for t in range(tries_size):
+                start, count, hoff = struct.unpack_from('<IHH', blob, tries_at + t * 8)
+                end = start + count
+                if start not in bounds or (end not in bounds and end != insns_size):
+                    raise RuntimeError(f'try {start}+{count} not on instruction boundary')
+                if hoff not in handler_starts:
+                    raise RuntimeError(f'handler_off {hoff} is not a handler start {sorted(handler_starts)}')
+        return bounds
+
+    for i in range(class_defs_size):
+        base = class_defs_off + i * 32
+        data_off = u32(base + 24)
+        if not data_off:
+            continue
+        # class_data: 4 ulebs then fields/methods. Walk to code_offs.
+        p = data_off
+        counts = []
+        for _ in range(4):
+            n, p = _uleb_at(blob, p)
+            counts.append(n)
+        for _ in range(counts[0] + counts[1]):
+            _, p = _uleb_at(blob, p)
+            _, p = _uleb_at(blob, p)
+        for _ in range(counts[2] + counts[3]):
+            _, p = _uleb_at(blob, p)
+            _, p = _uleb_at(blob, p)
+            code_off, p = _uleb_at(blob, p)
+            if code_off:
+                code_bounds(code_off)
 
 
 def _s16(n: int) -> int:
@@ -351,10 +582,11 @@ class Asm:
             start_at = labels[start]
             end_at = labels[end]
             handler_at = labels[handler]
-            # handler list: one catch-all group. handler_off is from the start of the list.
-            # size 0 means no typed catches, then a catch-all address. -1 would mean one typed catch plus a catch-all.
-            handlers = uleb(1) + sleb(0) + uleb(handler_at)
-            tries = struct.pack('<IHH', start_at, end_at - start_at, 0)
+            # handler_off 从列表起点算，必须落在某个 encoded_catch_handler 上，不能指到前面的 size。
+            # size 0 表示没有带类型的 catch，后面跟一个 catch-all 地址。
+            list_size = uleb(1)
+            handlers = list_size + sleb(0) + uleb(handler_at)
+            tries = struct.pack('<IHH', start_at, end_at - start_at, len(list_size))
         if len(units) % 2 and tries:
             units.append(0)
         tries_size = 1 if self.catch_all else 0
@@ -595,6 +827,8 @@ class DexBuilder:
         ann_item_off = add(ann_item, 1) if annotated else 0
         ann_set_off = add(struct.pack('<II', 1, ann_item_off)) if annotated else 0
 
+        # class_def 必须按 type_idx 升序。系统用二分查找，乱序会在进界面之前拒载整个 dex。
+        self.classes.sort(key=lambda c: self.type_ids[c['name']])
         # class data first, annotation directories after, so each map group stays contiguous.
         class_data_offs = []
         ann_dir_blobs = []
@@ -769,7 +1003,9 @@ class DexBuilder:
         digest = hashlib.sha1(out[32:]).digest()
         out[12:32] = digest
         out[8:12] = struct.pack('<I', zlib.adler32(out[12:]) & 0xffffffff)
-        return bytes(out)
+        blob = bytes(out)
+        audit_dex(blob)
+        return blob
 
     def _shorty(self, proto) -> str:
         ret, args = proto
