@@ -1,7 +1,7 @@
 """把口袋版打成单个可安装的 APK。不依赖 aapt 或 JDK。
 
-界面是 assets/ui.html，逻辑在手写的 classes.dex 里。
-签名同时带 v1 和 v2，密钥固定在 tools/pocket-signing.pem，重复安装不用先卸载。
+界面是 aapt2 编进去的原生布局，逻辑在手写的 classes.dex 里。
+启动不创建 WebView。签名同时带 v1 和 v2，密钥固定，重复安装不用先卸载。
 """
 from __future__ import annotations
 
@@ -523,8 +523,13 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
 
 def build() -> Path:
     key, cert = _load_key()
+    dex = build_dex()
+    if b'file:///android_asset/ui.html' in dex or b'Landroid/webkit/WebView;' in dex:
+        raise RuntimeError('启动 dex 仍引用 WebView')
+    if 'activity_main'.encode() not in dex or 'Phira'.encode() not in dex:
+        raise RuntimeError('原生界面或 Phira 说明没有进 dex')
     files = _aapt2_files()
-    files.append(('classes.dex', build_dex()))
+    files.append(('classes.dex', dex))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)

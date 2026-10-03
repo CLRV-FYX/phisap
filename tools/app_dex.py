@@ -1,4 +1,7 @@
-"""手机版 classes.dex。界面是 WebView，演奏是 root 下的 uinput。"""
+"""手机版 classes.dex。界面是系统原生布局，演奏是 root 下的 uinput。
+
+启动路径不创建 WebView。有的手机没装系统 WebView，构造函数会把进程直接打死。
+"""
 from __future__ import annotations
 
 from dexlib import Asm, DexBuilder
@@ -12,6 +15,7 @@ INJ = 'Lapp/phisap/pocket/Injector;'
 WRK = 'Lapp/phisap/pocket/Worker;'
 CHR = 'Lapp/phisap/pocket/Chrome;'
 HOOK = 'Lapp/phisap/pocket/HookEntry;'
+TAP = 'Lapp/phisap/pocket/Tap;'
 
 
 def M(cls, name, ret='V', args=()):
@@ -25,17 +29,16 @@ def F(cls, name, typ):
 def build_dex() -> bytes:
     dex = DexBuilder()
     _activity(dex)
-    _chrome(dex)
     _worker(dex)
     _injector(dex)
     _hook(dex)
+    _tap(dex)
     return dex.build()
 
 
 def _activity(dex: DexBuilder):
     dex.add_class(ACT, 'Landroid/app/Activity;')
     for name, typ, flags in (
-        ('web', 'Landroid/webkit/WebView;', PUB),
         ('pending', 'Landroid/webkit/ValueCallback;', PUB),
         ('offset', 'I', PUB),
         ('rot', 'I', PUB),
@@ -57,33 +60,58 @@ def _activity(dex: DexBuilder):
 
     on = Asm(16, 2)  # this v14, bundle v15
     on.invoke('super', M('Landroid/app/Activity;', 'onCreate', 'V', ('Landroid/os/Bundle;',)), [14, 15])
-    on.invoke('virtual', M('Landroid/app/Activity;', 'getActionBar', 'Landroid/app/ActionBar;'), [14], 0)
-    on.if_eqz(0, 'no_bar')
-    on.invoke('virtual', M('Landroid/app/ActionBar;', 'hide'), [0])
-    on.label('no_bar')
-    on.const(1, 0xFF121218)
-    on.invoke('virtual', M('Landroid/app/Activity;', 'getWindow', 'Landroid/view/Window;'), [14], 0)
-    on.invoke('virtual', M('Landroid/view/Window;', 'getDecorView', 'Landroid/view/View;'), [0], 0)
-    on.invoke('virtual', M('Landroid/view/View;', 'setBackgroundColor', 'V', ('I',)), [0, 1])
-    on.new(0, 'Landroid/webkit/WebView;')
-    on.invoke('direct', M('Landroid/webkit/WebView;', '<init>', 'V', ('Landroid/content/Context;',)), [0, 14])
-    on.iput(0, 14, F(ACT, 'web', 'Landroid/webkit/WebView;'), 'object')
-    on.invoke('virtual', M('Landroid/webkit/WebView;', 'getSettings', 'Landroid/webkit/WebSettings;'), [0], 1)
-    on.const(2, 1)
-    on.invoke('virtual', M('Landroid/webkit/WebSettings;', 'setJavaScriptEnabled', 'V', ('Z',)), [1, 2])
-    on.invoke('virtual', M('Landroid/webkit/WebSettings;', 'setAllowFileAccess', 'V', ('Z',)), [1, 2])
-    on.invoke('virtual', M('Landroid/webkit/WebSettings;', 'setDomStorageEnabled', 'V', ('Z',)), [1, 2])
-    on.new(1, CHR)
-    on.invoke('direct', M(CHR, '<init>', 'V', (ACT,)), [1, 14])
-    on.invoke('virtual', M('Landroid/webkit/WebView;', 'setWebChromeClient', 'V', ('Landroid/webkit/WebChromeClient;',)), [0, 1])
-    on.const_string(1, 'Phi')
-    on.invoke('virtual', M('Landroid/webkit/WebView;', 'addJavascriptInterface', 'V', ('Ljava/lang/Object;', 'Ljava/lang/String;')), [0, 14, 1])
-    on.const_string(1, 'file:///android_asset/ui.html')
-    on.invoke('virtual', M('Landroid/webkit/WebView;', 'loadUrl', 'V', ('Ljava/lang/String;',)), [0, 1])
-    on.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('Landroid/view/View;',)), [14, 0])
-    on.invoke('direct', M(ACT, 'loadSaved'), [14])
+    on.label('s')
+    on.invoke('virtual', M('Landroid/app/Activity;', 'getResources', 'Landroid/content/res/Resources;'), [14], 0)
+    on.const_string(1, 'activity_main')
+    on.const_string(2, 'layout')
+    on.invoke('virtual', M('Landroid/app/Activity;', 'getPackageName', 'Ljava/lang/String;'), [14], 3)
+    on.invoke(
+        'virtual',
+        M('Landroid/content/res/Resources;', 'getIdentifier', 'I', ('Ljava/lang/String;', 'Ljava/lang/String;', 'Ljava/lang/String;')),
+        [0, 1, 2, 3], 0, 'int',
+    )
+    on.if_eqz(0, 'missing')
+    on.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('I',)), [14, 0])
+    on.invoke('direct', M(ACT, 'bind', 'V', ()), [14])
+    on.invoke('direct', M(ACT, 'loadSaved', 'V', ()), [14])
+    on.invoke('virtual', M(ACT, 'paint', 'V', ()), [14])
+    on.goto('opened')
+    on.label('missing')
+    on.const_string(0, '界面资源缺失')
+    on.goto('fallback')
+    on.label('h')
+    on.move_exception(0)
+    on.invoke('virtual', M('Ljava/lang/Throwable;', 'toString', 'Ljava/lang/String;'), [0], 0)
+    on.goto('fallback')
+    on.label('fallback')
+    on.new(1, 'Landroid/widget/ScrollView;')
+    on.invoke('direct', M('Landroid/widget/ScrollView;', '<init>', 'V', ('Landroid/content/Context;',)), [1, 14])
+    on.new(2, 'Landroid/widget/TextView;')
+    on.invoke('direct', M('Landroid/widget/TextView;', '<init>', 'V', ('Landroid/content/Context;',)), [2, 14])
+    on.invoke('virtual', M('Landroid/widget/TextView;', 'setText', 'V', ('Ljava/lang/CharSequence;',)), [2, 0])
+    on.const(3, 48)
+    on.invoke('virtual', M('Landroid/view/View;', 'setPadding', 'V', ('I', 'I', 'I', 'I')), [2, 3, 3, 3, 3])
+    on.const(3, 0xFFF4F1F3)
+    on.invoke('virtual', M('Landroid/widget/TextView;', 'setTextColor', 'V', ('I',)), [2, 3])
+    on.const(3, 0xFF121218)
+    on.invoke('virtual', M('Landroid/view/View;', 'setBackgroundColor', 'V', ('I',)), [1, 3])
+    on.invoke('virtual', M('Landroid/view/ViewGroup;', 'addView', 'V', ('Landroid/view/View;',)), [1, 2])
+    on.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('Landroid/view/View;',)), [14, 1])
+    on.label('opened')
     on.ret()
+    on.try_all('s', 'h', 'h')
     dex.add_method(ACT, 'onCreate', 'V', ('Landroid/os/Bundle;',), PUB, on)
+
+    re = Asm(4, 1)  # this v3
+    re.invoke('super', M('Landroid/app/Activity;', 'onResume', 'V', ()), [3])
+    re.label('s')
+    re.invoke('virtual', M(ACT, 'paint', 'V', ()), [3])
+    re.ret()
+    re.label('h')
+    re.move_exception(0)
+    re.ret()
+    re.try_all('s', 'h', 'h')
+    dex.add_method(ACT, 'onResume', 'V', (), PUB, re)
 
     load = Asm(8, 1)  # this v7
     load.label('s')
@@ -357,7 +385,14 @@ def _activity(dex: DexBuilder):
     stop.ret()
     dex.add_method(ACT, 'stop', 'V', (), PUB, stop, annotated=True)
 
+    _screen(dex)
+
     ar = Asm(8, 4)  # this v4, req v5, result v6, data v7
+    ar.const(0, 7)
+    ar.if_ne(5, 0, 'web')
+    ar.invoke('direct', M(ACT, 'takePlan', 'V', ('I', 'Landroid/content/Intent;')), [4, 6, 7])
+    ar.ret()
+    ar.label('web')
     ar.const(0, 1)
     ar.if_ne(5, 0, 'out')
     ar.iget(1, 4, F(ACT, 'pending', 'Landroid/webkit/ValueCallback;'), 'object')
@@ -379,6 +414,204 @@ def _activity(dex: DexBuilder):
     ar.label('out')
     ar.ret()
     dex.add_method(ACT, 'onActivityResult', 'V', ('I', 'I', 'Landroid/content/Intent;'), PUB, ar)
+
+
+def _screen(dex: DexBuilder):
+    """原生界面：按名字找控件，避免把 aapt 资源号写死。"""
+    show = Asm(8, 3)  # this v5, id name v6, text v7
+    show.if_nez(7, 'has_text')
+    show.const_string(7, '')
+    show.label('has_text')
+    show.invoke('virtual', M('Landroid/app/Activity;', 'getResources', 'Landroid/content/res/Resources;'), [5], 0)
+    show.const_string(1, 'id')
+    show.invoke('virtual', M('Landroid/app/Activity;', 'getPackageName', 'Ljava/lang/String;'), [5], 2)
+    show.invoke(
+        'virtual',
+        M('Landroid/content/res/Resources;', 'getIdentifier', 'I', ('Ljava/lang/String;', 'Ljava/lang/String;', 'Ljava/lang/String;')),
+        [0, 6, 1, 2], 0, 'int',
+    )
+    show.if_eqz(0, 'out')
+    show.invoke('virtual', M('Landroid/app/Activity;', 'findViewById', 'Landroid/view/View;', ('I',)), [5, 0], 0)
+    show.if_eqz(0, 'out')
+    show.check_cast(0, 'Landroid/widget/TextView;')
+    show.invoke('virtual', M('Landroid/widget/TextView;', 'setText', 'V', ('Ljava/lang/CharSequence;',)), [0, 7])
+    show.label('out')
+    show.ret()
+    dex.add_method(ACT, 'show', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;'), PRIV, show)
+
+    note = Asm(4, 2)  # this v2, text v3
+    note.const_string(0, 'status.txt')
+    note.invoke('direct', M(ACT, 'save', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;')), [2, 0, 3])
+    note.ret()
+    dex.add_method(ACT, 'note', 'V', ('Ljava/lang/String;',), PUB, note)
+
+    nudge = Asm(6, 2)  # this v4, delta v5
+    nudge.iget(1, 4, F(ACT, 'offset', 'I'))
+    nudge.add(1, 1, 5)
+    nudge.invoke('static', M('Ljava/lang/Integer;', 'toString', 'Ljava/lang/String;', ('I',)), [1], 1)
+    nudge.invoke('virtual', M(ACT, 'setOffset', 'V', ('Ljava/lang/String;',)), [4, 1])
+    nudge.ret()
+    dex.add_method(ACT, 'nudge', 'V', ('I',), PUB, nudge)
+
+    paint = Asm(8, 1)  # this v7
+    paint.label('s')
+    paint.iget(1, 7, F(ACT, 'offset', 'I'))
+    paint.if_gtz(1, 'plus')
+    paint.invoke('static', M('Ljava/lang/Integer;', 'toString', 'Ljava/lang/String;', ('I',)), [1], 1)
+    paint.goto('off_ready')
+    paint.label('plus')
+    paint.invoke('static', M('Ljava/lang/Integer;', 'toString', 'Ljava/lang/String;', ('I',)), [1], 1)
+    paint.new(2, 'Ljava/lang/StringBuilder;')
+    paint.invoke('direct', M('Ljava/lang/StringBuilder;', '<init>'), [2])
+    paint.const_string(3, '+')
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'append', 'Ljava/lang/StringBuilder;', ('Ljava/lang/String;',)), [2, 3])
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'append', 'Ljava/lang/StringBuilder;', ('Ljava/lang/String;',)), [2, 1])
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'toString', 'Ljava/lang/String;'), [2], 1)
+    paint.label('off_ready')
+    paint.const_string(0, 'offset_value')
+    paint.invoke('direct', M(ACT, 'show', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;')), [7, 0, 1])
+    paint.iget(1, 7, F(ACT, 'planName', 'Ljava/lang/String;'), 'object')
+    paint.if_nez(1, 'named')
+    paint.const_string(1, '还没有计划')
+    paint.label('named')
+    paint.const_string(0, 'plan_name')
+    paint.invoke('direct', M(ACT, 'show', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;')), [7, 0, 1])
+    paint.iget(1, 7, F(ACT, 'events', 'I'))
+    paint.if_gtz(1, 'ev')
+    paint.const_string(1, '从电脑版导出后再导入。Phigros 和 Phira 都用这份计划。')
+    paint.goto('meta_ready')
+    paint.label('ev')
+    paint.invoke('static', M('Ljava/lang/Integer;', 'toString', 'Ljava/lang/String;', ('I',)), [1], 1)
+    paint.new(2, 'Ljava/lang/StringBuilder;')
+    paint.invoke('direct', M('Ljava/lang/StringBuilder;', '<init>'), [2])
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'append', 'Ljava/lang/StringBuilder;', ('Ljava/lang/String;',)), [2, 1])
+    paint.const_string(3, ' 个事件 · 1280×720')
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'append', 'Ljava/lang/StringBuilder;', ('Ljava/lang/String;',)), [2, 3])
+    paint.invoke('virtual', M('Ljava/lang/StringBuilder;', 'toString', 'Ljava/lang/String;'), [2], 1)
+    paint.label('meta_ready')
+    paint.const_string(0, 'plan_meta')
+    paint.invoke('direct', M(ACT, 'show', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;')), [7, 0, 1])
+    paint.const_string(0, 'status.txt')
+    paint.invoke('direct', M(ACT, 'readFile', 'Ljava/lang/String;', ('Ljava/lang/String;',)), [7, 0], 1)
+    paint.if_nez(1, 'st')
+    paint.const_string(1, '就绪。播放需要 root。Phigros 和 Phira 都走真实触摸。')
+    paint.label('st')
+    paint.const_string(0, 'status')
+    paint.invoke('direct', M(ACT, 'show', 'V', ('Ljava/lang/String;', 'Ljava/lang/String;')), [7, 0, 1])
+    paint.ret()
+    paint.label('h')
+    paint.move_exception(0)
+    paint.ret()
+    paint.try_all('s', 'h', 'h')
+    dex.add_method(ACT, 'paint', 'V', (), PUB, paint)
+
+    wire = Asm(8, 3)  # this v5, name v6, which v7
+    wire.invoke('virtual', M('Landroid/app/Activity;', 'getResources', 'Landroid/content/res/Resources;'), [5], 0)
+    wire.const_string(1, 'id')
+    wire.invoke('virtual', M('Landroid/app/Activity;', 'getPackageName', 'Ljava/lang/String;'), [5], 2)
+    wire.invoke(
+        'virtual',
+        M('Landroid/content/res/Resources;', 'getIdentifier', 'I', ('Ljava/lang/String;', 'Ljava/lang/String;', 'Ljava/lang/String;')),
+        [0, 6, 1, 2], 0, 'int',
+    )
+    wire.if_eqz(0, 'out')
+    wire.invoke('virtual', M('Landroid/app/Activity;', 'findViewById', 'Landroid/view/View;', ('I',)), [5, 0], 0)
+    wire.if_eqz(0, 'out')
+    wire.new(1, TAP)
+    wire.invoke('direct', M(TAP, '<init>', 'V', (ACT, 'I')), [1, 5, 7])
+    wire.invoke('virtual', M('Landroid/view/View;', 'setOnClickListener', 'V', ('Landroid/view/View$OnClickListener;',)), [0, 1])
+    wire.label('out')
+    wire.ret()
+    dex.add_method(ACT, 'wire', 'V', ('Ljava/lang/String;', 'I'), PRIV, wire)
+
+    bind = Asm(4, 1)  # this v3
+    for name, which in (
+        ('import_plan', 5),
+        ('offset_minus', 3),
+        ('offset_plus', 4),
+        ('start', 0),
+        ('test_tap', 1),
+        ('stop', 2),
+    ):
+        bind.const_string(1, name)
+        bind.const(2, which)
+        bind.invoke('direct', M(ACT, 'wire', 'V', ('Ljava/lang/String;', 'I')), [3, 1, 2])
+    bind.ret()
+    dex.add_method(ACT, 'bind', 'V', (), PRIV, bind)
+
+    pick = Asm(6, 1)  # this v5
+    pick.new(0, 'Landroid/content/Intent;')
+    pick.const_string(1, 'android.intent.action.OPEN_DOCUMENT')
+    pick.invoke('direct', M('Landroid/content/Intent;', '<init>', 'V', ('Ljava/lang/String;',)), [0, 1])
+    pick.const_string(1, 'android.intent.category.OPENABLE')
+    pick.invoke('virtual', M('Landroid/content/Intent;', 'addCategory', 'Landroid/content/Intent;', ('Ljava/lang/String;',)), [0, 1])
+    pick.const_string(1, '*/*')
+    pick.invoke('virtual', M('Landroid/content/Intent;', 'setType', 'Landroid/content/Intent;', ('Ljava/lang/String;',)), [0, 1])
+    pick.const(1, 7)
+    pick.invoke('virtual', M('Landroid/app/Activity;', 'startActivityForResult', 'V', ('Landroid/content/Intent;', 'I')), [5, 0, 1])
+    pick.ret()
+    dex.add_method(ACT, 'pickPlan', 'V', (), PUB, pick)
+
+    ru = Asm(12, 2)  # this v10, uri v11
+    ru.label('s')
+    ru.invoke('virtual', M('Landroid/app/Activity;', 'getContentResolver', 'Landroid/content/ContentResolver;'), [10], 0)
+    ru.invoke(
+        'virtual',
+        M('Landroid/content/ContentResolver;', 'openInputStream', 'Ljava/io/InputStream;', ('Landroid/net/Uri;',)),
+        [0, 11], 0,
+    )
+    ru.if_eqz(0, 'miss')
+    ru.new(1, 'Ljava/io/ByteArrayOutputStream;')
+    ru.invoke('direct', M('Ljava/io/ByteArrayOutputStream;', '<init>'), [1])
+    ru.const(2, 8192)
+    ru.new_array(3, 2, '[B')
+    ru.label('loop')
+    ru.invoke('virtual', M('Ljava/io/InputStream;', 'read', 'I', ('[B',)), [0, 3], 2, 'int')
+    ru.if_lez(2, 'done')
+    ru.const(4, 0)
+    ru.invoke('virtual', M('Ljava/io/ByteArrayOutputStream;', 'write', 'V', ('[B', 'I', 'I')), [1, 3, 4, 2])
+    ru.goto('loop')
+    ru.label('done')
+    ru.invoke('virtual', M('Ljava/io/InputStream;', 'close'), [0])
+    ru.const_string(2, 'UTF-8')
+    ru.invoke('virtual', M('Ljava/io/ByteArrayOutputStream;', 'toString', 'Ljava/lang/String;', ('Ljava/lang/String;',)), [1, 2], 0)
+    ru.ret(0, 'object')
+    ru.label('miss')
+    ru.const(0, 0)
+    ru.ret(0, 'object')
+    ru.label('h')
+    ru.move_exception(0)
+    ru.const(0, 0)
+    ru.ret(0, 'object')
+    ru.try_all('s', 'h', 'h')
+    dex.add_method(ACT, 'readUri', 'Ljava/lang/String;', ('Landroid/net/Uri;',), PRIV, ru)
+
+    tp = Asm(8, 3)  # this v5, result v6, data v7
+    tp.const(0, -1)
+    tp.if_ne(6, 0, 'out')
+    tp.if_eqz(7, 'out')
+    tp.invoke('virtual', M('Landroid/content/Intent;', 'getData', 'Landroid/net/Uri;'), [7], 1)
+    tp.if_eqz(1, 'out')
+    tp.invoke('direct', M(ACT, 'readUri', 'Ljava/lang/String;', ('Landroid/net/Uri;',)), [5, 1], 2)
+    tp.if_eqz(2, 'bad')
+    tp.invoke('virtual', M('Landroid/net/Uri;', 'getLastPathSegment', 'Ljava/lang/String;'), [1], 3)
+    tp.if_nez(3, 'named')
+    tp.const_string(3, '计划')
+    tp.label('named')
+    tp.invoke(
+        'virtual',
+        M(ACT, 'importPlan', 'Ljava/lang/String;', ('Ljava/lang/String;', 'Ljava/lang/String;')),
+        [5, 3, 2], 3,
+    )
+    tp.goto('wrote')
+    tp.label('bad')
+    tp.const_string(3, '这份计划读不了')
+    tp.label('wrote')
+    tp.invoke('virtual', M(ACT, 'note', 'V', ('Ljava/lang/String;',)), [5, 3])
+    tp.invoke('virtual', M(ACT, 'paint', 'V', ()), [5])
+    tp.label('out')
+    tp.ret()
+    dex.add_method(ACT, 'takePlan', 'V', ('I', 'Landroid/content/Intent;'), PRIV, tp)
 
 
 def _chrome(dex: DexBuilder):
@@ -1461,3 +1694,62 @@ def _hook(dex: DexBuilder):
         ('Lde/robv/android/xposed/callbacks/XC_LoadPackage$LoadPackageParam;',),
         PUB, hp,
     )
+
+
+def _tap(dex: DexBuilder):
+    dex.add_class(TAP, 'Ljava/lang/Object;', interfaces=('Landroid/view/View$OnClickListener;',))
+    dex.add_field(TAP, 'host', ACT, PUB)
+    dex.add_field(TAP, 'which', 'I', PUB)
+    init = Asm(3, 3)  # this v0, host v1, which v2
+    init.invoke('direct', M('Ljava/lang/Object;', '<init>'), [0])
+    init.iput(1, 0, F(TAP, 'host', ACT), 'object')
+    init.iput(2, 0, F(TAP, 'which', 'I'))
+    init.ret()
+    dex.add_method(TAP, '<init>', 'V', (ACT, 'I'), INIT, init)
+
+    click = Asm(8, 2)  # this v6, view v7
+    click.label('s')
+    click.iget(0, 6, F(TAP, 'host', ACT), 'object')
+    click.iget(1, 6, F(TAP, 'which', 'I'))
+    click.const(2, 0)
+    click.if_ne(1, 2, 'c1')
+    click.const_string(3, '0')
+    click.invoke('virtual', M(ACT, 'prepare', 'V', ('Ljava/lang/String;',)), [0, 3])
+    click.goto('done')
+    click.label('c1')
+    click.const(2, 1)
+    click.if_ne(1, 2, 'c2')
+    click.const_string(3, '1')
+    click.invoke('virtual', M(ACT, 'prepare', 'V', ('Ljava/lang/String;',)), [0, 3])
+    click.goto('done')
+    click.label('c2')
+    click.const(2, 2)
+    click.if_ne(1, 2, 'c3')
+    click.invoke('virtual', M(ACT, 'stop', 'V', ()), [0])
+    click.goto('done')
+    click.label('c3')
+    click.const(2, 3)
+    click.if_ne(1, 2, 'c4')
+    click.const(3, -5)
+    click.invoke('virtual', M(ACT, 'nudge', 'V', ('I',)), [0, 3])
+    click.goto('done')
+    click.label('c4')
+    click.const(2, 4)
+    click.if_ne(1, 2, 'c5')
+    click.const(3, 5)
+    click.invoke('virtual', M(ACT, 'nudge', 'V', ('I',)), [0, 3])
+    click.goto('done')
+    click.label('c5')
+    click.invoke('virtual', M(ACT, 'pickPlan', 'V', ()), [0])
+    click.label('done')
+    click.invoke('virtual', M(ACT, 'paint', 'V', ()), [0])
+    click.ret()
+    click.label('h')
+    click.move_exception(2)
+    click.iget(0, 6, F(TAP, 'host', ACT), 'object')
+    click.invoke('virtual', M('Ljava/lang/Throwable;', 'toString', 'Ljava/lang/String;'), [2], 2)
+    click.invoke('virtual', M(ACT, 'note', 'V', ('Ljava/lang/String;',)), [0, 2])
+    click.invoke('virtual', M(ACT, 'paint', 'V', ()), [0])
+    click.ret()
+    click.try_all('s', 'h', 'h')
+    dex.add_method(TAP, 'onClick', 'V', ('Landroid/view/View;',), PUB, click)
