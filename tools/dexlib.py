@@ -274,6 +274,26 @@ def audit_dex(blob: bytes) -> None:
             if code_off:
                 code_bounds(code_off)
 
+    # map 必须按偏移升序，并且最后一项就是 map 自己。按类型号排序会把 0x1000
+    # 插到数据段前面，ART 在进界面之前直接拒载整个 dex。
+    map_off = u32(52)
+    if map_off % 4:
+        raise RuntimeError('map_off not 4-aligned')
+    map_count = u32(map_off)
+    if map_count == 0:
+        raise RuntimeError('empty map')
+    prev = -1
+    for i in range(map_count):
+        typ, _unused, size, off = struct.unpack_from('<HHII', blob, map_off + 4 + i * 12)
+        if off < prev:
+            raise RuntimeError(f'map item {typ:#x} at {off} is before previous offset {prev}')
+        if size == 0:
+            raise RuntimeError(f'map item {typ:#x} has size 0')
+        prev = off
+        if i == map_count - 1:
+            if typ != 0x1000 or off != map_off or size != 1:
+                raise RuntimeError(f'map list item is not last: type={typ:#x} off={off}')
+
 
 def _s16(n: int) -> int:
     if not -32768 <= n <= 32767:
@@ -919,7 +939,8 @@ class DexBuilder:
         map_item(0x2000, len(self.classes), class_data_offs[0])
         map_item(0x2002, len(self.strings), string_offs[0])
         map_items.append((0x1000, 1, map_off))
-        map_items.sort()
+        # 按偏移排，不能按类型号排。0x1000 的偏移在文件末尾，按类型号会插到数据段前面。
+        map_items.sort(key=lambda item: item[2])
         map_blob = struct.pack('<I', len(map_items))
         for typ, size, off in map_items:
             map_blob += struct.pack('<HHII', typ, 0, size, off)
