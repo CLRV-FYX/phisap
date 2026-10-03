@@ -534,6 +534,92 @@ class AlgoredTest(unittest.TestCase):
                         covered += 1
             self.assertEqual(covered, 0, f'line {li} 有 {covered} 个点进了红场')
 
+    def test_stacked_notes_are_two_fingers(self):
+        """同一时刻、同一位置的两颗音符必须是两根分开的手指。
+
+        叠在同一个像素上, 设备会合成一次触摸, 另一颗直接漏。拆开要沿垂直方向,
+        投影不变, 也不能点进红场。
+        """
+        line = line_dict([note(32.0, 0.0, n_type=2)])
+        line['notesBelow'] = [note(32.0, 0.0, n_type=2)]
+        ch = chart_of(line)
+        ch.block_areas = [_block((0.0, 0.0), (0.08, 0.08), 0, 10)]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        judge = ch.judge_lines[0]
+        ms = round(judge.seconds(32.0) * 1000)
+        fingers = list(tl.at(ms).values())
+        self.assertGreaterEqual(len(fingers), 2, '两颗叠键只有一根手指, 另一颗会漏')
+        apart = min(math.hypot(a[0] - b[0], a[1] - b[1])
+                    for i, a in enumerate(fingers) for b in fingers[i + 1:])
+        self.assertGreaterEqual(apart, 36.0, fingers)
+        field = RedField.from_chart(ch)
+        for pos in fingers:
+            self.assertLess(abs(judge_offset(judge, ms, pos)), 8.0, pos)
+            self.assertFalse(field.contains(pos[0], pos[1], ms / 1000.0), pos)
+
+    def test_stacked_flick_pair_stays_apart(self):
+        """两颗叠在一起的红键, 滑动过程中也要分开, 不能滑着滑着又合成一根。"""
+        line = line_dict([note(32.0, 0.0, n_type=4)])
+        line['notesBelow'] = [note(32.0, 0.0, n_type=4)]
+        ch = chart_of(line)
+        ch.block_areas = [_block((0.0, 0.0), (0.08, 0.08), 0, 10)]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        judge = ch.judge_lines[0]
+        ms = round(judge.seconds(32.0) * 1000)
+        for t in (ms - 40, ms, ms + 40):
+            fingers = list(tl.at(t).values())
+            self.assertGreaterEqual(len(fingers), 2, t)
+            apart = min(math.hypot(a[0] - b[0], a[1] - b[1])
+                        for i, a in enumerate(fingers) for b in fingers[i + 1:])
+            self.assertGreaterEqual(apart, 36.0, (t, fingers))
+            for pos in fingers:
+                self.assertLess(abs(judge_offset(judge, t, pos)), 8.0, (t, pos))
+
+    def test_spread_does_not_enter_red(self):
+        """只有针尖大的空位时, 拆不开就叠着, 也不能把其中一根推进红场。"""
+        line = line_dict([note(32.0, 0.0, n_type=2)])
+        line['notesBelow'] = [note(32.0, 0.0, n_type=2)]
+        ch = chart_of(line)
+        ch.block_areas = [
+            _block((-1, -1), (2, 2), 0, 10),
+            _block((0.49, 0.485), (0.51, 0.515), 0, 10, subtract=True),
+        ]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        judge = ch.judge_lines[0]
+        ms = round(judge.seconds(32.0) * 1000)
+        self.assertTrue(tl.at(ms), '空位里的音符不能因为拆不开就跳过')
+        field = RedField.from_chart(ch)
+        for t, evs in ans.items():
+            for e in evs:
+                self.assertFalse(field.contains(e.pos[0], e.pos[1], t / 1000.0), (t, e.pos))
+
+    def test_spread_avoids_the_red_side(self):
+        """一侧是红场时, 往另一侧拆, 两根都不进红场。"""
+        line = line_dict([note(32.0, 0.0, n_type=2)])
+        line['notesBelow'] = [note(32.0, 0.0, n_type=2)]
+        ch = chart_of(line)
+        ch.block_areas = [_block((0.0, 0.0), (1.0, 0.42), 0, 10)]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        judge = ch.judge_lines[0]
+        ms = round(judge.seconds(32.0) * 1000)
+        fingers = list(tl.at(ms).values())
+        self.assertGreaterEqual(len(fingers), 2, fingers)
+        apart = min(math.hypot(a[0] - b[0], a[1] - b[1])
+                    for i, a in enumerate(fingers) for b in fingers[i + 1:])
+        self.assertGreaterEqual(apart, 36.0, fingers)
+        field = RedField.from_chart(ch)
+        for pos in fingers:
+            self.assertFalse(field.contains(pos[0], pos[1], ms / 1000.0), pos)
+            self.assertLess(abs(judge_offset(judge, ms, pos)), 8.0, pos)
+
 
 class OffsetPlanTest(unittest.TestCase):
     def test_shift_matches_offset(self):

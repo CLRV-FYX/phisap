@@ -11,6 +11,9 @@
 也没贴红边, 就停在原地, 不跟着跳。跟着跳会扫进红场, 然后一根接一根换手。
 换手要先按住新的, 至少重叠一帧, 再松开原来的; 同一毫秒一按一松, 长条会断。
 长条头优先落在原时刻的近处, 不贴 Good 外沿。
+同一时刻落在同一个点上的两颗音符不能收成一根手指: 一根手指只判一颗, 叠在同一个像素上
+设备还会把两次触摸合成一次, 另一颗直接漏。沿垂直方向拆开, 投影不变; 那边是红场就换一侧,
+实在挪不开就保持原位, 不点进红场。
 
 扫屏(algo3/algo3f)的手指会扫过红场, 扫到的那一下是无效点击, 不能用来打这种谱。
 """
@@ -28,7 +31,7 @@ from note import NoteType
 from .algo_base import (
     TouchAction, VirtualTouchEvent, hold_point, flick_path, flick_time_shift, note_state,
     recalc_pos, warn_pause_presses, pause_presses, MAX_POINTERS, JUDGE_HALF_WIDTH,
-    FLICK_START, FLICK_END, FLICK_RADIUS,
+    FLICK_START, FLICK_END, FLICK_RADIUS, PAUSE_BUTTON_BOX, PAUSE_EXIT_MARGIN,
 )
 from .algo2 import Frames, PointerAllocator, PID_REUSE_COOLDOWN_MS
 from .red_field import RED_CLEARANCE_PX, RedField
@@ -832,6 +835,172 @@ def _note_guard(chart: Chart):
     return level
 
 
+# 比这更近的两根手指, 设备会合成一次触摸。拆开至少这么远, 优先 56px, 投影尽量不动。
+_STACK_PX = 24.0
+_SEPARATE_PX = 36.0
+
+
+def _pos_at(e, ms: int):
+    """这根手指在 ms 的位置。抬起之后返回 None。"""
+    dt = ms - e['time']
+    path = e['path']
+    if e['kind'] == NoteType.HOLD:
+        if dt < 0:
+            return None
+        if dt == 0:
+            return e['pos']
+        if path and dt - 1 < len(path):
+            return path[dt - 1]
+        return None
+    if e['kind'] == NoteType.FLICK:
+        if path and 0 <= dt < len(path):
+            return path[dt]
+        return None
+    if 0 <= dt <= 8:
+        return e['pos']
+    return None
+
+
+def _spread_samples(e, ox: float, oy: float):
+    out = [(e['time'], e['pos'][0] + ox, e['pos'][1] + oy)]
+    path = e['path']
+    if not path:
+        return out
+    extra = 1 if e['kind'] == NoteType.HOLD else 0
+    idxs = list(range(0, len(path), 4))
+    if idxs[-1] != len(path) - 1:
+        idxs.append(len(path) - 1)
+    for i in idxs:
+        out.append((e['time'] + i + extra, path[i][0] + ox, path[i][1] + oy))
+    return out
+
+
+def _spread_clear(x: float, y: float, ms: int, field: RedField) -> bool:
+    if x < 2.0 or y < 2.0 or x > 1277.0 or y > 717.0:
+        return False
+    if x < PAUSE_BUTTON_BOX[0] + PAUSE_EXIT_MARGIN and y < PAUSE_BUTTON_BOX[1] + PAUSE_EXIT_MARGIN:
+        return False
+    return not field.contains(x, y, ms / 1000.0)
+
+
+def _spread_offset(e, field: RedField, committed, intrudes) -> dict | None:
+    """把这根手指挪开。垂直方向优先, 投影不变; 进红场、出屏幕、新盖住别的音符都不收。"""
+    sa, ca = math.sin(e['angle']), math.cos(e['angle'])
+    dirs = ((-sa, ca), (sa, -ca), (ca, sa), (-ca, -sa))
+    for dist in (56.0, 48.0, 40.0, 64.0, 72.0, 32.0):
+        for dx, dy in dirs:
+            nlen = math.hypot(dx, dy) or 1.0
+            ox, oy = dx / nlen * dist, dy / nlen * dist
+            samples = _spread_samples(e, ox, oy)
+            if not all(_spread_clear(x, y, ms, field) for ms, x, y in samples):
+                continue
+            if _spread_hits_finger(samples, committed, e):
+                continue
+            if any(intrudes(ms, _unoffset(e, ms), (x, y)) for ms, x, y in samples):
+                continue
+            return _apply_spread(e, ox, oy)
+    return None
+
+
+def _spread_hits_finger(samples, committed, e) -> bool:
+    for ms, x, y in samples:
+        for other in committed:
+            if other is e:
+                continue
+            op = _pos_at(other, ms)
+            if op is not None and math.hypot(op[0] - x, op[1] - y) < _SEPARATE_PX:
+                return True
+    return False
+
+
+def _unoffset(e, ms: int):
+    """偏移前这根手指在 ms 的位置, 用来判断新位置有没有多盖住别的音符。"""
+    pos = _pos_at(e, ms)
+    return pos if pos is not None else e['pos']
+
+
+def _apply_spread(e, ox: float, oy: float) -> dict:
+    pos = (e['pos'][0] + ox, e['pos'][1] + oy)
+    path = e['path']
+    if path is not None:
+        path = tuple((p[0] + ox, p[1] + oy) for p in path)
+        if e['kind'] == NoteType.FLICK and path:
+            pos = path[0]
+    out = dict(e)
+    out['pos'] = pos
+    out['path'] = path
+    if e['kind'] == NoteType.HOLD and e.get('hold_meta') is not None:
+        line, note, st, _, _, _ = e['hold_meta']
+        out['hold_meta'] = (line, note, st, len(path or ()), path, pos)
+    return out
+
+
+def _spread_emits(emits, field: RedField, chart: Chart) -> int:
+    """同一时刻叠在一起的音符拆成两根手指。拆不开就保持原位, 不点进红场。"""
+    items = []
+    for line in chart.judge_lines:
+        for n in line.notes_above + line.notes_below:
+            items.append((round(line.seconds(n.time) * 1000), line, n))
+    items.sort(key=lambda it: it[0])
+    times = [t for t, _, _ in items]
+
+    def intrudes(ms: int, old, new) -> bool:
+        if old is None:
+            return False
+        lo = bisect_left(times, ms - _STEAL_MS)
+        hi = bisect_right(times, ms + _STEAL_MS)
+        ox, oy = old
+        nx, ny = new
+        for nms, line, note in items[lo:hi]:
+            if abs(nms - ms) > _STEAL_MS:
+                continue
+            raw, sa, ca = note_state(line, note, ms)
+            old_hit = abs((ox - raw[0]) * ca + (oy - raw[1]) * sa) <= JUDGE_HALF_WIDTH
+            new_hit = abs((nx - raw[0]) * ca + (ny - raw[1]) * sa) <= JUDGE_HALF_WIDTH
+            if new_hit and not old_hit:
+                return True
+        return False
+
+    def clashes(e, committed):
+        hit = []
+        for other in committed:
+            if other is e:
+                continue
+            op = _pos_at(other, e['time'])
+            if op is None:
+                continue
+            if math.hypot(op[0] - e['pos'][0], op[1] - e['pos'][1]) < _STACK_PX:
+                hit.append(other)
+        return hit
+
+    order = {NoteType.HOLD: 0, NoteType.TAP: 1, NoteType.FLICK: 2, NoteType.DRAG: 3}
+    indexed = sorted(range(len(emits)), key=lambda i: (emits[i]['time'], order.get(emits[i]['kind'], 9), i))
+    committed = []
+    spread = 0
+    for i in indexed:
+        e = emits[i]
+        hit = clashes(e, committed)
+        if hit and e['kind'] == NoteType.HOLD:
+            for other in hit:
+                if other['kind'] == NoteType.HOLD:
+                    continue
+                alt = _spread_offset(other, field, [c for c in committed if c is not other] + [e], intrudes)
+                if alt is None:
+                    continue
+                other.clear()
+                other.update(alt)
+                spread += 1
+            hit = clashes(e, committed)
+        if hit:
+            alt = _spread_offset(e, field, committed, intrudes)
+            if alt is not None:
+                emits[i] = alt
+                e = alt
+                spread += 1
+        committed.append(e)
+    return spread
+
+
 def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stats: dict | None = None,
           relay: bool = True, warn_pause: bool = True) -> defaultdict[int, list[VirtualTouchEvent]]:
     field = RedField.from_chart(chart)
@@ -843,6 +1012,7 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
     frames = Frames()
     holds: dict[tuple[int, int], tuple] = {}
     heads: list[tuple[int, object, object]] = []
+    emits: list[dict] = []
     shifted = 0
     skipped = 0
     cuts = 0
@@ -966,10 +1136,13 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
                 for i, (st, hd, pts) in enumerate(segments):
                     path = tuple(pts)
                     tag = (li, ni) if i == 0 else (li, ni, st)
-                    holds[tag] = (line, note, st, len(path), path, hd)
                     _, sa_h, ca_h = note_state(line, note, st)
-                    frames[st].add(NoteType.HOLD, hd, math.atan2(sa_h, ca_h), path, tag=tag)
-                    heads.append((st, line, note))
+                    emits.append({
+                        'time': st, 'kind': NoteType.HOLD, 'pos': hd,
+                        'angle': math.atan2(sa_h, ca_h), 'path': path, 'tag': tag,
+                        'line': line, 'note': note,
+                        'hold_meta': (line, note, st, len(path), path, hd),
+                    })
             elif note.type == NoteType.FLICK:
                 emitted = False
                 for dt in _seek_dts():
@@ -980,7 +1153,11 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
                         shifted += 1
                     if dt:
                         waited += 1
-                    frames[ms + dt + FLICK_START].add(NoteType.FLICK, path[0], alpha, path)
+                    emits.append({
+                        'time': ms + dt + FLICK_START, 'kind': NoteType.FLICK, 'pos': path[0],
+                        'angle': alpha, 'path': path, 'tag': None,
+                        'line': line, 'note': note, 'hold_meta': None,
+                    })
                     emitted = True
                     break
                 if not emitted:
@@ -993,12 +1170,28 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
                 click_ms, (p, _), sa_i, ca_i = found
                 if click_ms != ms:
                     waited += 1
-                alpha_i = math.atan2(sa_i, ca_i)
-                frames[click_ms].add(note.type, p, alpha_i)
-                if note.type == NoteType.TAP:
-                    heads.append((click_ms, line, note))
+                emits.append({
+                    'time': click_ms, 'kind': note.type, 'pos': p,
+                    'angle': math.atan2(sa_i, ca_i), 'path': None, 'tag': None,
+                    'line': line, 'note': note, 'hold_meta': None,
+                })
+
+    spread = _spread_emits(emits, field, chart)
+    for e in emits:
+        if e['kind'] == NoteType.HOLD:
+            holds[e['tag']] = e['hold_meta']
+            frames[e['time']].add(NoteType.HOLD, e['pos'], e['angle'], e['path'], tag=e['tag'])
+            heads.append((e['time'], e['line'], e['note']))
+        elif e['kind'] == NoteType.FLICK:
+            frames[e['time']].add(NoteType.FLICK, e['path'][0], e['angle'], e['path'])
+        else:
+            frames[e['time']].add(e['kind'], e['pos'], e['angle'])
+            if e['kind'] == NoteType.TAP:
+                heads.append((e['time'], e['line'], e['note']))
 
     console.print(f'统计完毕，当前谱面共计{len(frames)}帧, 红场块{len(field.blocks)}个, 垂直挪出红场{shifted}处')
+    if spread:
+        console.print(f'同一位置的音符拆成两根手指, {spread}处')
     if waited:
         console.print(f'红场在动, {waited}个音符改到垂线让开的时刻按下')
     if skipped:
@@ -1042,6 +1235,7 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
         stats['red_waits'] = waited
         stats['red_handoffs'] = handoffs
         stats['red_prepress'] = prepress
+        stats['red_spreads'] = spread
     return events
 
 
