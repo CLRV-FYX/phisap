@@ -46,7 +46,10 @@ MAX_POINTERS = 16
 #      长条头优先 ±40ms, 不贴 Good 外沿, 免得 60fps 一帧顶出 ±80ms
 # v19: 换手至少重叠一帧再松原来的; 判定线瞬移时手指还在判定带里就停住, 不跳过红场
 # v20: 长条坐进垂线空位中间, 不再贴着红边跟着挪; 红场期间不再逐毫秒补 MOVE
-PLAN_CACHE_SUFFIX = '.ans.v20.json'
+# v21: 离开红边就停, 不走到空位正中间, 也不跟着判定线的垂直滑动跳;
+#      只有屏幕点马上进红场才剪掉旧手指。走到正中间会自己送进从中间长出来的红区,
+#      跟着跳又会一根接一根换手。
+PLAN_CACHE_SUFFIX = '.ans.v21.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):

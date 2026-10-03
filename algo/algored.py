@@ -6,8 +6,9 @@
 长条不能等红场盖到手指上再换: 红区从中间(或略偏两侧)长出来时, 要在它赶到之前
 先按住垂线上的空位, 新触点不松, 然后再松开原来的。这个新按下不能落进别的音符的
 判定窗: ±80ms 会把那个音符抢走, 再早到 180ms 是 Bad。同一侧还连得上的, 就提前挪过去,
-不扫过红场。空位比手指宽时坐到中间, 不贴着红边跟着挪:
-贴着边, 红场一快或晚一帧就进噪区。判定线瞬移时, 手指还在判定带里就停在原地, 不跟着跳过红场。
+不扫过红场。贴着红边才往里让一截, 不走到空位正中间: 红区常从中间长出来,
+走到正中间等于自己送进去。判定线沿垂直方向滑走时, 手指还在判定带里、
+也没贴红边, 就停在原地, 不跟着跳。跟着跳会扫进红场, 然后一根接一根换手。
 换手要先按住新的, 至少重叠一帧, 再松开原来的; 同一毫秒一按一松, 长条会断。
 长条头优先落在原时刻的近处, 不贴 Good 外沿。
 
@@ -51,15 +52,28 @@ def _red_ranges_ms(field: RedField) -> list[tuple[int, int]]:
     return merged
 
 
+# 贴着红边才往里让。已经离开边沿就停, 不要走到空位正中间:
+# 红区常从中间(略偏两侧)长出来, 走到正中间等于自己送进去。
+_LIP_PX = 48.0
+_LIP_INSET_PX = 64.0
+
+
 def _comfort_s(home, s: float) -> float | None:
-    """空位比手指宽时, 坐到中间。贴着红边跟着挪, 晚一帧就进噪区。"""
+    """只在贴着红边时往里让一截。已经离边够远就停, 不坐到空位正中间。"""
     if home is None:
         return None
     span = home[1] - home[0]
-    edge = min(s - home[0], home[1] - s)
-    if span > 64.0 and edge + 8.0 < span / 2:
-        return (home[0] + home[1]) / 2
-    return None
+    if span <= 64.0:
+        return None
+    left = s - home[0]
+    right = home[1] - s
+    if min(left, right) >= _LIP_PX:
+        return None
+    inset = min(_LIP_INSET_PX, span / 2)
+    target = home[0] + inset if left <= right else home[1] - inset
+    if abs(target - s) < 8.0:
+        return None
+    return target
 
 
 def _lift_red(events, field: RedField) -> int:
@@ -331,33 +345,58 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             return (0 if inside else 1, abs(c - prefer), -(b - a))
         return _inset(min(ivs, key=key), prefer)
 
-    def center_holds(ms: int, s: float, center: float) -> bool:
-        """往中间坐之前看一眼。中间马上被红场盖住、当前位置不会, 就不能走过去。
+    _holds_memo: dict[tuple, bool] = {}
 
-        换手按在边上的新手指, 红场还没到时整条垂线都是空位, 中间就是判定点。
-        不看这一眼, 新手指会走回判定点, 红场一到又得再换一次。
+    def center_holds(ms: int, s: float, center: float) -> bool:
+        """要去的那个偏移, 跟着判定线走的未来 400ms 会不会进红场。
+
+        不能只看这一毫秒的像素: 判定线一挪, 同一个偏移已经换了地方。
+        也不能只看现在的像素停着不动: 空位跟着判定线走时, 停着的点会自己掉出去,
+        然后被当成守不住, 一根接一根换手。
         """
-        dest = pos_of(ms, center)
+        key = (ms, round(center))
+        hit = _holds_memo.get(key)
+        if hit is not None:
+            return hit
+        ok = True
         for dt in range(0, 400, 40):
             u = ms + dt
             if u > end_ms + 8:
                 break
-            # 要去的那个点本身马上进红场, 就不能往那儿坐。
-            # 只看 s 还在不在空位里会漏: 判定线一挪, 同一个 s 的像素已经进红场了。
-            if field.contains(dest[0], dest[1], u / 1000.0):
-                return False
-            if _home(geom(u)[3], s) is not None and _home(geom(u)[3], center) is None:
-                return False
-        return True
+            if _home(geom(u)[3], center) is None or field.contains(*pos_of(u, center), u / 1000.0):
+                ok = False
+                break
+        _holds_memo[key] = ok
+        return ok
 
     def step(ms: int, s: float, toward: float | None = None):
-        home = _home(geom(ms)[3], s)
+        ivs = geom(ms)[3]
+        home = _home(ivs, s)
         if home is None:
-            return None
+            # 偏移滑出空位一小截。空位还在旁边就挪回去, 不要为此换手。
+            if toward is not None or not ivs:
+                return None
+            def _gap(iv):
+                a, b = iv
+                if a <= s <= b:
+                    return 0.0
+                return a - s if s < a else s - b
+            home = min(ivs, key=_gap)
+            if _gap(home) > 40.0:
+                return None
+            toward = _inset(home, s)
         if toward is None:
             cand = _comfort_s(home, s)
             if cand is not None and center_holds(ms, s, cand):
                 toward = cand
+            elif cand is not None:
+                # 整段落点还没确认时也先离开红边。贴着边晚一帧就进噪区;
+                # 只挪一步, 这一步本身不进红场, 也不走到空位正中间。
+                nudge = s + math.copysign(min(_STEP_PX, abs(cand - s)), cand - s)
+                nudge = min(max(nudge, home[0] + 1.0), home[1] - 1.0)
+                p = pos_of(ms, nudge)
+                if not field.contains(p[0], p[1], ms / 1000.0):
+                    toward = nudge
         target = _inset(home, s if toward is None else toward)
         if toward is not None:
             target = min(max(target, home[0]), home[1])
@@ -365,21 +404,37 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             target = s + math.copysign(_STEP_PX, target - s)
         return target
 
-    def forecast(ms: int, s: float, limit: int):
-        """当前偏移再往前, 最早哪一毫秒会掉出空位。中间遇到判定线瞬移就停, 那不是红场换边。
+    def forecast(ms: int, s: float, limit: int, screen=None):
+        """最早哪一毫秒守不住。
 
-        跟 step 同一套走法(空位宽就往中间坐)。按贴边来预报, 会把还坐得下的空位报成要断。
+        跟着走要跳很远或会扫进红场, 而屏幕点还在判定带里, 就当它停在原地。
+        按“跟着判定线滑”来预报, 会把还守得住的点报成要断, 然后一根接一根换手。
         """
+        pos = screen if screen is not None else pos_of(ms, s)
         cur = s
         last = min(limit, end_ms)
         for u in range(ms + 1, last + 1):
-            raw, prev = geom(u)[0], geom(u - 1)[0]
-            if math.hypot(raw[0] - prev[0], raw[1] - prev[1]) > _TELEPORT_PX:
-                return None
+            if should_camp(pos, u, cur):
+                cur = screen_s(u, pos)
+                continue
+            raw, prev_raw = geom(u)[0], geom(u - 1)[0]
+            if (math.hypot(raw[0] - prev_raw[0], raw[1] - prev_raw[1]) > _TELEPORT_PX
+                    and still_holding(pos, u) and not field.contains(pos[0], pos[1], u / 1000.0)):
+                cur = screen_s(u, pos)
+                continue
             nxt = step(u, cur, None)
             if nxt is None:
                 return u
-            cur = nxt
+            new = pos_of(u, nxt)
+            hit = (field.segment_hits(pos, new, u / 1000.0)
+                   or field.contains(new[0], new[1], u / 1000.0)
+                   or math.hypot(new[0] - pos[0], new[1] - pos[1]) > _TELEPORT_PX)
+            if hit:
+                if still_holding(pos, u) and not field.contains(pos[0], pos[1], u / 1000.0):
+                    cur = screen_s(u, pos)
+                    continue
+                return u
+            pos, cur = new, nxt
         return None
 
     def survival(s: float, ms: int) -> int:
@@ -482,6 +537,37 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
     def screen_s(ms: int, pos) -> float:
         raw, nx, ny, _ = geom(ms)
         return (pos[0] - raw[0]) * nx + (pos[1] - raw[1]) * ny
+
+    def camp(pos, ms: int) -> bool:
+        """这个屏幕点还判得中, 也不贴红边。判定线沿垂直方向滑走时, 停在这里比跟着跳安全。"""
+        if not still_holding(pos, ms):
+            return False
+        raw, nx, ny, ivs = geom(ms)
+        s = (pos[0] - raw[0]) * nx + (pos[1] - raw[1]) * ny
+        home = _home(ivs, s)
+        if home is None:
+            return False
+        edge = min(s - home[0], home[1] - s)
+        if edge < _LIP_PX and (home[1] - home[0]) > 80.0:
+            return False
+        along = (pos[0] - raw[0]) * ny - (pos[1] - raw[1]) * nx
+        return abs(along) <= JUDGE_HALF_WIDTH - 48.0
+
+    def should_camp(pos, ms: int, s: float) -> bool:
+        """停在这个屏幕点, 还是跟着当前偏移走。
+
+        跟着走是一小步、也不进红场, 就跟着走: 空位本身在动, 停住会掉出去再换手。
+        跟着走要跳很远或会扫进红场, 而这个点还守得住, 才停住。
+        """
+        if not camp(pos, ms):
+            return False
+        nxt = step(ms, s, None)
+        if nxt is None:
+            return True
+        new = pos_of(ms, nxt)
+        if field.contains(new[0], new[1], ms / 1000.0) or field.segment_hits(pos, new, ms / 1000.0):
+            return True
+        return math.hypot(new[0] - pos[0], new[1] - pos[1]) > _TELEPORT_PX
 
     def red_covers(pos, ms: int, horizon: int = 160):
         """手指停在 pos, 最早哪一毫秒会被红场盖住。这段里没有就 None。"""
@@ -588,16 +674,14 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             # 已经规划过危险时刻的, 把尾巴剪到抬起时刻。否则旧手指要在红场里多留一帧。
             keep = max(0, min(len(pts), lift - start))
             del pts[keep:]
-            # 重叠够了就不要把旧手指留到缝合上。贴着合拢的边再多留, 晚一帧就进红场。
+            # 重叠够了, 只有尾巴马上进红场才剪。判定线一滑, 同一个屏幕点的 s 会贴到
+            # 空位边上, 那不是贴红边。按 s 去剪, 会把还安全的手指提前松开, 新的一晚就断。
             overlapped = press + _OVERLAP_MS - start
             while len(pts) > overlapped:
                 t_tail = start + len(pts)
-                raw_t, nx_t, ny_t, ivs_t = geom(min(t_tail, end_ms))
                 tail = pts[-1]
-                s_tail = (tail[0] - raw_t[0]) * nx_t + (tail[1] - raw_t[1]) * ny_t
-                home_t = _home(ivs_t, s_tail)
-                edge_t = 0.0 if home_t is None else min(s_tail - home_t[0], home_t[1] - s_tail)
-                if edge_t >= 36.0 and not field.contains(tail[0], tail[1], t_tail / 1000.0):
+                if (not field.contains(tail[0], tail[1], t_tail / 1000.0)
+                        and red_covers(tail, t_tail, 32) is None):
                     break
                 pts.pop()
             if start + len(pts) < press + _MIN_OVERLAP_MS:
@@ -620,7 +704,7 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                 continue
             danger = None
             if (u & 7) == 0 or u == start + 1:
-                danger = forecast(u - 1, cur, u - 1 + _LOOKAHEAD_MS)
+                danger = forecast(u - 1, cur, u - 1 + _LOOKAHEAD_MS, prev)
                 if danger is None:
                     danger = red_covers(prev, u)
             if danger is not None and danger <= stop and want is None and tried != danger:
@@ -642,6 +726,10 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                         tried = danger
                     else:
                         want = slid
+            # 这个屏幕点还守得住, 就别跟着判定线的垂直滑动走, 也别往空位正中间凑。
+            if want is None and should_camp(prev, u, cur):
+                stay()
+                continue
             stepped = step(u, cur, want)
             if stepped is None:
                 if still_holding(prev, u):
@@ -692,7 +780,7 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
         # pick 会把点收进区间内部, 有时正好收进别的音符的判定带。干净的那个点还在就留在那儿。
         if occupied(click_ms, pos_of(click_ms, prefer_s)) < occupied(click_ms, pos_of(click_ms, s)):
             s = prefer_s
-    early = forecast(click_ms, s, click_ms + _LOOKAHEAD_MS)
+    early = forecast(click_ms, s, click_ms + _LOOKAHEAD_MS, pos_of(click_ms, s))
     if early is not None:
         found = refuge(early, s, click_ms)
         if found is not None and found[1] == click_ms and abs(found[0] - s) >= 8.0:

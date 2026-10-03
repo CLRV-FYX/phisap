@@ -491,10 +491,48 @@ class AlgoredTest(unittest.TestCase):
                     if home is None:
                         continue
                     edge = min(s - home[0], home[1] - s)
-                    wider = any(b - a > (home[1] - home[0]) + 80 for a, b in ivs)
-                    if edge <= 32 and (wider or home[1] - home[0] > 120):
+                    # 只算自己所在的宽缝。旁边那条更宽的缝如果隔着红场, 滑过去就是扫屏, 不能算没躲开。
+                    if edge <= 32 and home[1] - home[0] > 120:
                         lip_ms += 8
         self.assertLess(lip_ms, 80, '还在贴着红边坐, 宽空位不用')
+
+    def test_sliding_line_does_not_chain_handoffs(self):
+        """判定线沿垂直方向滑走时, 还守得住的屏幕点不能跟着跳, 更不能一根接一根换手。
+
+        Chart_AT 91485 那条长条, 判定线转到竖直之后音符沿水平方向来回滑。
+        停在垂线上的空位能撑到结束; 跟着滑就会扫进红场, 再换出一串手指。
+        多出来的按下会打出 Bad, 挤在一起的触点还会被合成一个, 抬一根就全断。
+        """
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Chart_AT.json')
+        if not os.path.isfile(path):
+            self.skipTest('没有 Chart_AT.json')
+        import json
+        from note import NoteType
+        from algo.algored import _note_guard, _plan_hold
+        with open(path, encoding='utf-8-sig') as f:
+            chart = Chart.from_dict(json.load(f))
+        field = RedField.from_chart(chart)
+        occupied = _note_guard(chart)
+        for li in (1, 2):
+            line = chart.judge_lines[li]
+            note = next(n for n in line.notes_above + line.notes_below
+                        if n.type == NoteType.HOLD and abs(round(line.seconds(n.time) * 1000) - 91485) < 5)
+            ms0 = round(line.seconds(note.time) * 1000)
+            end = ms0 + math.ceil(line.seconds(note.hold) * 1000)
+            guard = lambda t, pos, _n=note: occupied(t, pos, _n)
+            planned = _plan_hold(field, line, note, ms0, end, occupied=guard)
+            self.assertIsNotNone(planned, li)
+            segments, _pre = planned
+            self.assertLessEqual(len(segments), 2, f'line {li} 换手链没停, 段数 {len(segments)}')
+            covered = 0
+            for st, hd, pts in segments:
+                for k, p in enumerate([hd, *pts]):
+                    t = st + k
+                    if t > end:
+                        break
+                    if field.contains(p[0], p[1], t / 1000.0):
+                        covered += 1
+            self.assertEqual(covered, 0, f'line {li} 有 {covered} 个点进了红场')
 
 
 class OffsetPlanTest(unittest.TestCase):
