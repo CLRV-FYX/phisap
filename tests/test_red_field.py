@@ -448,6 +448,55 @@ class AlgoredTest(unittest.TestCase):
                         '很短的长条也要按下, 不能为了躲开后面的 tap 跳过')
 
 
+    def test_hold_does_not_camp_on_the_red_lip(self):
+        """空位比手指宽时, 不能贴着红边跟着挪。
+
+        Chart_AT 84208 那条长条, 缝宽几百像素, 旧规划却一直坐在离红边 28px 的唇上。
+        红场一快或注入晚一帧, 手指就进噪区, 同一处必断。
+        """
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Chart_AT.json')
+        if not os.path.isfile(path):
+            self.skipTest('没有 Chart_AT.json')
+        import json
+        from note import NoteType
+        from algo.algo_base import hold_point, note_state
+        from algo.algored import _normal, _note_guard, _plan_hold
+        with open(path, encoding='utf-8-sig') as f:
+            chart = Chart.from_dict(json.load(f))
+        field = RedField.from_chart(chart)
+        occupied = _note_guard(chart)
+        lip_ms = 0
+        for li in (1, 2):
+            line = chart.judge_lines[li]
+            note = next(n for n in line.notes_above + line.notes_below
+                        if n.type == NoteType.HOLD and abs(round(line.seconds(n.time) * 1000) - 84208) < 5)
+            ms0 = round(line.seconds(note.time) * 1000)
+            end = ms0 + math.ceil(line.seconds(note.hold) * 1000)
+            guard = lambda t, pos, _n=note: occupied(t, pos, _n)
+            planned = _plan_hold(field, line, note, ms0, end, occupied=guard)
+            self.assertIsNotNone(planned, li)
+            segments, _pre = planned
+            self.assertGreaterEqual(len(segments), 1)
+            for st, hd, pts in segments:
+                for k, p in enumerate([hd, *pts]):
+                    t = st + k
+                    if t > end or t % 8:
+                        continue
+                    raw = hold_point(line, note, t)
+                    _, sa, ca = note_state(line, note, t)
+                    nx, ny = _normal(sa, ca)
+                    s = (p[0] - raw[0]) * nx + (p[1] - raw[1]) * ny
+                    ivs = field.safe_intervals(raw[0], raw[1], sa, ca, t / 1000.0)
+                    home = next(((a, b) for a, b in ivs if a - 2 <= s <= b + 2), None)
+                    if home is None:
+                        continue
+                    edge = min(s - home[0], home[1] - s)
+                    wider = any(b - a > (home[1] - home[0]) + 80 for a, b in ivs)
+                    if edge <= 32 and (wider or home[1] - home[0] > 120):
+                        lip_ms += 8
+        self.assertLess(lip_ms, 80, '还在贴着红边坐, 宽空位不用')
+
+
 class OffsetPlanTest(unittest.TestCase):
     def test_shift_matches_offset(self):
         ch = chart_of(line_dict([note(0.0, 0.0)]))

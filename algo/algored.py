@@ -6,7 +6,8 @@
 长条不能等红场盖到手指上再换: 红区从中间(或略偏两侧)长出来时, 要在它赶到之前
 先按住垂线上的空位, 新触点不松, 然后再松开原来的。这个新按下不能落进别的音符的
 判定窗: ±80ms 会把那个音符抢走, 再早到 180ms 是 Bad。同一侧还连得上的, 就提前挪过去,
-不扫过红场。判定线瞬移时, 手指还在判定带里就停在原地, 不跟着跳过红场。
+不扫过红场。空位比手指宽时坐到中间, 不贴着红边跟着挪:
+贴着边, 红场一快或晚一帧就进噪区。判定线瞬移时, 手指还在判定带里就停在原地, 不跟着跳过红场。
 换手要先按住新的, 至少重叠一帧, 再松开原来的; 同一毫秒一按一松, 长条会断。
 长条头优先落在原时刻的近处, 不贴 Good 外沿。
 
@@ -50,33 +51,15 @@ def _red_ranges_ms(field: RedField) -> list[tuple[int, int]]:
     return merged
 
 
-def _pin_hold_paths(events, holds, hold_pointer, field: RedField) -> None:
-    """长条轨迹被精简后, 手指会在两次 MOVE 之间停住。红场若在这几毫秒里移过来, 停着的手指就进了红场。
-
-    红场活动期间按规划好的(已经躲开红场的)轨迹逐毫秒补 MOVE, 手指才跟得上。
-    """
-    for tag, info in holds.items():
-        pid = hold_pointer.get(tag)
-        if pid is None:
-            continue
-        ms, hold_ms, path, head = info[2], info[3], info[4], info[5]
-        for offset in range(0, hold_ms + 1):
-            t_ms = ms + offset
-            if not field.active(t_ms / 1000.0):
-                continue
-            pos = head if offset == 0 else path[offset - 1]
-            evs = events.get(t_ms)
-            if not evs:
-                events[t_ms] = [VirtualTouchEvent(pos, TouchAction.MOVE, pid)]
-                continue
-            replaced = False
-            for i, e in enumerate(evs):
-                if e.pointer == pid and e.action == TouchAction.MOVE:
-                    evs[i] = VirtualTouchEvent(pos, TouchAction.MOVE, pid)
-                    replaced = True
-                    break
-            if not replaced and not any(e.pointer == pid and e.action == TouchAction.DOWN for e in evs):
-                evs.append(VirtualTouchEvent(pos, TouchAction.MOVE, pid))
+def _comfort_s(home, s: float) -> float | None:
+    """空位比手指宽时, 坐到中间。贴着红边跟着挪, 晚一帧就进噪区。"""
+    if home is None:
+        return None
+    span = home[1] - home[0]
+    edge = min(s - home[0], home[1] - s)
+    if span > 64.0 and edge + 8.0 < span / 2:
+        return (home[0] + home[1]) / 2
+    return None
 
 
 def _lift_red(events, field: RedField) -> int:
@@ -348,10 +331,33 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             return (0 if inside else 1, abs(c - prefer), -(b - a))
         return _inset(min(ivs, key=key), prefer)
 
+    def center_holds(ms: int, s: float, center: float) -> bool:
+        """往中间坐之前看一眼。中间马上被红场盖住、当前位置不会, 就不能走过去。
+
+        换手按在边上的新手指, 红场还没到时整条垂线都是空位, 中间就是判定点。
+        不看这一眼, 新手指会走回判定点, 红场一到又得再换一次。
+        """
+        dest = pos_of(ms, center)
+        for dt in range(0, 400, 40):
+            u = ms + dt
+            if u > end_ms + 8:
+                break
+            # 要去的那个点本身马上进红场, 就不能往那儿坐。
+            # 只看 s 还在不在空位里会漏: 判定线一挪, 同一个 s 的像素已经进红场了。
+            if field.contains(dest[0], dest[1], u / 1000.0):
+                return False
+            if _home(geom(u)[3], s) is not None and _home(geom(u)[3], center) is None:
+                return False
+        return True
+
     def step(ms: int, s: float, toward: float | None = None):
         home = _home(geom(ms)[3], s)
         if home is None:
             return None
+        if toward is None:
+            cand = _comfort_s(home, s)
+            if cand is not None and center_holds(ms, s, cand):
+                toward = cand
         target = _inset(home, s if toward is None else toward)
         if toward is not None:
             target = min(max(target, home[0]), home[1])
@@ -360,27 +366,25 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
         return target
 
     def forecast(ms: int, s: float, limit: int):
-        """当前偏移再往前, 最早哪一毫秒会掉出空位。中间遇到判定线瞬移就停, 那不是红场换边。"""
+        """当前偏移再往前, 最早哪一毫秒会掉出空位。中间遇到判定线瞬移就停, 那不是红场换边。
+
+        跟 step 同一套走法(空位宽就往中间坐)。按贴边来预报, 会把还坐得下的空位报成要断。
+        """
         cur = s
         last = min(limit, end_ms)
         for u in range(ms + 1, last + 1):
             raw, prev = geom(u)[0], geom(u - 1)[0]
             if math.hypot(raw[0] - prev[0], raw[1] - prev[1]) > _TELEPORT_PX:
                 return None
-            home = _home(geom(u)[3], cur)
-            if home is None:
-                return u
-            nxt = _inset(home, cur)
-            if abs(nxt - cur) > _STEP_PX:
-                nxt = cur + math.copysign(_STEP_PX, nxt - cur)
-            if not (home[0] <= nxt <= home[1]):
+            nxt = step(u, cur, None)
+            if nxt is None:
                 return u
             cur = nxt
         return None
 
     def survival(s: float, ms: int) -> int:
         lived = 0
-        for k in range(0, 180, 8):
+        for k in range(0, 360, 8):
             u = ms + k
             if u > end_ms or not safe_s(u, s):
                 break
@@ -424,9 +428,10 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                 lived = survival(s, danger)
                 for lvl, press in found_at.items():
                     lead = danger - press
-                    # 重叠不够就换不了手: 有提前量的按下(哪怕只擦到已经判过的音符)优先于
-                    # 刚好踩在危险时刻的干净按下。干净仍然优先于擦边, 但都要来得及重叠。
-                    key = (0 if lead >= _OVERLAP_MS else 1, lvl, -lead, -lived, -(b - a), abs(s - avoid))
+                    depth = min(s - a, b - s)
+                    # 重叠不够就换不了手。干净优先于擦边, 但都要来得及重叠。
+                    # 同样来得及时坐进空位深处, 不按在唇上: 唇上那一下取整就会进红场。
+                    key = (0 if lead >= _OVERLAP_MS else 1, lvl, -lead, -lived, -depth, abs(s - avoid))
                     if best is None or key < best[0]:
                         best = (key, s, press)
         return None if best is None else (best[1], best[2])
@@ -531,7 +536,9 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             """新手指在 press 按下, 旧手指在红场盖到之前抬起。重叠不够就不要换。"""
             nonlocal prepress, u, cur, prev, prev_raw, want
             press = max(int(press), start)
-            if press >= stop or (press <= start and abs(ref_s - cur) < 8.0):
+            # 刚按下的手指不能在同一毫秒再换一次。换出去的位置若自己也不稳,
+            # 会在这一毫秒上无限换手, 把触点名额吃光。
+            if press >= stop or press <= start + 8:
                 return None
             lift = min(stop, leave_at - _LIFT_EARLY_MS)
             # 空位消失往往还没进红场。旧手指抬得太早, 新的只重叠了几毫秒, 一帧就断。
@@ -581,6 +588,18 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
             # 已经规划过危险时刻的, 把尾巴剪到抬起时刻。否则旧手指要在红场里多留一帧。
             keep = max(0, min(len(pts), lift - start))
             del pts[keep:]
+            # 重叠够了就不要把旧手指留到缝合上。贴着合拢的边再多留, 晚一帧就进红场。
+            overlapped = press + _OVERLAP_MS - start
+            while len(pts) > overlapped:
+                t_tail = start + len(pts)
+                raw_t, nx_t, ny_t, ivs_t = geom(min(t_tail, end_ms))
+                tail = pts[-1]
+                s_tail = (tail[0] - raw_t[0]) * nx_t + (tail[1] - raw_t[1]) * ny_t
+                home_t = _home(ivs_t, s_tail)
+                edge_t = 0.0 if home_t is None else min(s_tail - home_t[0], home_t[1] - s_tail)
+                if edge_t >= 36.0 and not field.contains(tail[0], tail[1], t_tail / 1000.0):
+                    break
+                pts.pop()
             if start + len(pts) < press + _MIN_OVERLAP_MS:
                 pts[:], u, cur, prev, prev_raw, want = saved
                 return None
@@ -910,7 +929,8 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
         console.print(f'[yellow]警告: 有{len(allocator.dropped)}个音符因同时需要超过{max_pointers}个触点而无法执行'
                       f'(首次出现在{allocator.dropped[0][0]}ms)[/yellow]')
     events = allocator.done()
-    _pin_hold_paths(events, holds, allocator.hold_pointer, field)
+    # 不在红场期间逐毫秒补 MOVE。轨迹本身已经躲开红场, thin_path 的位置误差只有几像素;
+    # 每毫秒每根手指都发一次, 注入会越积越晚, 贴边的手指正好在红场赶到时才跟上。
     pool = [p.id for p in allocator.pointers]
     if stats is not None:
         stats['dropped'] = len(allocator.dropped)

@@ -45,7 +45,8 @@ MAX_POINTERS = 16
 # v18: 换手的新按下不再落进别的音符的判定窗(不抢判定、不打出 Bad);
 #      长条头优先 ±40ms, 不贴 Good 外沿, 免得 60fps 一帧顶出 ±80ms
 # v19: 换手至少重叠一帧再松原来的; 判定线瞬移时手指还在判定带里就停住, 不跳过红场
-PLAN_CACHE_SUFFIX = '.ans.v19.json'
+# v20: 长条坐进垂线空位中间, 不再贴着红边跟着挪; 红场期间不再逐毫秒补 MOVE
+PLAN_CACHE_SUFFIX = '.ans.v20.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
