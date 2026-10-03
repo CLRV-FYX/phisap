@@ -1,5 +1,6 @@
 """噪点红场: 几何模型, 以及 algored 把触点放在红场外。"""
 import io
+import math
 import os
 import unittest
 
@@ -313,6 +314,62 @@ class AlgoredTest(unittest.TestCase):
         self.assertTrue(ys)
         # 这块红场是比例 y 0.4~0.6, 屏幕 y 288~432。整段都要停在同一侧, 不能扫过红场。
         self.assertTrue(all(y < 288 for y in ys) or all(y > 432 for y in ys), ys)
+
+    def test_hold_prepresses_before_red_comes_out_of_the_middle(self):
+        """红区从中间略偏两侧冒出来时, 不能等它盖住再换手。
+
+        长条已经按在判定点上。红场赶到之前, 要先在垂线的空位上按住不放,
+        然后再松开原来的触点。两边同时松、或旧手指留在红区里, 长条都会断。
+        """
+        ch = chart_of(line_dict([note(32.0, 0.0, n_type=3, hold=64.0)]))
+        # 0.9s 起中间一条横带挡点击, 略偏上。垂线上下都还有空位, 但中间已经过不去。
+        ch.block_areas = [_block((0.25, 0.42), (0.75, 0.62), 0.90, 1.20)]
+        ans = algored.solve(ch, quiet(), 16)
+        tl = Timeline(ans)
+        self.assertFalse(tl.errors, tl.errors)
+        field = RedField.from_chart(ch)
+        line = ch.judge_lines[0]
+        hold = line.notes_above[0]
+        ms0 = round(line.seconds(hold.time) * 1000)
+        end = ms0 + math.ceil(line.seconds(hold.hold) * 1000)
+        red_at = 900
+        self.assertTrue(field.contains(640, 360, red_at / 1000.0), '测试前提: 红场盖住判定点')
+        self.assertFalse(field.contains(640, 200, red_at / 1000.0))
+        self.assertFalse(field.contains(640, 520, red_at / 1000.0))
+
+        def outside(ms):
+            return [pos for pos in tl.at(ms).values()
+                    if abs(judge_offset(line, ms, pos)) < 8 and not field.contains(pos[0], pos[1], ms / 1000.0)]
+
+        # 红场出现前至少 40ms, 空位上已经有一只按着的手指。原来的触点这时还可以留在中间。
+        early = outside(red_at - 40)
+        self.assertTrue(early, '红场赶到之前就要按在垂线空位上')
+        self.assertTrue(any(pos[1] < 250 or pos[1] > 440 for pos in early), early)
+        # 原来的中间触点要在红场盖住之前松开, 不能留到红区里。
+        self.assertFalse(any(abs(pos[1] - 360) < 40 for pos in tl.at(red_at - 16).values()),
+                         tl.at(red_at - 16))
+        # 新旧重叠: 新的已经按在空位上, 原来的还没松。
+        overlap = [ms for ms in range(red_at - 80, red_at) if len(tl.at(ms)) >= 2 and outside(ms)]
+        self.assertTrue(overlap, '新触点按住之后才能松开原来的')
+        self.assertLess(max(ms for ms, evs in ans.items()
+                            if any(e.action == TouchAction.UP for e in evs) and ms < red_at), red_at)
+        # 红场出现之后, 判定点上不能还留着手指, 空位上的那只要继续按。
+        for ms in range(red_at, red_at + 80, 10):
+            fingers = tl.at(ms)
+            for pos in fingers.values():
+                self.assertFalse(field.contains(pos[0], pos[1], ms / 1000.0), (ms, pos))
+            self.assertTrue(outside(ms), (ms, fingers))
+        # 整段长条都有手指在判定带里, 不能断。
+        gap = 0
+        worst = 0
+        for ms in range(ms0, end + 1, 4):
+            if outside(ms):
+                worst = max(worst, gap)
+                gap = 0
+            else:
+                gap += 4
+        worst = max(worst, gap)
+        self.assertLess(worst, 40, '长条中间断开超过一帧')
 
 
 class OffsetPlanTest(unittest.TestCase):

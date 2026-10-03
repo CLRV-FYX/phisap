@@ -40,7 +40,9 @@ MAX_POINTERS = 16
 # v15: 红场在动, 只躲这一毫秒的位置; 这一下没缝就在判定窗里等它让开
 # v16: 红场按 4.0.1 原生判定几何(只在 enable 区间、正确缓动和缩放锚点);
 #      规划窗优先 Perfect ±40ms, 最远 Good ±80ms
-PLAN_CACHE_SUFFIX = '.ans.v16.json'
+# v17: 长条在红场赶到之前先按在垂线空位上, 接住之后再松开原来的触点;
+#      不再贴着红边, 也不把判定线瞬移当成扫过红场
+PLAN_CACHE_SUFFIX = '.ans.v17.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
