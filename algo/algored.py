@@ -6,7 +6,9 @@
 长条不能等红场盖到手指上再换: 红区从中间(或略偏两侧)长出来时, 要在它赶到之前
 先按住垂线上的空位, 新触点不松, 然后再松开原来的。这个新按下不能落进别的音符的
 判定窗: ±80ms 会把那个音符抢走, 再早到 180ms 是 Bad。同一侧还连得上的, 就提前挪过去,
-不扫过红场, 也不把判定线瞬移当成换边。长条头优先落在 Perfect(±40ms), 不贴 Good 外沿。
+不扫过红场。判定线瞬移时, 手指还在判定带里就停在原地, 不跟着跳过红场。
+换手要先按住新的, 至少重叠一帧, 再松开原来的; 同一毫秒一按一松, 长条会断。
+长条头优先落在原时刻的近处, 不贴 Good 外沿。
 
 扫屏(algo3/algo3f)的手指会扫过红场, 扫到的那一下是无效点击, 不能用来打这种谱。
 """
@@ -235,9 +237,12 @@ def _flick_outside(field: RedField, line, note, center_ms: int):
 
 
 # 新触点要比红场赶到早这么久按下, 旧触点再早这么久抬起。给注入延迟和一帧采样留空档,
-# 不能等红场已经盖住再换手。
+# 不能等红场已经盖住再换手。重叠不够一帧就不要换: 同一毫秒按下又松开, 游戏先处理抬起,
+# 长条会断。
 _PRESS_LEAD_MS = 48
 _LIFT_EARLY_MS = 48
+_OVERLAP_MS = 80
+_MIN_OVERLAP_MS = 32
 # 要提前看到红场: 别的音符的 Bad 窗有 180ms, 等到只剩 112ms 再换手, 新按下已经落在窗里。
 _LOOKAHEAD_MS = 300
 _SLIDE_MAX_PX = 70.0
@@ -403,7 +408,9 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                 if abs(s - avoid) < 10.0 and a - 2 <= avoid <= b + 2 and b - a < 120:
                     continue
                 found_at = {}
-                for t in range(max(now, click_ms), danger, 4):
+                # 发现得晚也要往回找。等到红场贴到手指上才搜, 搜索区间是空的, 只能和抬起挤在同一毫秒。
+                earliest = max(click_ms, danger - _LOOKAHEAD_MS)
+                for t in range(earliest, danger, 4):
                     if not safe_s(t, s) or field.contains(*pos_of(t, s), t / 1000.0):
                         continue
                     got = guard_level(t, s)
@@ -417,8 +424,9 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                 lived = survival(s, danger)
                 for lvl, press in found_at.items():
                     lead = danger - press
-                    # 完全不碰到别的音符, 优先于“只擦到已经过了 Good 的”。同样干净时尽早按住。
-                    key = (lvl, 0 if lead >= _PRESS_LEAD_MS else 1, -lead, -lived, -(b - a), abs(s - avoid))
+                    # 重叠不够就换不了手: 有提前量的按下(哪怕只擦到已经判过的音符)优先于
+                    # 刚好踩在危险时刻的干净按下。干净仍然优先于擦边, 但都要来得及重叠。
+                    key = (0 if lead >= _OVERLAP_MS else 1, lvl, -lead, -lived, -(b - a), abs(s - avoid))
                     if best is None or key < best[0]:
                         best = (key, s, press)
         return None if best is None else (best[1], best[2])
@@ -456,6 +464,28 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                 best = (key, target)
         return None if best is None else best[1]
 
+    def still_holding(pos, ms: int) -> bool:
+        """这个屏幕坐标此刻还判得中这条长条, 而且没进红场。"""
+        if ms < click_ms or ms > end_ms + 8:
+            return False
+        raw, nx, ny, _ = geom(ms)
+        along = (pos[0] - raw[0]) * ny - (pos[1] - raw[1]) * nx
+        if abs(along) > JUDGE_HALF_WIDTH - 8.0:
+            return False
+        return not field.contains(pos[0], pos[1], ms / 1000.0)
+
+    def screen_s(ms: int, pos) -> float:
+        raw, nx, ny, _ = geom(ms)
+        return (pos[0] - raw[0]) * nx + (pos[1] - raw[1]) * ny
+
+    def red_covers(pos, ms: int, horizon: int = 160):
+        """手指停在 pos, 最早哪一毫秒会被红场盖住。这段里没有就 None。"""
+        last = min(end_ms, ms + horizon)
+        for t in range(ms, last + 1, 4):
+            if field.contains(pos[0], pos[1], t / 1000.0):
+                return t
+        return None
+
     prepress = 0
 
     def cover(start: int, s: float, stop: int, depth: int = 0):
@@ -487,52 +517,107 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
         want = None
         tried = None
         u = start + 1
+
+        def stay():
+            nonlocal u, cur, prev, prev_raw, want
+            raw = geom(u)[0]
+            cur = screen_s(u, prev)
+            pts.append(prev)
+            prev_raw = raw
+            want = None
+            u += 1
+
+        def commit_handoff(press, ref_s, leave_at):
+            """新手指在 press 按下, 旧手指在红场盖到之前抬起。重叠不够就不要换。"""
+            nonlocal prepress, u, cur, prev, prev_raw, want
+            press = max(int(press), start)
+            if press >= stop or (press <= start and abs(ref_s - cur) < 8.0):
+                return None
+            lift = min(stop, leave_at - _LIFT_EARLY_MS)
+            # 空位消失往往还没进红场。旧手指抬得太早, 新的只重叠了几毫秒, 一帧就断。
+            # 红场真正盖上来之前能多留, 就留到重叠够。
+            want_lift = press + _OVERLAP_MS
+            if lift < want_lift:
+                red_t = red_covers(prev, max(start, u - 1), max(8, want_lift - start + _LIFT_EARLY_MS))
+                cap = stop if red_t is None else red_t - _LIFT_EARLY_MS
+                lift = min(stop, max(lift, min(want_lift, cap)))
+            if lift < press + _MIN_OVERLAP_MS:
+                if leave_at - 4 >= press + _MIN_OVERLAP_MS:
+                    lift = press + _MIN_OVERLAP_MS
+                else:
+                    return None
+            saved = (list(pts), u, cur, prev, prev_raw, want)
+            while u <= lift and u <= stop:
+                raw = geom(u)[0]
+                if (math.hypot(raw[0] - prev_raw[0], raw[1] - prev_raw[1]) > _TELEPORT_PX
+                        and still_holding(prev, u)):
+                    pts.append(prev)
+                    prev_raw = raw
+                    cur = screen_s(u, prev)
+                    u += 1
+                    continue
+                stepped = step(u, cur, None)
+                if stepped is None:
+                    if still_holding(prev, u):
+                        pts.append(prev)
+                        prev_raw = raw
+                        cur = screen_s(u, prev)
+                        u += 1
+                        continue
+                    break
+                p = pos_of(u, stepped)
+                if (field.segment_hits(prev, p, u / 1000.0) or field.contains(p[0], p[1], u / 1000.0)
+                        or math.hypot(p[0] - prev[0], p[1] - prev[1]) > _TELEPORT_PX):
+                    if still_holding(prev, u):
+                        pts.append(prev)
+                        prev_raw = raw
+                        cur = screen_s(u, prev)
+                        u += 1
+                        continue
+                    break
+                pts.append(p)
+                prev, prev_raw, cur = p, raw, stepped
+                u += 1
+            # 已经规划过危险时刻的, 把尾巴剪到抬起时刻。否则旧手指要在红场里多留一帧。
+            keep = max(0, min(len(pts), lift - start))
+            del pts[keep:]
+            if start + len(pts) < press + _MIN_OVERLAP_MS:
+                pts[:], u, cur, prev, prev_raw, want = saved
+                return None
+            prepress += 1
+            rest = cover(press, ref_s, stop, depth + 1)
+            if not rest:
+                prepress -= 1
+                pts[:], u, cur, prev, prev_raw, want = saved
+                return None
+            return [(start, head, pts)] + rest
+
         while u <= stop:
             raw = geom(u)[0]
-            if math.hypot(raw[0] - prev_raw[0], raw[1] - prev_raw[1]) > _TELEPORT_PX:
-                ns = pick(u, 0.0)
-                if ns is None or field.contains(*pos_of(u, ns), u / 1000.0):
-                    segs = [(start, head, pts)]
-                    segs.extend(cover(u, 0.0, stop, depth + 1))
-                    return segs
-                cur = ns
-                want = None
-                p = pos_of(u, cur)
-                pts.append(p)
-                prev, prev_raw = p, raw
-                u += 1
+            # 判定线瞬移, 但手指还在判定带里、也没进红场。跟着跳会扫过红场, 拆成两段又没有重叠。停住。
+            if (math.hypot(raw[0] - prev_raw[0], raw[1] - prev_raw[1]) > _TELEPORT_PX
+                    and still_holding(prev, u)):
+                stay()
                 continue
             danger = None
             if (u & 7) == 0 or u == start + 1:
                 danger = forecast(u - 1, cur, u - 1 + _LOOKAHEAD_MS)
+                if danger is None:
+                    danger = red_covers(prev, u)
             if danger is not None and danger <= stop and want is None and tried != danger:
                 found = refuge(danger, cur, u - 1)
                 if found is not None:
                     ref_s, press = found
-                    # 危险时刻两边已经隔着红场。现在滑过去会穿过它要出现的位置, 只能先按住再松原来的。
                     separated = _home(geom(min(danger, end_ms))[3], cur) is None
                     if (not separated and abs(ref_s - cur) <= _SLIDE_MAX_PX
                             and slide_clear(u - 1, cur, ref_s, min(max(u, danger - _LIFT_EARLY_MS), stop))):
                         want = ref_s
-                    elif not (press <= start and abs(ref_s - cur) < 8.0):
-                        press = max(press, start)
-                        lift = min(stop, max(press, danger - _LIFT_EARLY_MS))
-                        while u <= lift:
-                            stepped = step(u, cur, want)
-                            if stepped is None:
-                                break
-                            p = pos_of(u, stepped)
-                            if field.segment_hits(prev, p, u / 1000.0) or field.contains(p[0], p[1], u / 1000.0):
-                                break
-                            pts.append(p)
-                            prev, prev_raw, cur = p, geom(u)[0], stepped
-                            u += 1
-                        segs = [(start, head, pts)]
-                        prepress += 1
-                        segs.extend(cover(press, ref_s, stop, depth + 1))
-                        return segs
+                    else:
+                        handed = commit_handoff(press, ref_s, danger)
+                        if handed is not None:
+                            return handed
+                        tried = danger
                 else:
-                    # 每个能按的点都会误触。能不过红场滑走就滑, 不能滑也不打出 Bad。
                     slid = slide_target(u - 1, cur, danger)
                     if slid is None:
                         tried = danger
@@ -540,22 +625,40 @@ def _plan_hold(field: RedField, line, note, click_ms: int, end_ms: int, occupied
                         want = slid
             stepped = step(u, cur, want)
             if stepped is None:
-                found = refuge(min(u + 1, stop), cur, u)
-                segs = [(start, head, pts)]
+                if still_holding(prev, u):
+                    stay()
+                    continue
+                found = refuge(min(u + _LIFT_EARLY_MS, stop), cur, u)
                 if found is not None:
-                    prepress += 1
-                    segs.extend(cover(max(found[1], u), found[0], stop, depth + 1))
-                else:
-                    segs.extend(cover(u + 1, cur, stop, depth + 1))
-                return segs
+                    handed = commit_handoff(found[1], found[0], u)
+                    if handed is not None:
+                        return handed
+                # 不能换手, 也不进红场。停在还能判的位置; 已经进了就到此为止。
+                if not field.contains(prev[0], prev[1], u / 1000.0):
+                    stay()
+                    continue
+                return [(start, head, pts)]
             p = pos_of(u, stepped)
-            if field.segment_hits(prev, p, u / 1000.0) or field.contains(p[0], p[1], u / 1000.0):
-                found = refuge(min(u + 8, stop), cur, u)
-                segs = [(start, head, pts)]
-                if found is not None and abs(found[0] - cur) >= 8.0:
-                    prepress += 1
-                    segs.extend(cover(max(found[1], u), found[0], stop, depth + 1))
-                return segs
+            far = math.hypot(p[0] - prev[0], p[1] - prev[1]) > _TELEPORT_PX
+            blocked = field.segment_hits(prev, p, u / 1000.0) or field.contains(p[0], p[1], u / 1000.0)
+            if (far or blocked) and still_holding(prev, u):
+                soon = red_covers(prev, u, _LIFT_EARLY_MS + _OVERLAP_MS)
+                if soon is not None and tried != soon:
+                    found = refuge(soon, cur, u)
+                    if found is not None:
+                        handed = commit_handoff(found[1], found[0], soon)
+                        if handed is not None:
+                            return handed
+                    tried = soon
+                stay()
+                continue
+            if blocked:
+                found = refuge(min(u + _LIFT_EARLY_MS, stop), cur, u)
+                if found is not None:
+                    handed = commit_handoff(found[1], found[0], u)
+                    if handed is not None:
+                        return handed
+                return [(start, head, pts)]
             pts.append(p)
             prev, prev_raw, cur = p, raw, stepped
             if want is not None and abs(cur - want) < 4.0:
@@ -700,6 +803,11 @@ def solve(chart: Chart, console: Console, max_pointers: int = MAX_POINTERS, stat
         clean = [s for s, pos in near if guard(ms0, pos, note) == 0]
         if clean:
             return ms0, min(clean, key=abs)
+        # 原时刻没有完全干净的点, 但有不打出 Bad 的近点。挪到稍后去换一个很远的偏移,
+        # 判定线一转, 一帧延迟就把触点推出判定带, 这条长条根本没头。原时刻按下。
+        soft = [s for s, pos in near if guard(ms0, pos, note) <= 1]
+        if soft:
+            return ms0, min(soft, key=abs)
         best = None
         bands = ((0, 0, 40), (1, 44, _SEEK_COMFORT_MS), (2, _SEEK_COMFORT_MS + 4, _SEEK_MS))
         for band, lo, hi in bands:

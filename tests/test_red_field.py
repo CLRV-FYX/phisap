@@ -351,6 +351,8 @@ class AlgoredTest(unittest.TestCase):
         # 新旧重叠: 新的已经按在空位上, 原来的还没松。
         overlap = [ms for ms in range(red_at - 80, red_at) if len(tl.at(ms)) >= 2 and outside(ms)]
         self.assertTrue(overlap, '新触点按住之后才能松开原来的')
+        # 同一毫秒按下又松开, 游戏先处理抬起, 长条会断。至少重叠一帧以上。
+        self.assertGreaterEqual(max(overlap) - min(overlap), 32, overlap)
         self.assertLess(max(ms for ms, evs in ans.items()
                             if any(e.action == TouchAction.UP for e in evs) and ms < red_at), red_at)
         # 红场出现之后, 判定点上不能还留着手指, 空位上的那只要继续按。
@@ -421,6 +423,7 @@ class AlgoredTest(unittest.TestCase):
         self.assertTrue(outside(red_at - 40), '红场赶到之前空位上要有手指')
         overlap = [ms for ms in range(red_at - 80, red_at) if len(tl.at(ms)) >= 2 and outside(ms)]
         self.assertTrue(overlap, '新触点按住之后才能松开原来的')
+        self.assertGreaterEqual(max(overlap) - min(overlap), 32, overlap)
         gap = worst = 0
         for ms in range(ms0, end + 1, 4):
             if outside(ms):
