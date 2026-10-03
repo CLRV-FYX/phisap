@@ -135,8 +135,10 @@ class TestStatic(unittest.TestCase):
             self.assertTrue(needle in shutdown, f'_apk_shutdown 里没有 {needle}')
         window_close = ast.dump(_method(_class('Window'), 'closeEvent'))
         self.assertTrue('_apk_shutdown' in window_close, 'Window.closeEvent 没有收尾后台任务')
-        # 但 Window 不能去调 MainPage.closeEvent: 它里面的 save_cache 会在 ./cache(是个目录)上乱写
-        self.assertFalse('save_cache' in window_close)
+        # 关主窗口时 MainPage.closeEvent 不会被调用, 设置必须由 Window 自己存。
+        # 写的是 ./cache/settings.ini, 不是 ./cache 这个目录。
+        self.assertTrue('save_cache' in window_close, 'Window.closeEvent 没有保存设置')
+        self.assertNotIn('self.main_page.closeEvent', window_close)
         page_close = ast.dump(_method(_class('MainPage'), 'closeEvent'))
         self.assertTrue('_apk_shutdown' in page_close)
 

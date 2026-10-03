@@ -4,6 +4,7 @@ UI built with PyQt-Fluent-Widgets (Win11 Fluent Design).
 from __future__ import annotations
 
 import configparser
+import io
 import json
 import locale
 import os
@@ -37,8 +38,9 @@ from rich.console import Console
 
 from algo.algo_base import (
     TouchEvent, TouchAction, load_from_json, export_to_json, PLAN_CACHE_SUFFIX,
-    first_note_ms, manual_start_plan,
+    first_note_ms, chart_offset_ms, shift_plan, manual_start_plan,
 )
+from algo.red_field import chart_file_has_block_areas
 from chart import Chart
 from control import DeviceController, max_touch_points, VIDEO_MAX_FPS
 from player import run_player, raise_timer_resolution
@@ -47,7 +49,10 @@ from downloader import Downloader, SOURCES, DEFAULT_SOURCE
 import apk_tools
 
 
-ALGORITHMS = ('algo3', 'algo3f', 'algo1', 'algo2')
+ALGORITHMS = ('algo3', 'algo3f', 'algo1', 'algo2', 'algored')
+# 设置写在文件里。./cache 本身是目录(协议同意时创建, 下载索引也放里面),
+# 以前把这个目录路径当成 ini 去写, 每次都失败, 歌曲/算法/字体/下载源重启就丢。
+SETTINGS_FILE = './cache/settings.ini'
 
 _KNOWN_DIFFICULTIES = ('SPB', 'INB', 'HDB', 'ATB', 'SP', 'IN', 'HD', 'AT', 'DT', 'EZ')
 _CHART_TOKEN_RE = re.compile(r'chart[_\s\-#]?([a-z]+)', re.IGNORECASE)
@@ -124,7 +129,13 @@ def first_note_ms_from_path(path: str | None) -> int:
     try:
         ch, _ = load_chart_file(path)
         v = first_note_ms(ch)
-        v = v if v else 0
+        # offset 就地算, 不另调函数: tests/test_startup_latency.py 会把这个函数
+        # 从源码里抽出去单独 exec, 命名空间里没有 chart_offset_ms。
+        try:
+            off = int(round(float(getattr(ch, 'offset', 0) or 0) * 1000))
+        except (TypeError, ValueError):
+            off = 0
+        v = (v or 0) + off
     except Exception:
         v = 0
     if len(_FIRST_NOTE_CACHE) > 64:
@@ -143,6 +154,12 @@ _PLAN_CACHE_RE = re.compile(r'\.ans\.v\d+\.json$', re.IGNORECASE)
 def is_plan_cache(filename: str) -> bool:
     """是不是程序自己生成的规划缓存(*.ans.vN.json), 而不是谱面"""
     return bool(_PLAN_CACHE_RE.search(os.path.basename(filename)))
+
+
+def plan_cache_path(chart_path: str, algo: str, cap: int) -> str:
+    """规划缓存带上算法和触点数。同一张谱用不同算法/不同后端算出来的结果不能混用。"""
+    base, _ext = os.path.splitext(chart_path)
+    return f'{base}.{algo}.p{int(cap)}{PLAN_CACHE_SUFFIX}'
 
 
 def find_chart_path(song_id: str, diff: str) -> str | None:
@@ -194,6 +211,10 @@ class PlanThread(QThread):
                 cap.print(f'[yellow]RPE转换: {w}[/yellow]')
             mod = importlib.import_module(f'algo.{self.algo}')
             ans = mod.solve(chart, cap, self.max_pointers)
+            off = chart_offset_ms(chart)
+            if off:
+                cap.print(f'谱面 offset {off:+d} ms, 已加到规划时间上')
+                ans = shift_plan(ans, chart)
             with open(self.plan_path, 'w', encoding='utf-8') as fp:
                 export_to_json(ans, fp)
             self.log_line.emit(buf.getvalue())
@@ -361,7 +382,7 @@ class MainPage(ScrollArea):
         self._load_font_scale()
         self.detect_adb_devices()
         self.refresh_songs()
-        self.load_cache('./cache')
+        self.load_cache(SETTINGS_FILE)
         # 启动时尝试读磁盘缓存(不联网),更新状态文字
         try:
             self.downloader.load_index(force=False, use_cache=True)
@@ -570,6 +591,9 @@ class MainPage(ScrollArea):
         self.algo_box = ComboBox()
         self.algo_box.addItems(ALGORITHMS)
         self.algo_box.setMinimumWidth(180)
+        self.algo_box.currentTextChanged.connect(self._on_algo_changed)
+        self._algo_lock = False
+        self._keep_algo = False
         self.algo_card.hBoxLayout.addWidget(self.algo_box, 0, Qt.AlignRight)
         self.algo_card.hBoxLayout.addSpacing(16)
         plan_group.addSettingCard(self.algo_card)
@@ -621,6 +645,11 @@ class MainPage(ScrollArea):
         self.export_btn.clicked.connect(self.export_plan)
         self.export_btn.setEnabled(False)
         plan_btn_row.addWidget(self.export_btn)
+        self.device_export_btn = PushButton(FIF.PHONE, '导出到手机')
+        self.device_export_btn.clicked.connect(self.export_device_plan)
+        self.device_export_btn.setEnabled(False)
+        self.device_export_btn.setToolTip('给手机版导入。电脑版照常用 ADB 演奏，规划仍在这边做。')
+        plan_btn_row.addWidget(self.device_export_btn)
         plan_btn_row.addStretch(1)
         plan_group.vBoxLayout.addLayout(plan_btn_row)
         p_plan.addWidget(plan_group)
@@ -630,6 +659,7 @@ class MainPage(ScrollArea):
         self.dev_card = SettingCard(FIF.PHONE, 'ADB 设备', '选择设备')
         self.devices_box = ComboBox()
         self.devices_box.setMinimumWidth(320)
+        self.devices_box.currentIndexChanged.connect(self._on_device_changed)
         self.dev_card.hBoxLayout.addWidget(self.devices_box, 0, Qt.AlignRight)
         self.dev_card.hBoxLayout.addSpacing(16)
         dev_group.addSettingCard(self.dev_card)
@@ -875,6 +905,8 @@ class MainPage(ScrollArea):
             self.diff_box.clear()
 
     def song_selected(self, sid):
+        if not getattr(self, '_loading_cache', False):
+            self._keep_algo = False
         self.diff_box.clear()
         if not sid:
             return
@@ -894,26 +926,54 @@ class MainPage(ScrollArea):
             self.diff_box.setCurrentText(pref)
         self.difficulty_selected(self.diff_box.currentText())
 
+    def _pointer_cap(self) -> int:
+        if self.controller is not None:
+            return int(getattr(self.controller, 'max_pointers', None) or max_touch_points())
+        return int(max_touch_points())
+
+    def _set_algo(self, name: str):
+        self._algo_lock = True
+        try:
+            self.algo_box.setCurrentText(name)
+        finally:
+            self._algo_lock = False
+
+    def _on_algo_changed(self, _text):
+        if getattr(self, '_algo_lock', False):
+            return
+        self._keep_algo = True
+        self.difficulty_selected(self.diff_box.currentText())
+
     def difficulty_selected(self, diff):
         self.plan_path = None
         self._raw_ans = None
         self.export_btn.setEnabled(False)
+        self.device_export_btn.setEnabled(False)
         self.go_btn.setEnabled(False)
         sid = self.song_box.currentText()
         if not sid or not diff:
             return
-        folder = os.path.join('./Assets/Tracks', sid)
-        cand = os.path.join(folder, f'Chart_{diff}{PLAN_CACHE_SUFFIX}')
-        if (not os.path.exists(cand)) and diff == 'SP':
-            cand = os.path.join(folder, f'Chart{PLAN_CACHE_SUFFIX}')
-        if os.path.exists(cand):
+        chart = self._find_chart_path()
+        if chart and chart_file_has_block_areas(chart):
+            algo = self.algo_box.currentText()
+            if not getattr(self, '_keep_algo', False) and algo in ('algo3', 'algo3f'):
+                self._set_algo('algored')
+                self.log('这张谱有噪点红场, 扫屏算法点不中, 已改用 algored')
+            elif algo != 'algored' and getattr(self, '_red_hinted', None) != chart:
+                self._red_hinted = chart
+                self.log('这张谱有噪点红场, 建议改用 algored(垂直判定落在红场外, 不往红场里点)')
+        cand = plan_cache_path(chart, self.algo_box.currentText(), self._pointer_cap()) if chart else ''
+        if cand and os.path.exists(cand):
             self.plan_path = cand
             try:
                 with open(cand, 'r', encoding='utf-8') as f:
-                    self._raw_ans = load_from_json(json.load(f))
-            except Exception:
+                    self._raw_ans = load_from_json(f)
+            except Exception as e:
                 self._raw_ans = None
+                self.log(f'缓存规划读取失败: {e}')
+                return
             self.export_btn.setEnabled(True)
+            self.device_export_btn.setEnabled(True)
             self.go_btn.setEnabled(self.controller is not None)
             self.log(f'已载入缓存规划: {os.path.basename(cand)}')
             # 提前在后台把坐标适配算好(要100多ms), 用户点"开始演奏"时直接取
@@ -1072,16 +1132,19 @@ class MainPage(ScrollArea):
             InfoBar.info('无缓存', '本地没有缓存文件', parent=self.window(), duration=2000, position=InfoBarPosition.TOP)
 
     def _help_auto_start(self):
+        fps = VIDEO_MAX_FPS
+        frame_ms = 1000.0 / fps
+        half_ms = frame_ms / 2
         QMessageBox.information(self, '自动开始说明',
             '【方式一: 视觉自动开始(实验性, 默认关闭, 不保证可靠)】\n'
             '打开"视觉自动开始"开关 -> 点"开始演奏" -> 程序会帮你在屏幕中心点一下, \n'
-            '然后以20fps盯着屏幕帧数据。当检测到Phigros从准备界面跳进演奏界面\n'
+            f'然后以{fps:g}fps盯着屏幕帧数据。当检测到Phigros从准备界面跳进演奏界面\n'
             '(音符开始下落, 画面帧体积突变)的瞬间, 立刻按规划发送事件。\n'
             '原理: 只看每帧H.264数据的大小, 不解码画面内容, CPU占用极低。\n'
             '局限(所以默认关): 这是纯启发式猜测, 不是真的"看懂"画面。\n'
             '  - 帧体积受码率/画面复杂度/模拟器性能影响, 阈值1.8倍是我拍的, \n'
             '    不同设备/不同曲目可能不跳变或误触发;\n'
-            '  - 20fps意味着最多滞后50ms, 加上我回退的25ms, 误差可能到几十毫秒;\n'
+            f'  - {fps:g}fps意味着最多滞后{frame_ms:.0f}ms, 加上回退的半帧({half_ms:.0f}ms), 误差可能到一两百毫秒;\n'
             '  - 检测到的是"进入演奏界面", 不是"第一个音符落到判定线", \n'
             '    前奏长的歌会整体偏早。\n'
             '如果试了不准, 请改用方式二(计时器同步)或方式三。\n\n'
@@ -1386,14 +1449,15 @@ class MainPage(ScrollArea):
             try:
                 if is_plan_cache(fp):
                     # 规划缓存也是合法JSON, 不拦的话会被存成一张空谱面,
-                    # 曲目列表里多出一个莫名其妙的新歌。
-                    ok += 1
+                    # 曲目列表里多出一个莫名其妙的新歌。跳过不算导入成功。
                     self.log(f'跳过规划缓存文件(不是谱面): {os.path.basename(fp)}')
                     continue
                 with open(fp, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if detect_kind(data) == 'rpe':
-                    data = rpe_to_official_v3(data)
+                    data, warns = rpe_to_official_v3(data)
+                    for w in warns:
+                        self.log(f'RPE转换 {os.path.basename(fp)}: {w}')
                 sid = data.get('META', {}).get('id')
                 if not sid:
                     base = os.path.splitext(os.path.basename(fp))[0]
@@ -1434,8 +1498,50 @@ class MainPage(ScrollArea):
             return MaaTouchController(serial, server_dir='.')
         return DeviceController(serial)
 
-    def detect_adb_devices(self):
+    def _close_controller(self):
+        c = self.controller
         self.controller = None
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def _connect_serial(self, serial: str | None):
+        if not serial:
+            return
+        if self.controller is not None and getattr(self.controller, 'serial', None) == serial:
+            return
+        self._close_controller()
+        self._adapt_cache = None
+        try:
+            self.controller = self._make_controller(serial)
+        except FileNotFoundError:
+            self.dev_badge.setText('ADB 未找到')
+            InfoBar.error('ADB 未找到', '请把 adb 加入 PATH', parent=self.window(), duration=4000)
+            return
+        except Exception as e:
+            self.dev_badge.setText('连接失败')
+            self.log(f'连接 {serial} 失败: {e}')
+            return
+        self.dev_badge.setText(f'已连接 {serial}')
+        self.log(f'设备已连接: {serial} ({self.controller.device_width}x{self.controller.device_height})'
+                 f', 触控后端: {"MaaTouch" if self._cache_get("touch_backend","scrcpy")=="maatouch" else "scrcpy"}')
+        # 触点数可能变了(10/16), 缓存文件名里带了触点数, 换设备后要重找
+        if self.song_box.currentText():
+            self.difficulty_selected(self.diff_box.currentText())
+        elif self._raw_ans is not None:
+            self.go_btn.setEnabled(True)
+            self._refresh_adapted()
+
+    def _on_device_changed(self, idx: int):
+        if idx < 0 or self.devices_box.signalsBlocked():
+            return
+        self._connect_serial(self.devices_box.itemText(idx))
+
+    def detect_adb_devices(self):
+        self._close_controller()
+        self.devices_box.blockSignals(True)
         self.devices_box.clear()
         try:
             out = subprocess.check_output(['adb', 'devices'], text=True, stderr=subprocess.STDOUT, timeout=5)
@@ -1452,20 +1558,15 @@ class MainPage(ScrollArea):
                                 parent=self.window(), position=InfoBarPosition.TOP, duration=3000)
                 return
             self.devices_box.addItems(devs)
-            self._adapt_cache = None
-            self.controller = self._make_controller(devs[0])
-            self.dev_badge.setText(f'已连接 {devs[0]}')
-            self.log(f'设备已连接: {devs[0]} ({self.controller.device_width}x{self.controller.device_height})'
-                     f', 触控后端: {"MaaTouch" if self._cache_get("touch_backend","scrcpy")=="maatouch" else "scrcpy"}')
-            if self._raw_ans is not None:
-                self.go_btn.setEnabled(True)
-                # 屏幕尺寸以连接时为准, 变了他适配结果也要重算
-                self._refresh_adapted()
+            self.devices_box.setCurrentIndex(0)
+            self._connect_serial(devs[0])
         except FileNotFoundError:
             self.dev_badge.setText('ADB 未找到')
             InfoBar.error('ADB 未找到', '请把 adb 加入 PATH', parent=self.window(), duration=4000)
         except Exception as e:
             self.log(f'检测设备失败: {e}')
+        finally:
+            self.devices_box.blockSignals(False)
 
     # --- 规划 ---
     def start_planning(self):
@@ -1474,16 +1575,13 @@ class MainPage(ScrollArea):
             InfoBar.warning('提示', '请先选择曲目和难度', parent=self.window(), duration=2500)
             return
         algo = self.algo_box.currentText()
-        plan_path = path.replace('.json', PLAN_CACHE_SUFFIX)
+        cap = self._pointer_cap()
+        plan_path = plan_cache_path(path, algo, cap)
         self.plan_btn.setEnabled(False)
         self.go_btn.setEnabled(False)
-        self.log(f'开始生成规划 [{algo}] ...')
+        self.log(f'开始生成规划 [{algo}, {cap}触点] ...')
         # 触点数上限取决于当前后端: scrcpy补丁版16, MaaTouch只有10。
         # 之前固定按16算, 用MaaTouch时多出来的手指会被服务端静默丢弃。
-        if self.controller is not None:
-            cap = getattr(self.controller, 'max_pointers', None) or max_touch_points()
-        else:
-            cap = max_touch_points()
         self._plan_t = PlanThread(path, algo, plan_path, cap)
         self._plan_t.finished_ok.connect(self._plan_ok)
         self._plan_t.failed.connect(self._plan_fail)
@@ -1495,6 +1593,7 @@ class MainPage(ScrollArea):
         self.plan_path = plan_path
         self._raw_ans = ans
         self.export_btn.setEnabled(True)
+        self.device_export_btn.setEnabled(True)
         if self.controller:
             self.go_btn.setEnabled(True)
         self.log(f'规划完成: {os.path.basename(plan_path)} ({len(ans)} 个时间点)')
@@ -1516,6 +1615,28 @@ class MainPage(ScrollArea):
             import shutil
             shutil.copy(self.plan_path, fn)
             InfoBar.success('已导出', fn, parent=self.window(), duration=2000)
+
+    def export_device_plan(self):
+        '''手机版只播放，不重新规划。电脑版的 ADB 演奏不受影响。'''
+        if not self.plan_path:
+            return
+        fn, _ = QFileDialog.getSaveFileName(
+            self, '导出到手机', 'phisap-device.json', 'phisap (*.json)')
+        if not fn:
+            return
+        from device_plan import export_device_plan
+        try:
+            with open(self.plan_path, 'r', encoding='utf-8') as f:
+                ans = load_from_json(f)
+            with open(fn, 'w', encoding='utf-8') as f:
+                export_device_plan(ans, f, name=os.path.basename(self.plan_path))
+        except Exception as e:
+            self.log(f'导出到手机失败: {e}')
+            InfoBar.error('导出失败', str(e), parent=self.window(), duration=4000)
+            return
+        self.log(f'已导出手机计划: {fn}')
+        InfoBar.success('已导出到手机', '导入手机版即可。这边的 ADB 演奏不变。',
+                        parent=self.window(), duration=3000)
 
     # --- 播放 ---
     def _on_vauto_changed(self, on: bool):
@@ -1549,8 +1670,14 @@ class MainPage(ScrollArea):
             return
         if not self._raw_ans:
             if self.plan_path and os.path.exists(self.plan_path):
-                with open(self.plan_path, 'r', encoding='utf-8') as f:
-                    self._raw_ans = load_from_json(json.load(f))
+                try:
+                    with open(self.plan_path, 'r', encoding='utf-8') as f:
+                        self._raw_ans = load_from_json(f)
+                except Exception as e:
+                    self._raw_ans = None
+                    self.log(f'规划读取失败: {e}')
+                    InfoBar.error('规划读取失败', str(e)[:200], parent=self.window(), duration=4000)
+                    return
             else:
                 InfoBar.warning('提示', '请先生成规划', parent=self.window(), duration=2500); return
         if not self.controller:
@@ -1617,9 +1744,11 @@ class MainPage(ScrollArea):
                 return
             if not fired:
                 self.log('视觉自动开始: 等待超时(120秒)仍未检测到界面跳变')
-            # 记录"检测到跳变"的绝对时刻作为打歌时钟锚点;
-            # 真实跳变发生在 wait() 返回前的某一帧, 这里回退半帧(约25ms @20fps)补偿检测延迟
-            self._vauto_fire_time = time.perf_counter() - 0.025
+            # 记录"检测到跳变"的绝对时刻作为打歌时钟锚点。
+            # 真实跳变发生在 wait() 返回前的某一帧, 回退半帧补偿检测延迟。
+            # 采样是 VIDEO_MAX_FPS(现在是 5), 半帧是 100ms, 不是以前按 20fps 估的 25ms。
+            half = 0.5 / max(VIDEO_MAX_FPS, 1)
+            self._vauto_fire_time = time.perf_counter() - half
             self._start_time = self._vauto_fire_time
             # 必须在GUI线程里启动播放(要改按钮文字/重连信号), 用信号切回主线程
             self.vauto_launch.emit()
@@ -1631,7 +1760,8 @@ class MainPage(ScrollArea):
         if not self._vauto_waiting:
             return
         self._vauto_waiting = False
-        self.log(f'视觉触发: 已检测到进入演奏, 锚点回退25ms')
+        half_ms = 500.0 / max(VIDEO_MAX_FPS, 1)
+        self.log(f'视觉触发: 已检测到进入演奏, 锚点回退{half_ms:.0f}ms(半帧@{VIDEO_MAX_FPS:g}fps)')
         self._start_playback(manual=False, prestarted=True)
 
     def _cancel_visual_wait(self):
@@ -1928,9 +2058,11 @@ class MainPage(ScrollArea):
 
     # --- 缓存 ---
     def load_cache(self, path):
+        if path and os.path.isdir(path):
+            path = os.path.join(path, 'settings.ini')
         self.cache_path = path
         cache = configparser.ConfigParser()
-        if os.path.exists(path):
+        if path and os.path.isfile(path):
             try:
                 cache.read(path, encoding='utf-8')
             except Exception:
@@ -1946,12 +2078,18 @@ class MainPage(ScrollArea):
         sid = cache.get('cache', 'songid')
         diff = cache.get('cache', 'difficulty')
         algo = cache.get('cache', 'algo')
-        if sid and self.song_box.findText(sid) >= 0:
-            self.song_box.setCurrentText(sid)
-        if diff and self.diff_box.findText(diff) >= 0:
-            self.diff_box.setCurrentText(diff)
-        if algo and self.algo_box.findText(algo) >= 0:
-            self.algo_box.setCurrentText(algo)
+        self._loading_cache = True
+        try:
+            if algo and self.algo_box.findText(algo) >= 0:
+                # 这是上次存下来的选择, 不要被"红场谱自动改 algored"盖掉
+                self._keep_algo = True
+                self._set_algo(algo)
+            if sid and self.song_box.findText(sid) >= 0:
+                self.song_box.setCurrentText(sid)
+            if diff and self.diff_box.findText(diff) >= 0:
+                self.diff_box.setCurrentText(diff)
+        finally:
+            self._loading_cache = False
         return self
 
     def save_cache(self):
@@ -1960,14 +2098,19 @@ class MainPage(ScrollArea):
         cache.set('cache', 'songid', self.song_box.currentText())
         cache.set('cache', 'difficulty', self.diff_box.currentText())
         cache.set('cache', 'algo', self.algo_box.currentText())
-        with open(self.cache_path, 'w', encoding='utf-8') as f:
+        path = self._cache_path()
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
             cache.write(f)
 
     # ---- 字体缩放 ----
     FONT_SCALES = [0.9, 1.0, 1.15, 1.30]
 
     def _cache_path(self) -> str:
-        return getattr(self, 'cache_path', './cache')
+        p = getattr(self, 'cache_path', None) or SETTINGS_FILE
+        if os.path.isdir(p):
+            return os.path.join(p, 'settings.ini')
+        return p
 
     def _cache_get(self, key: str, default: str = '') -> str:
         cfg = configparser.ConfigParser()
@@ -1993,6 +2136,7 @@ class MainPage(ScrollArea):
             cfg.add_section('cache')
         cfg.set('cache', key, value)
         try:
+            os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
             with open(p, 'w', encoding='utf-8') as f:
                 cfg.write(f)
         except Exception:
@@ -2059,8 +2203,12 @@ class Window(MSFluentWindow):
         self.addSubInterface(self.main_page, FIF.APPLICATION, '主界面')
 
     def closeEvent(self, e):
-        # MainPage 是子控件, 关主窗口时它自己的 closeEvent 不会被调用, 所以由主窗口转交。
-        # 这里只收尾后台任务, 不碰 MainPage.closeEvent 里的 save_cache。
+        # MainPage 是子控件, 关主窗口时它自己的 closeEvent 不会被调用。
+        # 设置写到 ./cache/settings.ini(文件), 不能再写到 ./cache 这个目录上。
+        try:
+            self.main_page.save_cache()
+        except Exception:
+            pass
         try:
             self.main_page._apk_shutdown()
         except Exception:

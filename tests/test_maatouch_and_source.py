@@ -97,6 +97,19 @@ class MaaTouchProtocolTest(unittest.TestCase):
         self.c.touch_many([_ev(TouchAction.DOWN, 1, 1)])
         self.assertEqual(self.c.sent, [])
 
+    def test_write_failure_raises_control_channel_dead(self):
+        """管道写失败必须抛 ControlChannelDead, 不能把事件悄悄丢掉。"""
+        from control import ControlChannelDead
+
+        class _Dead(_RecordingStdin):
+            def write(self, data):
+                raise OSError('broken pipe')
+
+        self.c._stdin = _Dead()
+        with self.assertRaises(ControlChannelDead):
+            self.c.touch_many([_ev(TouchAction.DOWN, 1, 1)])
+        self.assertTrue(self.c._closed)
+
     def test_supports_visual_watch_false(self):
         '''MaaTouch没有视频流, 不支持视觉自动开始'''
         self.assertFalse(self.c.supports_visual_watch)
