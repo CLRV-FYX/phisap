@@ -659,6 +659,62 @@ class AlgoredTest(unittest.TestCase):
             self.assertFalse(Open().contains(e['pos'][0], e['pos'][1], 0))
 
 
+class JitterLiftTest(unittest.TestCase):
+    def test_held_finger_lifts_before_red_arrives(self):
+        """晚一帧才发出去时, 模型里还在外面的长按已经在红场里。提前抬, 不要等盖住。"""
+        from algo.algo_base import VirtualTouchEvent
+
+        class Block:
+            enable = 0.0
+            disable = 1.0
+
+        class Field:
+            blocks = [Block()]
+
+            def contains(self, x, y, t, margin=0):
+                return t >= 0.200
+
+            def active(self, t):
+                return 0.0 <= t < 1.0
+
+        events = {
+            0: [VirtualTouchEvent((10.0, 10.0), TouchAction.DOWN, 1)],
+            300: [VirtualTouchEvent((10.0, 10.0), TouchAction.UP, 1)],
+        }
+        lifted = algored._lift_red(events, Field())
+        self.assertGreaterEqual(lifted, 1)
+        ups = [ms for ms, batch in events.items()
+               if any(e.action == TouchAction.UP for e in batch)]
+        self.assertTrue(ups)
+        self.assertLessEqual(min(ups), 200 - algored._JITTER_MS)
+        self.assertNotIn(300, events)
+
+    def test_fresh_tap_is_not_cut_before_it_lands(self):
+        """刚按下的短点击不能因为 24ms 后有红场就被提前废掉。"""
+        from algo.algo_base import VirtualTouchEvent
+
+        class Block:
+            enable = 0.0
+            disable = 1.0
+
+        class Field:
+            blocks = [Block()]
+
+            def contains(self, x, y, t, margin=0):
+                return t >= 0.200
+
+            def active(self, t):
+                return 0.0 <= t < 1.0
+
+        events = {
+            180: [VirtualTouchEvent((10.0, 10.0), TouchAction.DOWN, 1)],
+            210: [VirtualTouchEvent((10.0, 10.0), TouchAction.UP, 1)],
+        }
+        algored._lift_red(events, Field())
+        self.assertIn(180, events)
+        self.assertEqual(events[180][0].action, TouchAction.DOWN)
+
+
 class OffsetPlanTest(unittest.TestCase):
     def test_shift_matches_offset(self):
         ch = chart_of(line_dict([note(0.0, 0.0)]))

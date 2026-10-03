@@ -2,5 +2,7 @@
 <resources>
     <string-array name="xposed_scope">
         <item>com.PigeonGames.Phigros</item>
+        <item>org.flos.phira</item>
+        <item>org.flos.phira.modded</item>
     </string-array>
 </resources>

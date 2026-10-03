@@ -8,14 +8,19 @@ import de.robv.android.xposed.XposedHelpers;
 
 /**
  * LSPosed 和 NPatch 都认 assets/xposed_init 里的这个类。
- * 作用域只有 Phigros。模块加载进游戏进程后，才挂侧边的开始。
+ * 进程内的侧边按钮只对 Phigros 有用。Phira 是 Rust，点不进画布，
+ * 播放走本应用的 root 真实触摸，这里不要往它的界面上挂。
  */
 public final class HookEntry implements IXposedHookLoadPackage {
     private static final String GAME = "com.PigeonGames.Phigros";
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
-        if (!GAME.equals(lpparam.packageName)) {
+        String pkg = lpparam.packageName;
+        if ("org.flos.phira".equals(pkg) || "org.flos.phira.modded".equals(pkg)) {
+            return;
+        }
+        if (!GAME.equals(pkg)) {
             return;
         }
         XposedHelpers.findAndHookMethod(

@@ -498,19 +498,60 @@ class RedField:
             return None
         return x + nx * best, y + ny * best, best
 
+    def _clear_ahead(self, x: float, y: float, t: float, pad: float = 0.024) -> bool:
+        """这个屏幕点在接下来 pad 秒里都不进红场。注入晚一帧时, 只看这一毫秒的点会进死区。"""
+        step = 0.008
+        u = t
+        end = t + pad
+        while u <= end + 1e-9:
+            if self.contains(x, y, u):
+                return False
+            u += step
+        return True
+
+    def _pick_stable(self, x: float, y: float, nx: float, ny: float, ivs, prefer_s: float, t: float):
+        """同一条垂线上, 优先选晚一帧也不会进红场的点。没有这样的点就交给精确时刻的选择。"""
+        best = None
+        best_key = None
+        for a, b in ivs:
+            if b - a < 1.0:
+                continue
+            span = b - a
+            lip = min(8.0, span / 2)
+            samples = (
+                min(max(prefer_s, a), b),
+                (a + b) / 2,
+                a + lip,
+                b - lip,
+            )
+            for s in samples:
+                px, py = x + nx * s, y + ny * s
+                if not self._clear_ahead(px, py, t):
+                    continue
+                key = (abs(s - prefer_s), abs(s))
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = (px, py, s)
+        return best
+
     def vertical_slot(self, x: float, y: float, sa: float, ca: float, t: float,
                       prefer_s: float = 0.0) -> tuple[float, float, float] | None:
         """在音符的垂直线上选一个这一毫秒安全的点。这一下整条线都在红场里时返回 None。
 
-        优先留在 prefer_s 那一侧, 并且尽量离填色远一点。只有贴着边才有缝时,
-        退到仍在矩形外的位置, 也不把触点放进噪区。
+        优先留在 prefer_s 那一侧, 并且尽量离填色远一点。晚一帧仍在红场外的点优先;
+        整条线都只在这一毫秒安全时, 退回精确时刻的点, 不因此判成没位置。
+        只有贴着边才有缝时, 退到仍在矩形外的位置, 也不把触点放进噪区。
         """
         nx, ny = _unit(sa, ca)
+        exact = None
         for clearance in (RED_CLEARANCE_PX, 8.0, 0.0, -RED_MARGIN_PX):
-            hit = self._pick(x, y, nx, ny, self.safe_intervals(x, y, sa, ca, t, clearance), prefer_s)
-            if hit is not None:
-                return hit
-        return None
+            ivs = self.safe_intervals(x, y, sa, ca, t, clearance)
+            stable = self._pick_stable(x, y, nx, ny, ivs, prefer_s, t)
+            if stable is not None:
+                return stable
+            if exact is None:
+                exact = self._pick(x, y, nx, ny, ivs, prefer_s)
+        return exact
 
     def segment_hits(self, p0: tuple[float, float], p1: tuple[float, float], t: float) -> bool:
         """从 p0 滑到 p1 会不会穿过当前红场。长条换边之前先查这个, 避免手指扫进噪区。"""

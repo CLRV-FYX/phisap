@@ -79,16 +79,42 @@ def _comfort_s(home, s: float) -> float | None:
     return target
 
 
+# 同一份计划连打两遍会差大约一万分, 断在原来那些贴边的地方。差在注入晚一帧:
+# 模型里这一毫秒还在红场外, 晚 16–24ms 发出去就已经在里面。只对已经按住的手指提前离开,
+# 不改还安全的几何, 也不把短点击在按下那一帧掐掉。
+_JITTER_MS = 24
+_JITTER_HOLD_MS = 40
+
+
+def _red_soon(field: RedField, pos, ms: int) -> bool:
+    """这个点此刻或接下来一帧多会不会进红场。"""
+    for dt in range(0, _JITTER_MS + 1, 8):
+        if field.contains(pos[0], pos[1], (ms + dt) / 1000.0):
+            return True
+    return False
+
+
 def _lift_red(events, field: RedField) -> int:
-    """手指停在红场里时立刻抬起。红场会自己移过来, 所以不能只在有事件的那一毫秒查。"""
+    """手指停在红场里时立刻抬起。红场会自己移过来, 所以不能只在有事件的那一毫秒查。
+
+    已经按住超过一帧的手指, 红场还有 24ms 才盖到, 也提前抬。晚一帧才发出去的那一下,
+    模型里还在外面, 实机已经在里面。刚按下的短点击不按这条提前掐, 否则一帧延迟会把
+    还没进红场的点击直接废掉。
+    """
     if not events:
         return 0
     down: dict[int, tuple] = {}
+    down_since: dict[int, int] = {}
     dead: set[int] = set()
     lifted = 0
     ranges = _red_ranges_ms(field)
     lo, hi = min(events), max(events)
     cursor = lo
+
+    def leaving(pid: int, pos, ms: int) -> bool:
+        if field.contains(pos[0], pos[1], ms / 1000.0):
+            return True
+        return (ms - down_since.get(pid, ms)) >= _JITTER_HOLD_MS and _red_soon(field, pos, ms)
 
     def apply(ms: int):
         nonlocal lifted
@@ -105,9 +131,10 @@ def _lift_red(events, field: RedField) -> int:
                     dead.discard(pid)
                 else:
                     continue
-            if e.action == TouchAction.MOVE and pid in down and field.contains(e.pos[0], e.pos[1], t):
+            if e.action == TouchAction.MOVE and pid in down and leaving(pid, e.pos, ms):
                 kept.append(VirtualTouchEvent(down[pid], TouchAction.UP, pid))
                 down.pop(pid, None)
+                down_since.pop(pid, None)
                 dead.add(pid)
                 lifted += 1
                 continue
@@ -119,16 +146,19 @@ def _lift_red(events, field: RedField) -> int:
             kept.append(e)
             if e.action == TouchAction.DOWN:
                 down[pid] = e.pos
+                down_since[pid] = ms
             elif e.action == TouchAction.MOVE:
                 down[pid] = e.pos
             elif e.action == TouchAction.UP:
                 down.pop(pid, None)
-        # 没有新事件、但红场移到了还按着的手指上
-        if field.active(t):
+                down_since.pop(pid, None)
+        # 没有新事件、但红场移到了还按着的手指上, 或再过一帧就会移到。
+        if field.active(t) or down:
             for pid, pos in list(down.items()):
-                if field.contains(pos[0], pos[1], t):
+                if leaving(pid, pos, ms):
                     kept.append(VirtualTouchEvent(pos, TouchAction.UP, pid))
                     down.pop(pid, None)
+                    down_since.pop(pid, None)
                     dead.add(pid)
                     lifted += 1
         if kept:
@@ -137,7 +167,8 @@ def _lift_red(events, field: RedField) -> int:
             del events[ms]
 
     for a, b in ranges:
-        a, b = max(a, lo), min(b, hi)
+        # 往前多看一帧, 才能在红场盖住之前把已经按住的手指抬起来。
+        a, b = max(a - _JITTER_MS, lo), min(b, hi)
         if a > b:
             continue
         while cursor < a:

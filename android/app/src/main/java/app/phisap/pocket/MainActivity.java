@@ -91,7 +91,7 @@ public final class MainActivity extends Activity {
             }
         }
         getContentResolver().call(ModProvider.URI, "requestPlay", null, null);
-        Toast.makeText(this, "已交给游戏。侧边的 phisap 会在 4 秒内开始。", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "Phigros 侧边按钮 4 秒内会开始。Phira 请用 root 真实触摸，进程内点不进去。", Toast.LENGTH_LONG).show();
     }
 
     @Override
