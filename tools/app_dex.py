@@ -33,7 +33,7 @@ def build_dex() -> bytes:
     _safe_activity(dex)
     _worker(dex)
     _injector(dex)
-    _hook(dex)
+    # 不放 HookEntry。它实现的 Xposed 接口手机上通常没有，严格的 dexopt 会整包拒绝。
     return dex.build()
 
 
@@ -85,7 +85,7 @@ def _safe_activity(dex: DexBuilder):
     on.iput(0, 14, F(ACT, 'banner', 'Landroid/widget/TextView;'), 'object')
     on.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('Landroid/view/View;',)), [14, 0])
     on.label('s')
-    on.invoke('direct', M(ACT, 'buildUi', 'V', ()), [14])
+    on.invoke('direct', M(ACT, 'bindLayout', 'V', ()), [14])
     on.invoke('direct', M(ACT, 'loadSaved', 'V', ()), [14])
     on.invoke('virtual', M(ACT, 'refresh', 'V', ()), [14])
     on.ret()
@@ -186,6 +186,39 @@ def _safe_activity(dex: DexBuilder):
     ui.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('Landroid/view/View;',)), [15, 0])
     ui.ret()
     dex.add_method(ACT, 'buildUi', 'V', (), PRIV, ui)
+
+    # 资源 id 来自 aapt2。build_apk 会核对，对不上就不出包。
+    bind = Asm(8, 1)  # this v7
+    bind.const(0, 0x7f040000)
+    bind.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('I',)), [7, 0])
+    for reg_field, rid, field in (
+        (1, 0x7f030007, 'statusView'),
+        (1, 0x7f030005, 'planView'),
+        (1, 0x7f030003, 'offsetView'),
+    ):
+        bind.const(0, rid)
+        bind.invoke('virtual', M('Landroid/app/Activity;', 'findViewById', 'Landroid/view/View;', ('I',)), [7, 0], 1)
+        bind.check_cast(1, 'Landroid/widget/TextView;')
+        bind.iput(1, 7, F(ACT, field, 'Landroid/widget/TextView;'), 'object')
+    for n, (rid, which) in enumerate((
+        (0x7f030000, 5),
+        (0x7f030001, 3),
+        (0x7f030002, 4),
+        (0x7f030006, 0),
+        (0x7f030009, 1),
+        (0x7f030008, 2),
+    )):
+        bind.const(0, rid)
+        bind.invoke('virtual', M('Landroid/app/Activity;', 'findViewById', 'Landroid/view/View;', ('I',)), [7, 0], 1)
+        skip = f'skip{n}'
+        bind.if_eqz(1, skip)
+        bind.new(2, TAP)
+        bind.const(3, which)
+        bind.invoke('direct', M(TAP, '<init>', 'V', (ACT, 'I')), [2, 7, 3])
+        bind.invoke('virtual', M('Landroid/view/View;', 'setOnClickListener', 'V', ('Landroid/view/View$OnClickListener;',)), [1, 2])
+        bind.label(skip)
+    bind.ret()
+    dex.add_method(ACT, 'bindLayout', 'V', (), PRIV, bind)
 
     _safe_files(dex)
     _safe_play(dex)

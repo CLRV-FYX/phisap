@@ -486,6 +486,14 @@ def _raw_deflate(data: bytes) -> bytes:
     return compressor.compress(data) + compressor.flush()
 
 
+def _arsc_align(start: int) -> bytes:
+    """对齐必须是合法的 extra 记录。1 到 3 个裸零字节会被系统当成损坏的安装包。"""
+    pad = (4 - start % 4) % 4
+    if pad == 0:
+        return b''
+    return struct.pack('<HH', 0x5041, pad) + b'\x00' * pad
+
+
 def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
     """按 aapt2 的方式打包。resources.arsc 不压缩、4 字节对齐，对齐用裸填充，不用 id 为 0 的 extra 头。"""
     local = bytearray()
@@ -498,11 +506,11 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
         extra = b''
         if name == 'resources.arsc':
             start = len(local) + 30 + len(raw_name)
-            extra = b'\x00' * ((4 - start % 4) % 4)
+            extra = _arsc_align(start)
         offset = len(local)
         crc = zlib.crc32(data) & 0xffffffff
         local.extend(struct.pack(
-            '<IHHHHHIIIHH', 0x04034b50, 0, 0, method, 0, 0, crc, len(payload), len(data),
+            '<IHHHHHIIIHH', 0x04034b50, 20, 0, method, 0, 0, crc, len(payload), len(data),
             len(raw_name), len(extra),
         ))
         local.extend(raw_name)
@@ -512,7 +520,7 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
         local.extend(payload)
         central.extend(struct.pack(
             '<IHHHHHHIIIHHHHHII',
-            0x02014b50, 0, 0, 0, method, 0, 0, crc, len(payload), len(data),
+            0x02014b50, 20, 20, 0, method, 0, 0, crc, len(payload), len(data),
             len(raw_name), 0, 0, 0, 0, 0, offset,
         ))
         central.extend(raw_name)
@@ -538,6 +546,30 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
+    if "versionCode='7'" not in badging:
+        raise RuntimeError('versionCode 不是 7')
+    xml = subprocess.check_output(
+        [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
+        text=True,
+    )
+    if 'Theme.DeviceDefault.NoActionBar' not in xml and '0x01030129' not in xml:
+        # 主题必须写进二进制清单。没有主题时，有的手机会在 onCreate 之前拆掉窗口。
+        if 'theme' not in xml:
+            raise RuntimeError('清单没有系统主题')
+    resources = subprocess.check_output([str(_find_aapt2()), 'dump', 'resources', str(OUT)], text=True)
+    for needle in (
+        '0x7f040000 layout/activity_main',
+        '0x7f030007 id/status',
+        '0x7f030005 id/plan_name',
+        '0x7f030003 id/offset_value',
+        '0x7f030000 id/import_plan',
+        '0x7f030006 id/start',
+        '0x7f030008 id/stop',
+    ):
+        if needle not in resources:
+            raise RuntimeError(f'资源 id 变了: {needle}')
+    if b'Lde/robv/android/xposed/IXposedHookLoadPackage;' in dex:
+        raise RuntimeError('dex 仍引用不存在的 Xposed 接口')
     return OUT
 
 
