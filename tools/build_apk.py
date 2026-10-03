@@ -473,7 +473,7 @@ def _aapt2_files() -> list[tuple[str, bytes]]:
         subprocess.check_call([
             str(aapt2), 'link', '-o', str(base), '-I', str(jar),
             '--manifest', str(POCKET / 'AndroidManifest.xml'),
-            str(compiled), '-A', str(UI),
+            str(compiled),
             '--min-sdk-version', '26', '--target-sdk-version', '28',
             '--rename-manifest-package', PKG,
         ])
@@ -524,10 +524,10 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
 def build() -> Path:
     key, cert = _load_key()
     dex = build_dex()
-    if b'file:///android_asset/ui.html' in dex or b'Landroid/webkit/WebView;' in dex:
+    if b'Landroid/webkit/WebView;' in dex or b'file:///android_asset/ui.html' in dex:
         raise RuntimeError('启动 dex 仍引用 WebView')
-    if 'activity_main'.encode() not in dex or 'Phira'.encode() not in dex:
-        raise RuntimeError('原生界面或 Phira 说明没有进 dex')
+    if '已打开'.encode() not in dex or 'Phira'.encode() not in dex:
+        raise RuntimeError('启动界面没有进 dex')
     files = _aapt2_files()
     files.append(('classes.dex', dex))
     signed = _v1_files(files, key, cert)
