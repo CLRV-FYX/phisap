@@ -36,7 +36,11 @@ MAX_POINTERS = 16
 #      flick很密的谱面自动增加滑键触点, 排不下的flick推迟/短划(见 algo3.solve_with)
 # v12: 音符落在左上角暂停键区域时, 触点沿垂直于判定线的方向平移到区域外(见 avoid_pause_button)
 # v13: 规划时间加上谱面 offset; 缓存文件名带上算法和触点数; algored(噪点红场)
-PLAN_CACHE_SUFFIX = '.ans.v13.json'
+# v14: algored 按红块出现到消失的整段躲开, 在垂直线上选离红场足够远的点, 不再往红场里按下
+# v15: 红场在动, 只躲这一毫秒的位置; 这一下没缝就在判定窗里等它让开
+# v16: 红场按 4.0.1 原生判定几何(只在 enable 区间、正确缓动和缩放锚点);
+#      规划窗优先 Perfect ±40ms, 最远 Good ±80ms
+PLAN_CACHE_SUFFIX = '.ans.v16.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):

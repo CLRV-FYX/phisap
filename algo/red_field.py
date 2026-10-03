@@ -1,114 +1,191 @@
 """Phigros 4.0.1 噪点红场(blockAreaList)。
 
-谱面里没有单独的说明, 几何和时间窗口是从 Chart_AT.json 对出来的, 并被测试钉死:
+几何按 4.0.1(versionCode 157) 的 PreviewBlockControl / JudgeControl 还原:
 
 - 坐标是屏幕比例, 原点在左下, y 向上。phisap 的像素坐标原点在左上, y 向下。
-- 只有 enableTime~disableTime(秒, 和音符的 line.seconds 同一时间轴)内挡点击。
-  appear/disappear 只是淡入淡出, 不挡点击。
-- 矩形先按 bottomLeft/topRight 定大小, 再绕锚点缩放、旋转, 最后把中心挪到
-  moveEvents.endPosition。缓动用起始关键帧的 ease(outgoing), 索引和 rpe.py 的 RPE 表一致。
-- 同一时刻多个块重叠时, 列表里靠后的块说了算。isSubtract 为真表示这块是挖孔
-  (从红场里减掉), 不是另一块红场。Chart_AT 在 64s 附近有一块铺满屏幕的普通块,
-  紧跟着一块同样铺满屏幕的 subtract 块, 同时还有音符: 如果 subtract 也挡点击,
-  这一段就没法打。所以 subtract 必须是孔。
+- 挡点击的只有 enableTime <= t < disableTime。appear~disappear 是淡入淡出,
+  enable==disable 的块整段都不挡点击。把淡入也算进死区, 垂线上明明有解也会被判成没位置。
+- 缓动不是 RPE 那张表。0 线性; 1–3 二次 in/out/in-out; 4–6 三次; 7–9 四次;
+  10–12 五次; 13 恒为 0(停在这一关键帧); 14 恒为 1(立刻跳到下一关键帧)。
+  用的是当前关键帧的 ease, 不是上一个的。
+- 变换顺序: 先绕各段缩放锚点改中心和尺寸(锚点不插值, 已完成的段用上一段的锚点),
+  再绕旋转锚点转, 最后把中心平移到 moveEvents.endPosition 相对原中心的偏移。
+- 普通块取并集, subtract 按覆盖次数的奇偶, 两者再异或。单独的 subtract 也挡点击;
+  和普通块重叠的地方互相抵消, 所以铺满屏幕的 subtract 能把底下的红场挖掉。
+  触控死区比填色矩形再缩进屏幕高度的 3%(每边最多缩掉边长的 1/4), 孔则外扩同样多,
+  并且必须同时落在填色遮罩里。规划躲开的是填色矩形: 它包住死区, 贴着噪点边沿点下去
+  取整之后还会进死区。
 """
 from __future__ import annotations
 
 import math
 import os
 import re
-from dataclasses import dataclass
+import struct
+from bisect import bisect_right
+from dataclasses import dataclass, field
+from functools import lru_cache
 
-from rpe import _EASINGS, _linear
-
-from .algo_base import in_pause_box
+from .algo_base import PAUSE_BUTTON_BOX, PAUSE_EXIT_MARGIN, _pause_cut, _perpendicular_room
 
 SCREEN_W = 1280.0
 SCREEN_H = 720.0
-# 矩形外再扩这么多像素才算出红场, 抵消取整和缓动插值的误差
+# 规划时再离开填色矩形这么多像素。贴着边落下, 缩放/取整之后还会进死区。
 RED_MARGIN_PX = 6.0
-# 沿垂直方向往外探路的步长
-_STEP = 6.0
-_TIME_EPS = 5e-4  # 半毫秒, 盖住音符时间取整
+RED_CLEARANCE_PX = 28.0
+# 原生触控遮罩相对填色矩形的缩进: 屏幕高度的 3%, 每边最多缩掉该边边长的 1/4。
+TOUCH_INSET_PX = SCREEN_H * 0.03
+TOUCH_INSET_CAP = 0.25
+TIME_PAD_SEC = 0.040
+_SCREEN_INSET = 2.0
 
 
-def _ease(et, u: float) -> float:
-    try:
-        et = int(et or 0)
-    except (TypeError, ValueError):
-        et = 0
-    if et <= 1:
-        return u
-    f = _EASINGS[et] if 0 <= et < len(_EASINGS) else _linear
-    try:
-        return float(f(u))
-    except (TypeError, ValueError):
-        return u
+def _f32(value) -> float:
+    return struct.unpack('<f', struct.pack('<f', float(value)))[0]
 
 
-def _lerp(a: float, b: float, u: float) -> float:
-    return a + (b - a) * u
-
-
-def _collapse(events: list) -> list:
-    out = []
-    for e in sorted(events or [], key=lambda ev: float(ev.get('time', 0) or 0)):
-        if out and abs(float(e.get('time', 0) or 0) - float(out[-1].get('time', 0) or 0)) < 1e-9:
-            out[-1] = e
+@lru_cache(maxsize=15)
+def _ease_table(kind: int) -> tuple[float, ...]:
+    # GetEase.Instantiation 的 101 个采样, GetEaseWithProgress 再线性插值。
+    values = []
+    for i in range(101):
+        t = _f32(i / 100)
+        if kind == 0:
+            value = t
+        elif kind == 13:
+            value = 0.0
+        elif kind == 14:
+            value = 1.0
         else:
-            out.append(e)
-    return out
+            power = (kind - 1) // 3 + 2
+            direction = (kind - 1) % 3
+            if direction == 0:
+                value = _f32(t ** power)
+            elif direction == 1:
+                value = _f32(1 - _f32(_f32(1 - t) ** power))
+            elif i < 50:
+                value = _f32(_f32(_f32(2 * i / 100) ** power) * 0.5)
+            else:
+                value = _f32(_f32(_f32(1 - _f32(_f32(1 - _f32(2 * (i - 50) / 100)) ** power)) * 0.5) + 0.5)
+        values.append(_f32(value))
+    return tuple(values)
 
 
-def _sample_xy(events, t: float, xy_of, ease_x, ease_y, default):
-    events = _collapse(events)
-    if not events:
-        return default
-    if t <= float(events[0].get('time', 0) or 0):
-        return xy_of(events[0])
-    if t >= float(events[-1].get('time', 0) or 0):
-        return xy_of(events[-1])
-    for i in range(len(events) - 1):
-        a, b = events[i], events[i + 1]
-        ta, tb = float(a.get('time', 0) or 0), float(b.get('time', 0) or 0)
-        if ta <= t <= tb:
-            span = tb - ta
-            u = 0.0 if span <= 0 else (t - ta) / span
-            ax, ay = xy_of(a)
-            bx, by = xy_of(b)
-            return (_lerp(ax, bx, _ease(ease_x(a), u)),
-                    _lerp(ay, by, _ease(ease_y(a), u)))
-    return xy_of(events[-1])
+def _ease(progress: float, kind) -> float:
+    try:
+        kind = int(kind or 0)
+    except (TypeError, ValueError):
+        kind = 0
+    if kind < 0 or kind > 14:
+        kind = 0
+    table = _ease_table(kind)
+    position = _f32(_f32(progress) * 100)
+    index = int(position)
+    if index < 0:
+        return table[0]
+    if index >= 100:
+        return table[100]
+    return _f32(table[index] + _f32(_f32(position - index) * _f32(table[index + 1] - table[index])))
 
 
-def _sample_scalar(events, t: float, val_of, ease_of, default: float) -> float:
-    events = _collapse(events)
-    if not events:
-        return default
-    if t <= float(events[0].get('time', 0) or 0):
-        return val_of(events[0])
-    if t >= float(events[-1].get('time', 0) or 0):
-        return val_of(events[-1])
-    for i in range(len(events) - 1):
-        a, b = events[i], events[i + 1]
-        ta, tb = float(a.get('time', 0) or 0), float(b.get('time', 0) or 0)
-        if ta <= t <= tb:
-            span = tb - ta
-            u = 0.0 if span <= 0 else (t - ta) / span
-            return _lerp(val_of(a), val_of(b), _ease(ease_of(a), u))
-    return val_of(events[-1])
-
-
-def _xy(d, default=(0.0, 0.0)):
+def _xy(d, default=(0.0, 0.0)) -> tuple[float, float]:
     if not isinstance(d, dict):
         return default
-    return float(d.get('x', default[0]) or 0), float(d.get('y', default[1]) or 0)
+    return _f32(d.get('x', default[0]) or 0), _f32(d.get('y', default[1]) or 0)
 
 
-def _rot(dx, dy, deg: float):
-    a = deg * math.pi / 180.0
-    c, s = math.cos(a), math.sin(a)
-    return dx * c - dy * s, dx * s + dy * c
+def _world(p: tuple[float, float]) -> tuple[float, float]:
+    return ((p[0] - 0.5) * SCREEN_W, (p[1] - 0.5) * SCREEN_H)
+
+
+def _safe_div(a: float, b: float) -> float:
+    # Mathf.Approximately(b, 0) 才当除零。返回 1 表示这一步不挪中心。
+    return 1.0 if abs(b) < 1e-12 else a / b
+
+
+def _merge(ivs: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    ivs = sorted((a, b) for a, b in ivs if b > a + 1e-6)
+    if not ivs:
+        return []
+    out = [list(ivs[0])]
+    for a, b in ivs[1:]:
+        if a <= out[-1][1] + 1e-4:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _subtract_one(room: tuple[float, float], blocked: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    lo, hi = room
+    if hi <= lo:
+        return []
+    out = []
+    cursor = lo
+    for a, b in blocked:
+        if b <= cursor:
+            continue
+        if a >= hi:
+            break
+        if a > cursor:
+            out.append((cursor, min(a, hi)))
+        cursor = max(cursor, b)
+        if cursor >= hi:
+            break
+    if cursor < hi:
+        out.append((cursor, hi))
+    return [(a, b) for a, b in out if b > a + 1e-3]
+
+
+def _xor_mask(spans: list[tuple[float, float, bool]]) -> list[tuple[float, float]]:
+    """spans: (s0, s1, subtract)。普通块取并集, subtract 按奇偶, 两者再异或。"""
+    if not spans:
+        return []
+    events = []
+    for s0, s1, sub in spans:
+        events.append((s0, 1, sub))
+        events.append((s1, -1, sub))
+    events.sort(key=lambda e: (e[0], -e[1]))
+    normal = subtract = 0
+    red = []
+    prev = None
+
+    def is_red() -> bool:
+        return (normal > 0) ^ (subtract % 2 == 1)
+
+    for s, delta, sub in events:
+        if prev is not None and s > prev + 1e-9 and is_red():
+            red.append((prev, s))
+        if sub:
+            subtract += delta
+        else:
+            normal += delta
+        prev = s
+    return _merge(red)
+
+
+def _slab(x, y, dx, dy, minx, maxx, miny, maxy):
+    lo, hi = -math.inf, math.inf
+    for p, d, a, b in ((x, dx, minx, maxx), (y, dy, miny, maxy)):
+        if abs(d) < 1e-12:
+            if p < a - 1e-9 or p > b + 1e-9:
+                return None
+            continue
+        t0, t1 = (a - p) / d, (b - p) / d
+        if t0 > t1:
+            t0, t1 = t1, t0
+        lo = max(lo, t0)
+        hi = min(hi, t1)
+        if lo > hi:
+            return None
+    return lo, hi
+
+
+def _touch_half(full: float, inset: float, subtract: bool) -> float:
+    if full < 1e-4:
+        return 0.0
+    sign = 1.0 if subtract else -1.0
+    return full * (0.5 + sign * min(TOUCH_INSET_CAP, inset / full))
 
 
 @dataclass
@@ -116,62 +193,161 @@ class _Block:
     subtract: bool
     enable: float
     disable: float
-    cx: float
-    cy: float
-    hx: float
-    hy: float
-    moves: list
+    appear: float
+    disappear: float
+    bl: tuple[float, float]
+    tr: tuple[float, float]
     scales: list
     rots: list
+    moves: list
+    _rc: dict = field(default_factory=dict, repr=False, compare=False)
 
     def covers(self, t: float) -> bool:
-        return self.enable - _TIME_EPS <= t <= self.disable + _TIME_EPS
+        return self.enable <= t < self.disable
 
-    def _pose(self, t: float):
-        mx, my = _sample_xy(
-            self.moves, t,
-            lambda e: _xy(e.get('endPosition'), (self.cx, self.cy)),
-            lambda e: e.get('easeTypeX', e.get('easeType', 0)),
-            lambda e: e.get('easeTypeY', e.get('easeType', 0)),
-            (self.cx, self.cy))
-        sx, sy = _sample_xy(
-            self.scales, t,
-            lambda e: _xy(e.get('scale'), (1.0, 1.0)),
-            lambda e: e.get('easeTypeX', e.get('easeType', 0)),
-            lambda e: e.get('easeTypeY', e.get('easeType', 0)),
-            (1.0, 1.0))
-        ax, ay = _sample_xy(
-            self.scales, t,
-            lambda e: _xy(e.get('anchor'), (self.cx, self.cy)),
-            lambda e: e.get('easeTypeX', 0),
-            lambda e: e.get('easeTypeY', 0),
-            (self.cx, self.cy))
-        rot = _sample_scalar(
-            self.rots, t,
-            lambda e: float(e.get('rotation', 0) or 0),
-            lambda e: e.get('easeType', 0),
-            0.0)
-        rx, ry = _sample_xy(
-            self.rots, t,
-            lambda e: _xy(e.get('anchor'), (self.cx, self.cy)),
-            lambda e: 0,
-            lambda e: 0,
-            (self.cx, self.cy))
-        # 锚点写在未平移的谱面坐标里, 跟着中心一起挪
-        return (mx, my), (sx, sy), rot, (ax - self.cx, ay - self.cy), (rx - self.cx, ry - self.cy)
+    def rect_at(self, t: float) -> tuple[float, float, float, float, float]:
+        """左上角像素坐标下的 (cx, cy, width, height, angle_rad)。angle 是图表角度取负。"""
+        key = int(round(t * 1000))
+        hit = self._rc.get(key)
+        if hit is not None:
+            return hit
+        hit = self._rect(key / 1000.0)
+        self._rc[key] = hit
+        if len(self._rc) > 160:
+            self._rc.pop(next(iter(self._rc)))
+        return hit
 
-    def contains_norm(self, x: float, y: float, t: float, margin_x: float, margin_y: float) -> bool:
-        (mx, my), (sx, sy), rot, (asx, asy), (arx, ary) = self._pose(t)
-        if abs(sx) < 1e-3 or abs(sy) < 1e-3:
-            return False  # 缩没了, 没有可点区域
-        # 逆变换: 平移回中心, 绕旋转锚点转回去, 再绕缩放锚点缩回去
-        lx, ly = x - mx, y - my
-        dx, dy = lx - arx, ly - ary
-        ux, uy = _rot(dx, dy, -rot)
-        ux, uy = ux + arx, uy + ary
-        lx = asx + (ux - asx) / sx
-        ly = asy + (uy - asy) / sy
-        return abs(lx) <= self.hx + margin_x and abs(ly) <= self.hy + margin_y
+    def _event(self, items: list, t: float, kind: str):
+        if not items:
+            return -1, None
+        times = [e['time'] for e in items]
+        index = bisect_right(times, t) - 1
+        if index < 0:
+            return index, None
+        current = items[index]
+        if index == len(items) - 1:
+            return index, current
+        nxt = items[index + 1]
+        duration = nxt['time'] - current['time']
+        u0 = 0.0 if duration <= 0 else _f32(_f32(t - current['time']) / duration)
+        if kind == 'rot':
+            u = max(0.0, min(1.0, _ease(u0, current['ease'])))
+            return index, {
+                'time': current['time'], 'anchor': current['anchor'], 'ease': current['ease'],
+                'rotation': current['rotation'] + (nxt['rotation'] - current['rotation']) * u,
+            }
+        axes = []
+        for axis in range(2):
+            u = max(0.0, min(1.0, _ease(u0, current['ease'][axis])))
+            a, b = current['value'][axis], nxt['value'][axis]
+            axes.append(a + (b - a) * u)
+        return index, {
+            'time': current['time'], 'anchor': current['anchor'], 'ease': current['ease'],
+            'value': (axes[0], axes[1]), 'value0': current['value'],
+        }
+
+    def _rect(self, t: float) -> tuple[float, float, float, float, float]:
+        lo, hi = _world(self.bl), _world(self.tr)
+        original = ((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5)
+        center = original
+        size = (hi[0] - lo[0], hi[1] - lo[1])
+        index, current = self._event(self.scales, t, 'scale')
+        if current is not None:
+            steps = [(self.scales[i], self.scales[i + 1]['value']) for i in range(index)]
+            if index < len(self.scales) - 1:
+                steps.append((self.scales[index], current['value']))
+            for event, value in steps:
+                anchor = _world(event['anchor'])
+                ratio = (_safe_div(value[0], event['value'][0]), _safe_div(value[1], event['value'][1]))
+                center = (anchor[0] + ratio[0] * (center[0] - anchor[0]),
+                          anchor[1] + ratio[1] * (center[1] - anchor[1]))
+            size = (abs(size[0] * current['value'][0]), abs(size[1] * current['value'][1]))
+        index, current = self._event(self.rots, t, 'rot')
+        angle = 0.0
+        if current is not None:
+            steps = [(self.rots[i], self.rots[i + 1]['rotation']) for i in range(index)]
+            if index < len(self.rots) - 1:
+                steps.append((self.rots[index], current['rotation']))
+            for event, value in steps:
+                anchor = _world(event['anchor'])
+                delta = math.radians(value - event['rotation'])
+                c, s = math.cos(delta), math.sin(delta)
+                dx, dy = center[0] - anchor[0], center[1] - anchor[1]
+                center = (anchor[0] + c * dx - s * dy, anchor[1] + s * dx + c * dy)
+            angle = current['rotation']
+        _, current = self._event(self.moves, t, 'move')
+        if current is not None:
+            pos = _world(current['value'])
+            center = (center[0] + pos[0] - original[0], center[1] + pos[1] - original[1])
+        return (center[0] + SCREEN_W * 0.5, SCREEN_H * 0.5 - center[1],
+                abs(size[0]), abs(size[1]), -math.radians(angle))
+
+    def _frame(self, t: float, margin_px: float, touch: bool):
+        cx, cy, width, height, angle = self.rect_at(t)
+        if min(width, height) < 1e-4:
+            return None
+        if touch:
+            hx = _touch_half(width, TOUCH_INSET_PX, self.subtract) + margin_px
+            hy = _touch_half(height, TOUCH_INSET_PX, self.subtract) + margin_px
+        else:
+            hx = width * 0.5 + margin_px
+            hy = height * 0.5 + margin_px
+        if hx <= 0 or hy <= 0:
+            return None
+        c, s = math.cos(angle), math.sin(angle)
+        return cx, cy, hx, hy, c, s
+
+    def contains_px(self, x: float, y: float, t: float, margin_px: float = 0.0, touch: bool = False) -> bool:
+        frame = self._frame(t, margin_px, touch)
+        if frame is None:
+            return False
+        cx, cy, hx, hy, c, s = frame
+        dx, dy = x - cx, y - cy
+        return abs(dx * c + dy * s) <= hx and abs(-dx * s + dy * c) <= hy
+
+    def intersect_s(self, x_px: float, y_px: float, nx: float, ny: float, t: float,
+                    margin_px: float, touch: bool = False) -> tuple[float, float] | None:
+        """点 (x_px, y_px) + s*(nx, ny) 落在这块(外扩 margin_px)里的 s 区间。"""
+        frame = self._frame(t, margin_px, touch)
+        if frame is None:
+            return None
+        cx, cy, hx, hy, c, s = frame
+        dx, dy = x_px - cx, y_px - cy
+        return _slab(dx * c + dy * s, -dx * s + dy * c, nx * c + ny * s, -nx * s + ny * c,
+                     -hx, hx, -hy, hy)
+
+
+def _norm_scale(raw: dict, cx: float, cy: float) -> dict:
+    return {
+        'time': _f32(raw.get('time', 0) or 0),
+        'anchor': _xy(raw.get('anchor'), (cx, cy)),
+        'ease': (int(raw.get('easeTypeX', raw.get('easeType', 0)) or 0),
+                 int(raw.get('easeTypeY', raw.get('easeType', 0)) or 0)),
+        'value': _xy(raw.get('scale'), (1.0, 1.0)),
+    }
+
+
+def _norm_move(raw: dict, cx: float, cy: float) -> dict:
+    return {
+        'time': _f32(raw.get('time', 0) or 0),
+        'anchor': (cx, cy),
+        'ease': (int(raw.get('easeTypeX', raw.get('easeType', 0)) or 0),
+                 int(raw.get('easeTypeY', raw.get('easeType', 0)) or 0)),
+        'value': _xy(raw.get('endPosition'), (cx, cy)),
+    }
+
+
+def _norm_rot(raw: dict, cx: float, cy: float) -> dict:
+    return {
+        'time': _f32(raw.get('time', 0) or 0),
+        'anchor': _xy(raw.get('anchor'), (cx, cy)),
+        'ease': int(raw.get('easeType', 0) or 0),
+        'rotation': _f32(raw.get('rotation', 0) or 0),
+    }
+
+
+def _sorted_events(events: list) -> list:
+    return sorted(events, key=lambda e: e['time'])
 
 
 def _parse_block(raw: dict) -> _Block | None:
@@ -185,21 +361,30 @@ def _parse_block(raw: dict) -> _Block | None:
         return None
     enable = float(raw.get('enableTime', raw.get('appearTime', 0)) or 0)
     disable = float(raw.get('disableTime', raw.get('disappearTime', enable)) or enable)
-    if disable < enable:
-        enable, disable = disable, enable
+    appear = float(raw.get('appearTime', enable) or 0)
+    disappear = float(raw.get('disappearTime', disable) or 0)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     return _Block(
         subtract=bool(raw.get('isSubtract')),
         enable=enable, disable=disable,
-        cx=(x0 + x1) / 2, cy=(y0 + y1) / 2,
-        hx=abs(x1 - x0) / 2, hy=abs(y1 - y0) / 2,
-        moves=list(raw.get('moveEvents') or []),
-        scales=list(raw.get('scaleEvents') or []),
-        rots=list(raw.get('rotateEvents') or []),
+        appear=appear, disappear=disappear,
+        bl=(x0, y0), tr=(x1, y1),
+        scales=_sorted_events(_norm_scale(e, cx, cy) for e in (raw.get('scaleEvents') or [])),
+        rots=_sorted_events(_norm_rot(e, cx, cy) for e in (raw.get('rotateEvents') or [])),
+        moves=_sorted_events(_norm_move(e, cx, cy) for e in (raw.get('moveEvents') or [])),
     )
 
 
+def _unit(sa: float, ca: float) -> tuple[float, float]:
+    nx, ny = -sa, ca
+    nlen = math.hypot(nx, ny)
+    if nlen < 1e-8:
+        return 0.0, 1.0
+    return nx / nlen, ny / nlen
+
+
 class RedField:
-    """某一时刻屏幕上的红场。没有块时 contains 恒为 False。"""
+    """某一时刻屏幕上的红场。没有块, 或不在 enable 区间时, contains 恒为 False。"""
 
     def __init__(self, blocks: list[_Block]):
         self.blocks = blocks
@@ -215,8 +400,7 @@ class RedField:
         return bool(self.blocks)
 
     def active(self, t: float) -> list[_Block]:
-        # 规划只有 1ms 分辨率。用四舍五入后的毫秒再换算回去, 避免 102.9696 和 102.970
-        # 共用一个缓存键却算出两套不同的活动块。
+        # 规划只有 1ms 分辨率。用四舍五入后的毫秒再换算回去, 避免同一毫秒算出两套活动块。
         key = int(round(t * 1000))
         hit = self._active_cache.get(key)
         if hit is None:
@@ -225,82 +409,121 @@ class RedField:
             self._active_cache[key] = hit
         return hit
 
-    def contains(self, x_px: float, y_px: float, t_sec: float, margin_px: float = RED_MARGIN_PX) -> bool:
-        """像素坐标(y 向下)在 t_sec 是否落在红场里。
-
-        重叠时列表靠后的块说了算: 普通块是红场, isSubtract 是从红场里挖掉的孔。
-        """
+    def _masked(self, x_px: float, y_px: float, t_sec: float, margin_px: float, touch: bool) -> bool:
         t_sec = round(t_sec * 1000) / 1000.0
         active = self.active(t_sec)
         if not active:
             return False
-        nx = x_px / SCREEN_W
-        ny = 1.0 - y_px / SCREEN_H
-        mx = margin_px / SCREEN_W
-        my = margin_px / SCREEN_H
-        last = None
+        normal = False
+        subtract = 0
         for b in active:
-            if b.contains_norm(nx, ny, t_sec, mx, my):
-                last = b
-        return last is not None and not last.subtract
+            if b.contains_px(x_px, y_px, t_sec, margin_px, touch):
+                if b.subtract:
+                    subtract ^= 1
+                else:
+                    normal = True
+        return normal ^ bool(subtract)
 
-    def _safe(self, x: float, y: float, t: float) -> bool:
-        return (1.0 <= x <= SCREEN_W - 1 and 1.0 <= y <= SCREEN_H - 1
-                and not in_pause_box((x, y))
-                and not self.contains(x, y, t))
+    def contains(self, x_px: float, y_px: float, t_sec: float, margin_px: float = 0.0) -> bool:
+        """像素坐标(y 向下)在 t_sec 是否落在挡点击的填色遮罩里。
 
-    def escape(self, x: float, y: float, sa: float, ca: float, t_sec: float,
-               prefer_s: float = 0.0) -> tuple[float, float, float]:
-        """沿垂直于判定线的方向把点挪出红场。返回 (x, y, s)。
-
-        s 是沿 (-sa, ca) 走的距离。投影(判定)不变。挪不出去就原样返回, s=0,
-        调用方必须把这根手指立刻抬起。prefer_s 非 0 时优先留在同一侧, 长条才不会来回跳。
+        只在 enable 区间。普通块取并集, subtract 按奇偶, 两者再异或。
+        margin_px 表示离这张精确遮罩不到这么多像素也算进红场。不能先把每块矩形外扩再异或,
+        否则外扩的普通块会和 subtract 抵消, 死区中间被判成空地。
         """
-        nx, ny = -sa, ca
-        if nx * nx + ny * ny < 1e-8:
-            nx, ny = 0.0, 1.0
-        if self._safe(x, y, t_sec):
-            return x, y, 0.0
+        if self._masked(x_px, y_px, t_sec, 0.0, touch=False):
+            return True
+        if margin_px <= 0:
+            return False
+        # 四向采样是遮罩外扩的下界, 用来提前离开边沿, 不会把异或结果翻过来。
+        m = margin_px
+        return any(self._masked(x_px + dx, y_px + dy, t_sec, 0.0, touch=False)
+                   for dx, dy in ((m, 0.0), (-m, 0.0), (0.0, m), (0.0, -m)))
 
-        def at(s: float):
-            return x + nx * s, y + ny * s
+    def touch_blocked(self, x_px: float, y_px: float, t_sec: float) -> bool:
+        """原生触控死区: 填色遮罩和缩进/外扩后的遮罩同时盖住才算。"""
+        return (self._masked(x_px, y_px, t_sec, 0.0, touch=False)
+                and self._masked(x_px, y_px, t_sec, 0.0, touch=True))
 
-        def search(sign: float):
-            s = 0.0
-            while abs(s) < 1700.0:
-                s += sign * _STEP
-                px, py = at(s)
-                if not (0.0 <= px <= SCREEN_W and 0.0 <= py <= SCREEN_H):
-                    return None
-                if not self._safe(px, py, t_sec):
-                    continue
-                lo, hi = s - sign * _STEP, s
-                for _ in range(8):
-                    mid = (lo + hi) / 2
-                    if self._safe(*at(mid), t_sec):
-                        hi = mid
-                    else:
-                        lo = mid
-                extra = hi + sign * 4.0
-                if self._safe(*at(extra), t_sec):
-                    px, py = at(extra)
-                    return px, py, extra
-                px, py = at(hi)
-                return px, py, hi
+    def dead(self, x: float, y: float, t: float, clearance: float = RED_CLEARANCE_PX) -> bool:
+        """这一毫秒、这个点在边距内是不是红场。红场在动, 不把前后扫过的区域并进来。"""
+        return self.contains(x, y, t, RED_MARGIN_PX + clearance)
+
+    def _red_at(self, x: float, y: float, nx: float, ny: float, t: float,
+                margin_px: float) -> list[tuple[float, float]]:
+        active = self.active(t)
+        if not active:
+            return []
+        spans = []
+        for b in active:
+            iv = b.intersect_s(x, y, nx, ny, t, 0.0, touch=False)
+            if iv is None or iv[1] <= iv[0] + 1e-4:
+                continue
+            spans.append((iv[0], iv[1], b.subtract))
+        # 先异或, 再把得到的死区向外扩。外扩输入矩形会把重叠处的异或结果翻掉。
+        red = _xor_mask(spans)
+        if margin_px > 0.5:
+            red = _merge([(a - margin_px, b + margin_px) for a, b in red])
+        return red
+
+    def safe_intervals(self, x: float, y: float, sa: float, ca: float, t: float,
+                       clearance: float = RED_CLEARANCE_PX) -> list[tuple[float, float]]:
+        """这一毫秒, 沿垂直于判定线的方向, 屏幕内、不碰暂停键、不进红场的 s 区间。
+
+        s 是沿 (-sa, ca) 走的像素。投影(判定)不变。红场在动, 只看这一下的位置。
+        """
+        nx, ny = _unit(sa, ca)
+        lo, hi = _perpendicular_room(x, y, nx, ny)
+        lo, hi = lo + _SCREEN_INSET, hi - _SCREEN_INSET
+        if hi <= lo:
+            return []
+        red = self._red_at(x, y, nx, ny, t, max(0.0, RED_MARGIN_PX + clearance))
+        pause = _pause_cut(x, y, nx, ny)
+        if pause is not None:
+            red = _merge(red + [pause])
+        return _subtract_one((lo, hi), red)
+
+    def _pick(self, x: float, y: float, nx: float, ny: float, ivs, prefer_s: float):
+        best = None
+        best_key = None
+        for a, b in ivs:
+            if b - a < 1.0:
+                continue
+            s = min(max(prefer_s, a), b)
+            key = (0 if a - 1e-3 <= prefer_s <= b + 1e-3 else 1, abs(s - prefer_s), abs(s))
+            if best_key is None or key < best_key:
+                best_key = key
+                best = s
+        if best is None:
             return None
+        return x + nx * best, y + ny * best, best
 
-        if abs(prefer_s) >= 1.0:
-            sign = 1.0 if prefer_s > 0 else -1.0
-            hit = search(sign)
+    def vertical_slot(self, x: float, y: float, sa: float, ca: float, t: float,
+                      prefer_s: float = 0.0) -> tuple[float, float, float] | None:
+        """在音符的垂直线上选一个这一毫秒安全的点。这一下整条线都在红场里时返回 None。
+
+        优先留在 prefer_s 那一侧, 并且尽量离填色远一点。只有贴着边才有缝时,
+        退到仍在矩形外的位置, 也不把触点放进噪区。
+        """
+        nx, ny = _unit(sa, ca)
+        for clearance in (RED_CLEARANCE_PX, 8.0, 0.0, -RED_MARGIN_PX):
+            hit = self._pick(x, y, nx, ny, self.safe_intervals(x, y, sa, ca, t, clearance), prefer_s)
             if hit is not None:
                 return hit
-            hit = search(-sign)
-            return hit if hit is not None else (x, y, 0.0)
-        a, b = search(1.0), search(-1.0)
-        cands = [c for c in (a, b) if c is not None]
-        if not cands:
-            return x, y, 0.0
-        return min(cands, key=lambda c: abs(c[2]))
+        return None
+
+    def segment_hits(self, p0: tuple[float, float], p1: tuple[float, float], t: float) -> bool:
+        """从 p0 滑到 p1 会不会穿过当前红场。长条换边之前先查这个, 避免手指扫进噪区。"""
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1.0:
+            return self.contains(p0[0], p0[1], t, RED_MARGIN_PX)
+        nx, ny = dx / dist, dy / dist
+        red = self._red_at(p0[0], p0[1], nx, ny, t, RED_MARGIN_PX)
+        for a, b in red:
+            if a < dist - 0.5 and b > 0.5:
+                return True
+        return False
 
 
 def chart_has_block_areas(path: str) -> bool:
@@ -317,4 +540,5 @@ def chart_file_has_block_areas(path: str | None) -> bool:
     return bool(path) and os.path.isfile(path) and chart_has_block_areas(path)
 
 
-__all__ = ['RedField', 'RED_MARGIN_PX', 'chart_has_block_areas', 'chart_file_has_block_areas']
+__all__ = ['RedField', 'RED_MARGIN_PX', 'RED_CLEARANCE_PX', 'TIME_PAD_SEC',
+           'TOUCH_INSET_PX', 'chart_has_block_areas', 'chart_file_has_block_areas']

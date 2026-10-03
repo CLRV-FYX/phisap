@@ -955,7 +955,7 @@ class MainPage(ScrollArea):
                 self.log('这张谱有噪点红场, 扫屏算法点不中, 已改用 algored')
             elif algo != 'algored' and getattr(self, '_red_hinted', None) != chart:
                 self._red_hinted = chart
-                self.log('这张谱有噪点红场, 建议改用 algored(垂直判定落在红场外, 误入立刻抬起)')
+                self.log('这张谱有噪点红场, 建议改用 algored(垂直判定落在红场外, 不往红场里点)')
         cand = plan_cache_path(chart, self.algo_box.currentText(), self._pointer_cap()) if chart else ''
         if cand and os.path.exists(cand):
             self.plan_path = cand
