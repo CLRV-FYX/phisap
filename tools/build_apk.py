@@ -6,8 +6,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import urllib.request
+import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +29,12 @@ from app_dex import build_dex  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'android' / 'phisap-pocket.apk'
-UI = ROOT / 'android' / 'app' / 'src' / 'main' / 'assets' / 'ui.html'
+UI = ROOT / 'android' / 'app' / 'src' / 'main' / 'assets'
+POCKET = ROOT / 'android' / 'pocket'
+JAR_URL = (
+    'https://api.github.com/repos/Sable/android-platforms/contents/'
+    'android-28/android.jar?ref=master'
+)
 KEY_PATH = Path(__file__).resolve().parent / 'pocket-signing.pem'
 CERT_PATH = Path(__file__).resolve().parent / 'pocket-signing.crt'
 
@@ -243,12 +254,30 @@ def _lp(blob: bytes) -> bytes:
     return _u32(len(blob)) + blob
 
 
+def _cert_start(cert) -> datetime:
+    start = getattr(cert, 'not_valid_before_utc', None)
+    if start is None:
+        start = cert.not_valid_before
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+    return start
+
+
 def _load_key():
-    if KEY_PATH.exists() and CERT_PATH.exists():
+    if KEY_PATH.exists():
         key = serialization.load_pem_private_key(KEY_PATH.read_bytes(), password=None)
+    else:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        KEY_PATH.write_bytes(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    if CERT_PATH.exists():
         cert = x509.load_pem_x509_certificate(CERT_PATH.read_bytes())
-        return key, cert
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # 手机时间早于证书生效日时，系统会把整包判成无效。生效日放到 2016。
+        if _cert_start(cert) <= datetime(2020, 1, 1, tzinfo=timezone.utc):
+            return key, cert
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'phisap')])
     cert = (
         x509.CertificateBuilder()
@@ -256,7 +285,7 @@ def _load_key():
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(1)
-        .not_valid_before(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        .not_valid_before(datetime(2016, 1, 1, tzinfo=timezone.utc))
         .not_valid_after(datetime(2046, 1, 1, tzinfo=timezone.utc))
         .sign(key, hashes.SHA256())
     )
@@ -401,19 +430,109 @@ def _verify_v2(apk: bytes, cert) -> None:
     cert.public_key().verify(signature, signed, padding.PKCS1v15(), hashes.SHA256())
 
 
+def _find_aapt2() -> Path:
+    env = os.environ.get('AAPT2')
+    candidates = [Path(env)] if env else []
+    candidates += [
+        Path(__file__).resolve().parent / 'prebuilt' / 'aapt2',
+        Path('/tmp/sdk/aapt2'),
+    ]
+    for path in candidates:
+        if path.is_file():
+            path.chmod(0o755)
+            return path
+    raise RuntimeError('找不到 aapt2')
+
+
+def _find_android_jar() -> Path:
+    env = os.environ.get('ANDROID_JAR')
+    candidates = [Path(env)] if env else []
+    candidates += [Path('/tmp/sdk/android.jar'), Path(__file__).resolve().parent / 'android.jar']
+    for path in candidates:
+        if path.is_file() and path.stat().st_size > 1_000_000:
+            return path
+    dest = Path('/tmp/sdk/android.jar')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(
+        JAR_URL, headers={'Accept': 'application/vnd.github.raw', 'User-Agent': 'phisap'},
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp, dest.open('wb') as out:
+        shutil.copyfileobj(resp, out)
+    return dest
+
+
+def _aapt2_files() -> list[tuple[str, bytes]]:
+    """用 aapt2 生成清单和资源表。手写的二进制清单系统会当成无效安装包。"""
+    aapt2 = _find_aapt2()
+    jar = _find_android_jar()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        compiled = tmp_path / 'resources.zip'
+        base = tmp_path / 'base.apk'
+        subprocess.check_call([str(aapt2), 'compile', '--dir', str(POCKET / 'res'), '-o', str(compiled)])
+        subprocess.check_call([
+            str(aapt2), 'link', '-o', str(base), '-I', str(jar),
+            '--manifest', str(POCKET / 'AndroidManifest.xml'),
+            str(compiled), '-A', str(UI),
+            '--min-sdk-version', '26', '--target-sdk-version', '28',
+            '--rename-manifest-package', PKG,
+        ])
+        with zipfile.ZipFile(base) as blob:
+            return [(info.filename, blob.read(info.filename)) for info in blob.infolist()]
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return compressor.compress(data) + compressor.flush()
+
+
+def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
+    """按 aapt2 的方式打包。resources.arsc 不压缩、4 字节对齐，对齐用裸填充，不用 id 为 0 的 extra 头。"""
+    local = bytearray()
+    central = bytearray()
+    for name, data in entries:
+        raw_name = name.encode('utf-8')
+        store = name == 'resources.arsc' or name.startswith('META-INF/') or name.endswith('.png')
+        payload = data if store else _raw_deflate(data)
+        method = 0 if store else 8
+        extra = b''
+        if name == 'resources.arsc':
+            start = len(local) + 30 + len(raw_name)
+            extra = b'\x00' * ((4 - start % 4) % 4)
+        offset = len(local)
+        crc = zlib.crc32(data) & 0xffffffff
+        local.extend(struct.pack(
+            '<IHHHHHIIIHH', 0x04034b50, 0, 0, method, 0, 0, crc, len(payload), len(data),
+            len(raw_name), len(extra),
+        ))
+        local.extend(raw_name)
+        local.extend(extra)
+        if name == 'resources.arsc' and len(local) % 4:
+            raise RuntimeError('resources.arsc is not 4-byte aligned')
+        local.extend(payload)
+        central.extend(struct.pack(
+            '<IHHHHHHIIIHHHHHII',
+            0x02014b50, 0, 0, 0, method, 0, 0, crc, len(payload), len(data),
+            len(raw_name), 0, 0, 0, 0, 0, offset,
+        ))
+        central.extend(raw_name)
+    cd_off = len(local)
+    eocd = struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, len(entries), len(entries), len(central), cd_off, 0)
+    return bytes(local) + bytes(central) + eocd
+
+
 def build() -> Path:
     key, cert = _load_key()
-    files = [
-        ('AndroidManifest.xml', build_manifest()),
-        ('resources.arsc', build_arsc()),
-        ('classes.dex', build_dex()),
-        ('assets/ui.html', UI.read_bytes()),
-    ]
+    files = _aapt2_files()
+    files.append(('classes.dex', build_dex()))
     signed = _v1_files(files, key, cert)
-    apk = _v2(_zip(signed), key, cert)
+    apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_bytes(apk)
+    badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
+    if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
+        raise RuntimeError('aapt2 did not recognize the package')
     return OUT
 
 
