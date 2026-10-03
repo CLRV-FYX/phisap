@@ -998,6 +998,63 @@ def _spread_emits(emits, field: RedField, chart: Chart) -> int:
                 e = alt
                 spread += 1
         committed.append(e)
+    spread += _separate_converging(emits, field, intrudes)
+    return spread
+
+
+def _end_ms(e) -> int:
+    path = e.get('path') or ()
+    if e['kind'] == NoteType.HOLD:
+        return e['time'] + len(path)
+    if path:
+        return e['time'] + len(path) - 1
+    return e['time'] + 8
+
+
+def _stays_close(a, b, limit_ms: int = 48) -> bool:
+    """两根手指贴在 24px 里连续超过 limit_ms, 设备会把它俩收成一根。"""
+    start = max(a['time'], b['time'])
+    end = min(_end_ms(a), _end_ms(b))
+    if end - start < limit_ms:
+        return False
+    run = 0
+    for ms in range(start, end + 1, 16):
+        pa, pb = _pos_at(a, ms), _pos_at(b, ms)
+        if pa is None or pb is None:
+            run = 0
+            continue
+        if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) < _STACK_PX:
+            run += 16
+            if run >= limit_ms:
+                return True
+        else:
+            run = 0
+    return False
+
+
+def _separate_converging(emits, field: RedField, intrudes) -> int:
+    """开头没叠上、走到一半贴到一起的长条, 整段垂向挪开。挪进红场就保持原位。"""
+    holds = [e for e in emits if e['kind'] == NoteType.HOLD]
+    holds.sort(key=lambda e: e['time'])
+    spread = 0
+    for i, a in enumerate(holds):
+        a_end = _end_ms(a)
+        for b in holds[i + 1:]:
+            if b['time'] > a_end:
+                break
+            if not _stays_close(a, b):
+                continue
+            alt = _spread_offset(b, field, [a], intrudes)
+            if alt is None:
+                alt = _spread_offset(a, field, [b], intrudes)
+                if alt is None:
+                    continue
+                a.clear()
+                a.update(alt)
+            else:
+                b.clear()
+                b.update(alt)
+            spread += 1
     return spread
 
 

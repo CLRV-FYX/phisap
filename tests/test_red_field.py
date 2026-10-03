@@ -621,6 +621,44 @@ class AlgoredTest(unittest.TestCase):
             self.assertLess(abs(judge_offset(judge, ms, pos)), 8.0, pos)
 
 
+    def test_converging_holds_are_pulled_apart(self):
+        """两根长条走到一半贴在一起时也要拆开, 不能只看按下那一毫秒。"""
+        from note import NoteType
+        from algo.algored import _separate_converging
+
+        class Open:
+            def contains(self, x, y, t, margin=0):
+                return False
+
+        def hold(t, xs):
+            path = tuple((float(x), 360.0) for x in xs)
+            return {
+                'time': t, 'kind': NoteType.HOLD, 'pos': path[0], 'angle': 0.0,
+                'path': path[1:], 'tag': ('h', t), 'line': None, 'note': None, 'hold_meta': None,
+            }
+
+        # 0..80ms 分开, 之后贴在同一点上停 80ms
+        a = hold(0, [200] * 200)
+        b = hold(0, [400] * 80 + [200] * 120)
+        ch = chart_of(line_dict([]))
+        n = _separate_converging([a, b], Open(), lambda ms, old, new: False)
+        self.assertGreaterEqual(n, 1)
+        close = 0
+        for ms in range(80, 180, 8):
+            # path[i] is at time+i+1, head at time
+            def at(e, ms):
+                dt = ms - e['time']
+                if dt == 0:
+                    return e['pos']
+                return e['path'][dt - 1]
+            pa, pb = at(a, ms), at(b, ms)
+            if math.hypot(pa[0] - pb[0], pa[1] - pb[1]) < 36:
+                close += 1
+        self.assertEqual(close, 0, '贴在一起的那段没有拆开')
+        for e in (a, b):
+            self.assertFalse(Open().contains(e['pos'][0], e['pos'][1], 0))
+
+
 class OffsetPlanTest(unittest.TestCase):
     def test_shift_matches_offset(self):
         ch = chart_of(line_dict([note(0.0, 0.0)]))

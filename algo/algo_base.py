@@ -50,7 +50,8 @@ MAX_POINTERS = 16
 #      只有屏幕点马上进红场才剪掉旧手指。走到正中间会自己送进从中间长出来的红区,
 #      跟着跳又会一根接一根换手。
 # v22: 同一时刻叠在同一个点上的音符拆成两根手指。叠在一个像素上, 设备会合成一次触摸, 另一颗漏判。
-PLAN_CACHE_SUFFIX = '.ans.v22.json'
+# v23: 长条走到一半贴到另一根手指上时也拆开。只在开头拆, 后面滑到一起设备还是会合成一次。
+PLAN_CACHE_SUFFIX = '.ans.v23.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
