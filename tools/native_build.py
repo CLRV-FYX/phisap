@@ -54,32 +54,60 @@ def _section_names(blob: bytes) -> list[str]:
     return names
 
 
+def _prebuilt_native() -> dict[str, bytes] | None:
+    """没装 zig 时沿用已验证过的 aarch64 钩子。这次只改 Java 悬浮窗，不重编 so。"""
+    import zipfile
+    apk = ROOT / 'android' / 'phisap-pocket.apk'
+    if not apk.is_file():
+        return None
+    with zipfile.ZipFile(apk) as blob:
+        names = set(blob.namelist())
+
+        def pick(*cands: str) -> bytes | None:
+            for name in cands:
+                if name in names:
+                    return blob.read(name)
+            return None
+
+        so = pick('lib/arm64-v8a/libphisap.so', 'assets/libphisap.so')
+        tapd = pick('assets/phisap-tapd', 'lib/arm64-v8a/libphisap-tapd.so')
+        inject = pick('assets/phisap-inject', 'lib/arm64-v8a/libphisap-inject.so')
+    if not so or not tapd or not inject:
+        return None
+    return {'so': so, 'tapd': tapd, 'inject': inject}
+
+
 def build_native() -> dict[str, bytes]:
-    zig = find_zig()
-    out = Path('/tmp/phisap-native')
-    out.mkdir(parents=True, exist_ok=True)
-    so = out / 'libphisap.so'
-    tapd = out / 'phisap-tapd'
-    inject = out / 'phisap-inject'
-    subprocess.check_call([
-        zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
-        '-nostdlib', '-fno-stack-protector', '-O2', '-fno-exceptions',
-        str(NATIVE / 'hook.c'), str(NATIVE / 'hook.S'), '-o', str(so),
-    ])
-    subprocess.check_call([
-        zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
-        '-fno-stack-protector', str(NATIVE / 'tapd.c'), '-o', str(tapd),
-    ])
-    subprocess.check_call([
-        zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
-        '-fno-stack-protector', str(NATIVE / 'inject.c'), '-o', str(inject),
-    ])
-    blobs = {
-        'so': so.read_bytes(),
-        'tapd': tapd.read_bytes(),
-        'inject': inject.read_bytes(),
-        'script': (NATIVE / 'inside.sh').read_bytes().replace(b'\r\n', b'\n'),
-    }
+    script = (NATIVE / 'inside.sh').read_bytes().replace(b'\r\n', b'\n')
+    try:
+        zig = find_zig()
+    except RuntimeError:
+        zig = None
+    if zig:
+        out = Path('/tmp/phisap-native')
+        out.mkdir(parents=True, exist_ok=True)
+        so = out / 'libphisap.so'
+        tapd = out / 'phisap-tapd'
+        inject = out / 'phisap-inject'
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
+            '-nostdlib', '-fno-stack-protector', '-O2', '-fno-exceptions',
+            str(NATIVE / 'hook.c'), str(NATIVE / 'hook.S'), '-o', str(so),
+        ])
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
+            '-fno-stack-protector', str(NATIVE / 'tapd.c'), '-o', str(tapd),
+        ])
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
+            '-fno-stack-protector', str(NATIVE / 'inject.c'), '-o', str(inject),
+        ])
+        blobs = {'so': so.read_bytes(), 'tapd': tapd.read_bytes(), 'inject': inject.read_bytes()}
+    else:
+        blobs = _prebuilt_native()
+        if blobs is None:
+            raise RuntimeError('找不到 zig，也没有现成的 aarch64 钩子')
+    blobs['script'] = script
     for name in ('so', 'tapd', 'inject'):
         if _elf_machine(blobs[name]) != 0xB7:
             raise RuntimeError(f'{name} 不是 aarch64')
