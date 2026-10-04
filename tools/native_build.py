@@ -91,7 +91,7 @@ def build_native() -> dict[str, bytes]:
     for needle in (b'JudgeLineControl', b'UpdateInfo', b'libil2cpp.so', b'phisap-hook'):
         if needle not in blobs['so']:
             raise RuntimeError(f'钩子里没有 {needle.decode()}')
-    if b'LD_PRELOAD=$SO' not in blobs['script'] and b'LD_PRELOAD=/data/local/tmp/libphisap.so' not in blobs['script']:
+    if b'LD_PRELOAD=' not in blobs['script']:
         raise RuntimeError('wrap 脚本没有设 LD_PRELOAD')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')

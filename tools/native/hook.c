@@ -92,19 +92,145 @@ static void log_num(const char *prefix, long long n) {
     log_raw(buf);
 }
 
-static void write_status(const char *s) {
-    int fd = open("/data/local/tmp/phisap-status", 1 | 64 | 512, 0666);
-    if (fd >= 0) {
-        write(fd, s, slen(s));
-        write(fd, "\n", 1);
-        close(fd);
+struct Scan { int fd; char buf[1024]; int n, i; };
+
+static int scan_open(struct Scan *sc, const char *path) {
+    sc->fd = open(path, 0, 0);
+    sc->n = 0;
+    sc->i = 0;
+    return sc->fd >= 0;
+}
+static void scan_close(struct Scan *sc) {
+    if (sc->fd >= 0) close(sc->fd);
+    sc->fd = -1;
+}
+static int scan_line(struct Scan *sc, char *out, int cap) {
+    int n = 0;
+    if (cap < 1) return 0;
+    for (;;) {
+        if (sc->i >= sc->n) {
+            long r = read(sc->fd, sc->buf, sizeof sc->buf);
+            sc->n = r > 0 ? (int)r : 0;
+            sc->i = 0;
+            if (sc->n <= 0) {
+                out[n] = 0;
+                return n > 0;
+            }
+        }
+        char c = sc->buf[sc->i++];
+        if (c == '\n') {
+            out[n] = 0;
+            return 1;
+        }
+        if (n + 1 < cap) out[n++] = c;
     }
+}
+
+static int mapped_path(const char *soname, char *path, unsigned long path_n) {
+    struct Scan sc;
+    char line[512];
+    path[0] = 0;
+    if (!scan_open(&sc, "/proc/self/maps")) return 0;
+    while (scan_line(&sc, line, sizeof line)) {
+        if (!strhas(line, soname)) continue;
+        const char *p = line;
+        while (*p && *p != '/') p++;
+        if (*p) {
+            scopy(path, p, path_n);
+            break;
+        }
+    }
+    scan_close(&sc);
+    return path[0] != 0;
+}
+
+static char side_dir[240];
+static void cache_side(void) {
+    if (side_dir[0]) return;
+    char so[256];
+    if (!mapped_path("libphisap.so", so, sizeof so)) return;
+    char *slash = 0;
+    for (char *p = so; *p; p++) if (*p == '/') slash = p;
+    if (!slash) return;
+    unsigned long n = (unsigned long)(slash - so) + 1;
+    if (n + 1 >= sizeof side_dir) return;
+    for (unsigned long i = 0; i < n; i++) side_dir[i] = so[i];
+    side_dir[n] = 0;
+}
+static void side_file(char *out, unsigned long n, const char *name) {
+    cache_side();
+    out[0] = 0;
+    if (!side_dir[0]) return;
+    scopy(out, side_dir, n);
+    unsigned long j = slen(out);
+    for (unsigned long k = 0; name[k] && j + 1 < n; k++) out[j++] = name[k];
+    out[j] = 0;
+}
+static void write_file(const char *path, const char *s) {
+    int fd = open(path, 1 | 64 | 512, 0666);
+    if (fd < 0) return;
+    write(fd, s, slen(s));
+    write(fd, "\n", 1);
+    close(fd);
+}
+static int pkg_file(char *out, unsigned long n, const char *name) {
+    char pkg[128];
+    int fd = open("/proc/self/cmdline", 0, 0);
+    out[0] = 0;
+    if (fd < 0) return 0;
+    long nr = read(fd, pkg, sizeof pkg - 1);
+    close(fd);
+    if (nr <= 0) return 0;
+    pkg[nr] = 0;
+    const char *pre = "/data/user/0/";
+    const char *mid = "/files/";
+    unsigned long j = 0;
+    for (unsigned long i = 0; pre[i] && j + 1 < n; i++) out[j++] = pre[i];
+    for (unsigned long i = 0; pkg[i] && j + 1 < n; i++) out[j++] = pkg[i];
+    for (unsigned long i = 0; mid[i] && j + 1 < n; i++) out[j++] = mid[i];
+    for (unsigned long i = 0; name[i] && j + 1 < n; i++) out[j++] = name[i];
+    out[j] = 0;
+    return j > 0;
+}
+static void write_status(const char *s) {
+    char side[256];
+    write_file("/data/local/tmp/phisap-status", s);
+    side_file(side, sizeof side, "phisap-status");
+    if (side[0]) write_file(side, s);
+    if (pkg_file(side, sizeof side, "phisap-status")) write_file(side, s);
     log_raw(s);
     log_raw("\n");
 }
+static void status_sec(const char *head, int sec) {
+    char buf[80];
+    char tmp[12];
+    int j = 0, i = 0;
+    unsigned n = sec < 0 ? 0 : (unsigned)sec;
+    scopy(buf, head, 60);
+    j = (int)slen(buf);
+    if (!n) tmp[i++] = '0';
+    while (n && i < 10) { tmp[i++] = (char)('0' + n % 10); n /= 10; }
+    while (i > 0 && j < 72) buf[j++] = tmp[--i];
+    if (j < 76) buf[j++] = 's';
+    buf[j] = 0;
+    write_status(buf);
+}
+static int file_exists(const char *path) {
+    int fd = open(path, 0, 0);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+static int stop_asked(void) {
+    char side[256];
+    if (file_exists("/data/local/tmp/phisap-stop")) return 1;
+    side_file(side, sizeof side, "phisap-stop");
+    if (side[0] && file_exists(side)) return 1;
+    return pkg_file(side, sizeof side, "phisap-stop") && file_exists(side);
+}
 
 struct Map { uintptr_t start, end; int r, x; };
-static struct Map maps[512];
+static struct Map maps[4096];
 static int nmaps;
 
 static int hexval(char c) {
@@ -124,25 +250,14 @@ static int parse_hex(const char *s, const char **end, uintptr_t *out) {
 }
 
 static void load_maps(void) {
-    char buf[65536];
-    int fd = open("/proc/self/maps", 0, 0);
+    struct Scan sc;
+    char line[512];
     nmaps = 0;
-    if (fd < 0) return;
-    unsigned long got = 0;
-    while (got + 1 < sizeof buf) {
-        long n = read(fd, buf + got, sizeof buf - 1 - got);
-        if (n <= 0) break;
-        got += (unsigned long)n;
-    }
-    close(fd);
-    buf[got] = 0;
-    char *p = buf;
-    while (*p && nmaps < 512) {
-        char *nl = p;
-        while (*nl && *nl != '\n') nl++;
+    if (!scan_open(&sc, "/proc/self/maps")) return;
+    while (scan_line(&sc, line, sizeof line) && nmaps < 4096) {
         uintptr_t a, b;
         const char *e;
-        if (parse_hex(p, &e, &a) && *e == '-' && parse_hex(e + 1, &e, &b)) {
+        if (parse_hex(line, &e, &a) && *e == '-' && parse_hex(e + 1, &e, &b)) {
             while (*e == ' ') e++;
             maps[nmaps].start = a;
             maps[nmaps].end = b;
@@ -150,9 +265,8 @@ static void load_maps(void) {
             maps[nmaps].x = e[2] == 'x';
             nmaps++;
         }
-        if (!*nl) break;
-        p = nl + 1;
     }
+    scan_close(&sc);
 }
 
 static int readable(const void *p, unsigned long n) {
@@ -374,49 +488,33 @@ static void *find_sym(const char *path, uint64_t bias, const char *want) {
 }
 
 static int map_lib(const char *soname, char *path, unsigned long path_n, uint64_t *bias) {
-    char buf[1 << 16];
-    int fd = open("/proc/self/maps", 0, 0);
-    if (fd < 0) return 0;
-    unsigned long got = 0;
-    while (got + 1 < sizeof buf) {
-        long n = read(fd, buf + got, sizeof buf - 1 - got);
-        if (n <= 0) break;
-        got += (unsigned long)n;
-    }
-    close(fd);
-    buf[got] = 0;
+    struct Scan sc;
+    char line[512];
     uintptr_t best = ~(uintptr_t)0;
     uintptr_t best_off = 0;
     char best_path[256];
     best_path[0] = 0;
-    char *p = buf;
-    while (*p) {
-        char *nl = p;
-        while (*nl && *nl != '\n') nl++;
-        char saved = *nl;
-        *nl = 0;
-        if (strhas(p, soname)) {
-            uintptr_t a = 0, off = 0;
-            const char *e;
-            if (parse_hex(p, &e, &a) && *e == '-') {
-                while (*e && *e != ' ') e++;
-                while (*e == ' ') e++;
-                while (*e && *e != ' ') e++;
-                while (*e == ' ') e++;
-                parse_hex(e, &e, &off);
-                const char *path_s = e;
-                while (*path_s && *path_s != '/') path_s++;
-                if (*path_s && a < best) {
-                    best = a;
-                    best_off = off;
-                    scopy(best_path, path_s, sizeof best_path);
-                }
-            }
+    path[0] = 0;
+    if (!scan_open(&sc, "/proc/self/maps")) return 0;
+    while (scan_line(&sc, line, sizeof line)) {
+        if (!strhas(line, soname)) continue;
+        uintptr_t a = 0, off = 0;
+        const char *e;
+        if (!parse_hex(line, &e, &a) || *e != '-') continue;
+        while (*e && *e != ' ') e++;
+        while (*e == ' ') e++;
+        while (*e && *e != ' ') e++;
+        while (*e == ' ') e++;
+        parse_hex(e, &e, &off);
+        const char *path_s = e;
+        while (*path_s && *path_s != '/') path_s++;
+        if (*path_s && a < best) {
+            best = a;
+            best_off = off;
+            scopy(best_path, path_s, sizeof best_path);
         }
-        *nl = saved;
-        if (!saved) break;
-        p = nl + 1;
     }
+    scan_close(&sc);
     if (!best_path[0]) return 0;
     scopy(path, best_path, path_n);
     int efd = open(path, 0, 0);
@@ -451,8 +549,12 @@ static int resolve_api(void) {
     } while (0)
     path[0] = 0;
     if (!map_lib("libil2cpp.so", path, sizeof path, &bias)) {
+        if (!handle && path[0]) handle = dlopen(path, 4);
+        if (!handle && path[0]) handle = dlopen(path, 2);
         if (!handle) return 0;
     } else {
+        if (!handle && path[0]) handle = dlopen(path, 4);
+        if (!handle && path[0]) handle = dlopen(path, 2);
         log_raw("libil2cpp ");
         log_raw(path);
         log_raw("\n");
@@ -639,6 +741,9 @@ static void finger_up(struct Finger *f) {
     tap_send(1, f->slot, f->x, f->y);
     f->alive = 0;
     f->note = 0;
+}
+static void release_all(void) {
+    for (int i = 0; i < 10; i++) if (fingers[i].alive) finger_up(&fingers[i]);
 }
 
 static void release_due(long long now) {
@@ -950,6 +1055,12 @@ void sample_line(void *self) {
     in_sample = 1;
     static int frames;
     frames++;
+    if (stop_asked()) {
+        release_all();
+        if ((frames % 30) == 1) write_status("已停止");
+        in_sample = 0;
+        return;
+    }
     if ((frames % 60) == 1) load_maps();
     release_due(now_ms());
     if (!ensure_offsets(self)) { in_sample = 0; return; }
@@ -1000,12 +1111,25 @@ static int hook_method(void *klass, const char *name) {
     return 1;
 }
 
+static void wait_if_stopped(void) {
+    int said = 0;
+    while (stop_asked()) {
+        if (!said) { write_status("已停止"); said = 1; }
+        usleep(200000);
+    }
+}
 static void *worker(void *arg) {
     (void)arg;
-    write_status("等 il2cpp");
-    for (int i = 0; i < 600; i++) {
+    write_status("钩子已进进程");
+    for (int i = 0; i < 900; i++) {
+        wait_if_stopped();
         load_maps();
         if (resolve_api() && api.domain_get && api.domain_get()) break;
+        if ((i % 10) == 0) {
+            char path[256];
+            if (mapped_path("libil2cpp.so", path, sizeof path)) status_sec("找到 il2cpp，正在读 ", i / 10);
+            else status_sec("钩子已进，游戏加载中 ", i / 10);
+        }
         usleep(100000);
     }
     if (!api.ok || !api.domain_get || !api.domain_get()) {
@@ -1013,10 +1137,15 @@ static void *worker(void *arg) {
         return 0;
     }
     if (api.thread_attach) api.thread_attach(api.domain_get());
+    write_status("已进 il2cpp，等判定线");
     void *line = 0;
-    for (int i = 0; i < 80 && !line; i++) {
+    for (int i = 0; i < 200 && !line; i++) {
+        wait_if_stopped();
         line = find_class("JudgeLineControl", 0);
-        if (!line) usleep(100000);
+        if (!line) {
+            if ((i % 10) == 0) status_sec("已进 il2cpp，等判定线 ", i / 10);
+            usleep(100000);
+        }
     }
     if (!line) {
         write_status("没有 JudgeLineControl");
@@ -1043,7 +1172,8 @@ __attribute__((constructor)) void phisap_init(void) {
     if (once) return;
     once = 1;
     signal(13, (void (*)(int))1);
-    log_raw("phisap-hook-10\n");
+    log_raw("phisap-hook-11\n");
+    write_status("钩子已进进程");
     unsigned long th = 0;
-    pthread_create(&th, 0, worker, 0);
+    if (pthread_create(&th, 0, worker, 0) != 0) write_status("钩子线程没起来");
 }

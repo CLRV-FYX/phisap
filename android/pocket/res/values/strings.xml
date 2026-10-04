@@ -16,7 +16,7 @@
     <string name="test_tap">测试点一下</string>
     <string name="setup_title">怎么接上</string>
     <string name="step_pc">计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</string>
-    <string name="step_lsposed">外部触摸用电脑传来的计划。进程内不需要计划：root 把钩子送进 Phigros，看判定线自己点。Phira 是 Rust，钩子进不去，仍用外部触摸。</string>
+    <string name="step_lsposed">点开始就会进游戏，画面上方一直留着悬浮窗，随时点停止。不用再等，也不用再点别的。进程内不需要计划。Phira 没有 il2cpp，悬浮窗会说明，仍用外部触摸。</string>
     <string name="step_npatch">只打 Phigros 且不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持 com.PigeonGames.Phigros。这条路打不了 Phira。</string>
     <string name="ceiling">权限到 root 为止。不需要电脑常开，也不改第二套框架。</string>
 </resources>

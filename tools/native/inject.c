@@ -45,7 +45,7 @@ static uint64_t v2off(Elf64_Phdr *ph, int nph, uint64_t v) {
     return 0;
 }
 
-static uint64_t find_dlopen(const char *path, uint64_t map_start, uint64_t map_off) {
+static uint64_t find_sym_file(const char *path, uint64_t map_start, uint64_t map_off, const char *want) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     Elf64_Ehdr eh;
@@ -97,7 +97,7 @@ static uint64_t find_dlopen(const char *path, uint64_t map_start, uint64_t map_o
         ssize_t nr = read(fd, name, sizeof name - 1);
         if (nr <= 0) continue;
         name[nr] = 0;
-        if (strcmp(name, "dlopen") == 0) {
+        if (strcmp(name, want) == 0) {
             close(fd);
             return bias + sym.st_value;
         }
@@ -106,27 +106,72 @@ static uint64_t find_dlopen(const char *path, uint64_t map_start, uint64_t map_o
     return 0;
 }
 
-static uint64_t remote_dlopen(pid_t pid) {
+struct OpenFn {
+    uint64_t addr;
+    int loader;
+    uint64_t caller;
+    uint64_t fallback;
+};
+
+static int map_first(pid_t pid, const char *needle, int exec_only,
+                     uint64_t *start, uint64_t *off, char *path, size_t path_n) {
     char maps_path[64];
     snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", pid);
     FILE *f = fopen(maps_path, "r");
     if (!f) return 0;
     char line[512];
     uint64_t best = ~0ull, best_off = 0;
-    char path[256] = {0};
+    char best_path[256] = {0};
     while (fgets(line, sizeof line, f)) {
-        if (!strstr(line, "libc.so")) continue;
-        unsigned long long start = 0, off = 0;
-        if (sscanf(line, "%llx-%*x %*s %llx", &start, &off) < 1) continue;
+        if (!strstr(line, needle)) continue;
+        unsigned long long a = 0, o = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%*x %7s %llx", &a, perms, &o) < 2) continue;
+        if (exec_only && !strchr(perms, 'x')) continue;
         char *slash = strchr(line, '/');
-        if (!slash || start >= best) continue;
-        best = start;
-        best_off = off;
-        sscanf(slash, "%255s", path);
+        if (!slash || a >= best) continue;
+        best = a;
+        best_off = o;
+        sscanf(slash, "%255s", best_path);
     }
     fclose(f);
-    if (!path[0]) return 0;
-    return find_dlopen(path, best, best_off);
+    if (!best_path[0]) return 0;
+    *start = best;
+    *off = best_off;
+    snprintf(path, path_n, "%s", best_path);
+    return 1;
+}
+
+static uint64_t sym_in(pid_t pid, const char *lib, const char *sym) {
+    uint64_t start = 0, off = 0;
+    char path[256];
+    if (!map_first(pid, lib, 0, &start, &off, path, sizeof path)) return 0;
+    return find_sym_file(path, start, off, sym);
+}
+
+static uint64_t caller_of(pid_t pid) {
+    const char *names[] = {"libil2cpp.so", "libunity.so", "libmain.so", 0};
+    for (int i = 0; names[i]; i++) {
+        uint64_t start = 0, off = 0;
+        char path[256];
+        if (map_first(pid, names[i], 1, &start, &off, path, sizeof path)) return start;
+    }
+    return 0;
+}
+
+static struct OpenFn resolve_open(pid_t pid) {
+    struct OpenFn fn;
+    fn.addr = sym_in(pid, "linker64", "__loader_dlopen");
+    fn.loader = fn.addr ? 1 : 0;
+    fn.caller = caller_of(pid);
+    fn.fallback = sym_in(pid, "libdl.so", "dlopen");
+    if (!fn.fallback) fn.fallback = sym_in(pid, "libc.so", "dlopen");
+    if (!fn.addr) {
+        fn.addr = fn.fallback;
+        fn.fallback = 0;
+        fn.loader = 0;
+    }
+    return fn;
 }
 
 static int poke(pid_t pid, unsigned long addr, const void *src, size_t n) {
@@ -140,6 +185,39 @@ static int poke(pid_t pid, unsigned long addr, const void *src, size_t n) {
         memcpy(&word, p + i, m);
         if (ptrace(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0) return -1;
     }
+    return 0;
+}
+
+static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
+                         uint64_t a0, uint64_t a1, uint64_t a2, int loader, unsigned long *out) {
+    struct pt_regs_arm64 regs = *saved;
+    regs.regs[0] = a0;
+    regs.regs[1] = a1;
+    if (loader) regs.regs[2] = a2;
+    regs.regs[30] = 0;
+    regs.pc = fn;
+    regs.sp = (a0 - 128) & ~0xful;
+    struct iovec iov = { &regs, sizeof regs };
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) < 0
+        || ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
+        iov.iov_base = saved;
+        ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+        return -1;
+    }
+    int got = 0, st = 0;
+    for (int i = 0; i < 8 && !timed_out; i++) {
+        if (waitpid(pid, &st, 0) < 0) break;
+        if (!WIFSTOPPED(st)) break;
+        int sig = WSTOPSIG(st);
+        if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS) { got = 1; break; }
+        if (ptrace(PTRACE_CONT, pid, 0, 0) < 0) break;
+    }
+    iov.iov_base = &regs;
+    ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+    *out = regs.regs[0];
+    iov.iov_base = saved;
+    ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+    if (!got || timed_out) return -2;
     return 0;
 }
 
@@ -178,13 +256,13 @@ int main(int argc, char **argv) {
         }
         close(efd);
     }
-    uint64_t dlopen_addr = remote_dlopen(pid);
-    if (!dlopen_addr) {
+    struct OpenFn fn = resolve_open(pid);
+    if (!fn.addr) {
         fprintf(stderr, "找不到 dlopen\n");
         return 1;
     }
     signal(SIGALRM, on_alarm);
-    alarm(6);
+    alarm(8);
     if (ptrace(PTRACE_ATTACH, pid, 0, 0) < 0) {
         fprintf(stderr, "ptrace 失败: %s\n", strerror(errno));
         return 1;
@@ -195,54 +273,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, "attach 后没有停住\n");
         return 1;
     }
-    struct pt_regs_arm64 regs, saved;
-    struct iovec iov = { &regs, sizeof regs };
+    struct pt_regs_arm64 saved;
+    struct iovec iov = { &saved, sizeof saved };
     if (ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) < 0) {
         ptrace(PTRACE_DETACH, pid, 0, 0);
         fprintf(stderr, "读寄存器失败\n");
         return 1;
     }
-    saved = regs;
-    unsigned long remote = (regs.sp - 512) & ~0xful;
+    unsigned long remote = (saved.sp - 512) & ~0xful;
     char path[256];
     snprintf(path, sizeof path, "%s", so);
     if (poke(pid, remote, path, strlen(path) + 1) != 0) {
-        ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &(struct iovec){ &saved, sizeof saved });
         ptrace(PTRACE_DETACH, pid, 0, 0);
         fprintf(stderr, "写路径失败\n");
         return 1;
     }
-    regs.regs[0] = remote;
-    regs.regs[1] = 2; /* RTLD_NOW */
-    regs.regs[30] = 0;
-    regs.pc = dlopen_addr;
-    regs.sp = (remote - 128) & ~0xful;
-    iov.iov_base = &regs;
-    iov.iov_len = sizeof regs;
-    if (ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) < 0
-        || ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
-        iov.iov_base = &saved;
-        ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        fprintf(stderr, "没法跳到 dlopen\n");
+    unsigned long handle = 0;
+    int rc = invoke_remote(pid, &saved, fn.addr, remote, 2, fn.caller, fn.loader, &handle);
+    if ((rc != 0 || !handle) && fn.fallback && fn.fallback != fn.addr && !timed_out) {
+        unsigned long handle2 = 0;
+        int rc2 = invoke_remote(pid, &saved, fn.fallback, remote, 2, 0, 0, &handle2);
+        if (rc2 == 0 && handle2) {
+            handle = handle2;
+            rc = 0;
+        } else if (rc == 0) {
+            rc = rc2;
+        }
+    }
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    if (rc == -2 || timed_out) {
+        fprintf(stderr, "dlopen 没有返回\n");
         return 1;
     }
-    int got = 0;
-    for (int i = 0; i < 8 && !timed_out; i++) {
-        if (waitpid(pid, &st, 0) < 0) break;
-        if (!WIFSTOPPED(st)) break;
-        int sig = WSTOPSIG(st);
-        if (sig == SIGSEGV || sig == SIGTRAP) { got = 1; break; }
-        ptrace(PTRACE_CONT, pid, 0, 0);
-    }
-    iov.iov_base = &regs;
-    ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
-    unsigned long handle = regs.regs[0];
-    iov.iov_base = &saved;
-    ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
-    ptrace(PTRACE_DETACH, pid, 0, 0);
-    if (!got || timed_out) {
-        fprintf(stderr, "dlopen 没有返回\n");
+    if (rc != 0) {
+        fprintf(stderr, "没法跳到 dlopen\n");
         return 1;
     }
     if (!handle) {

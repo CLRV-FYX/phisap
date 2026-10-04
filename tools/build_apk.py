@@ -555,8 +555,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='10'" not in badging:
-        raise RuntimeError('versionCode 不是 10')
+    if "versionCode='11'" not in badging:
+        raise RuntimeError('versionCode 不是 11')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -579,7 +579,7 @@ def build() -> Path:
             raise RuntimeError(f'资源 id 变了: {needle}')
     if b'Lde/robv/android/xposed/IXposedHookLoadPackage;' in dex:
         raise RuntimeError('dex 仍引用不存在的 Xposed 接口')
-    if '正在把钩子送进游戏'.encode() not in dex or b'libphisap.so' not in dex:
+    if '正在进游戏'.encode() not in dex or '悬浮窗会留在画面上'.encode() not in dex or b'libphisap.so' not in dex:
         raise RuntimeError('进程内入口没有进 dex')
     with zipfile.ZipFile(OUT) as blob:
         names = set(blob.namelist())
