@@ -1,0 +1,308 @@
+/* root 触摸守护。游戏里的钩子把点写到抽象套接字，这里用 uinput 发出去。
+ * 坐标换算和电脑版注入器的 toDev 一致：先对上当前屏幕，再转成自然方向。
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <linux/input.h>
+#include <linux/uinput.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+
+#define MAGIC 0x31534850u
+
+struct Msg {
+    uint32_t magic;
+    int32_t action;
+    int32_t slot;
+    int32_t x;
+    int32_t y;
+};
+
+static int ufd = -1;
+static int fingers;
+static int track = 1;
+static int cur_w = 1080, cur_h = 2400, rot = 0;
+static int uw, uh;
+static int nat_w = 1080, nat_h = 2400;
+static int dev_ready;
+
+static void die(const char *s) {
+    perror(s);
+    exit(1);
+}
+
+static int cfg_int(const char *text, const char *key, int fallback) {
+    char pat[32];
+    snprintf(pat, sizeof pat, "%s=", key);
+    const char *p = strstr(text, pat);
+    if (!p) return fallback;
+    return atoi(p + strlen(pat));
+}
+
+static void load_cfg(void) {
+    FILE *f = fopen("/data/local/tmp/phisap-hook.cfg", "r");
+    if (!f) return;
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    int w = cfg_int(buf, "dw", cur_w);
+    int h = cfg_int(buf, "dh", cur_h);
+    int r = cfg_int(buf, "rot", rot);
+    int a = cfg_int(buf, "uw", uw);
+    int b = cfg_int(buf, "uh", uh);
+    if (w > 100 && h > 100) { cur_w = w; cur_h = h; }
+    if (r >= 0 && r <= 3) rot = r;
+    if (a > 100 && b > 100) { uw = a; uh = b; }
+}
+
+static int parse_display(char *text, int *w, int *h, int *r) {
+    char *cur = strstr(text, "cur=");
+    if (!cur) return 0;
+    cur += 4;
+    int ww = 0, hh = 0;
+    if (sscanf(cur, "%dx%d", &ww, &hh) != 2 || ww < 100 || hh < 100) return 0;
+    *w = ww;
+    *h = hh;
+    int rr = *r;
+    char *mr = strstr(text, "mRotation=");
+    if (mr) {
+        mr += 10;
+        if (*mr >= '0' && *mr <= '3') rr = *mr - '0';
+    }
+    char *name = strstr(text, "ROTATION_");
+    if (name) {
+        name += 9;
+        if (*name == '0') rr = 0;
+        else if (*name == '9') rr = 1;
+        else if (*name == '1') rr = 2;
+        else if (*name == '2') rr = 3;
+    }
+    *r = rr;
+    return 1;
+}
+
+static void refresh_display(void) {
+    FILE *f = popen("/system/bin/dumpsys window", "r");
+    if (!f) return;
+    char *buf = malloc(256 * 1024);
+    if (!buf) { pclose(f); return; }
+    size_t n = fread(buf, 1, 256 * 1024 - 1, f);
+    pclose(f);
+    buf[n] = 0;
+    int w = cur_w, h = cur_h, r = rot;
+    if (parse_display(buf, &w, &h, &r)) {
+        cur_w = w;
+        cur_h = h;
+        rot = r;
+    }
+    free(buf);
+}
+
+static void emit(int type, int code, int value) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = (uint16_t)type;
+    ev.code = (uint16_t)code;
+    ev.value = value;
+    if (write(ufd, &ev, sizeof ev) != (ssize_t)sizeof ev) {
+        /* 设备被拔掉就下次重建 */
+        close(ufd);
+        ufd = -1;
+        dev_ready = 0;
+    }
+}
+
+static int setup_dev(void) {
+    if (rot == 1 || rot == 3) { nat_w = cur_h; nat_h = cur_w; }
+    else { nat_w = cur_w; nat_h = cur_h; }
+    if (nat_w < 100) nat_w = 1080;
+    if (nat_h < 100) nat_h = 2400;
+    ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (ufd < 0) {
+        perror("open /dev/uinput");
+        return -1;
+    }
+    ioctl(ufd, UI_SET_EVBIT, EV_SYN);
+    ioctl(ufd, UI_SET_EVBIT, EV_KEY);
+    ioctl(ufd, UI_SET_EVBIT, EV_ABS);
+    ioctl(ufd, UI_SET_KEYBIT, BTN_TOUCH);
+    ioctl(ufd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
+    int axes[] = {ABS_MT_SLOT, ABS_MT_TOUCH_MAJOR, ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
+                  ABS_MT_TRACKING_ID, ABS_MT_PRESSURE, ABS_X, ABS_Y};
+    for (unsigned i = 0; i < sizeof axes / sizeof axes[0]; i++) ioctl(ufd, UI_SET_ABSBIT, axes[i]);
+    ioctl(ufd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    struct uinput_user_dev dev;
+    memset(&dev, 0, sizeof dev);
+    snprintf(dev.name, sizeof dev.name, "phisap");
+    dev.id.bustype = BUS_VIRTUAL;
+    dev.absmax[ABS_MT_POSITION_X] = nat_w;
+    dev.absmax[ABS_MT_POSITION_Y] = nat_h;
+    dev.absmax[ABS_X] = nat_w;
+    dev.absmax[ABS_Y] = nat_h;
+    dev.absmax[ABS_MT_SLOT] = 9;
+    dev.absmax[ABS_MT_TOUCH_MAJOR] = 255;
+    dev.absmax[ABS_MT_PRESSURE] = 255;
+    dev.absmax[ABS_MT_TRACKING_ID] = 65535;
+    if (write(ufd, &dev, sizeof dev) != (ssize_t)sizeof dev) {
+        perror("write uinput dev");
+        close(ufd);
+        ufd = -1;
+        return -1;
+    }
+    if (ioctl(ufd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE");
+        close(ufd);
+        ufd = -1;
+        return -1;
+    }
+    dev_ready = 1;
+    fingers = 0;
+    fprintf(stderr, "uinput %dx%d rot=%d cur=%dx%d\n", nat_w, nat_h, rot, cur_w, cur_h);
+    return 0;
+}
+
+static void to_dev(int x, int y, int *ox, int *oy) {
+    int sx = x, sy = y;
+    if (uw > 0 && uh > 0) {
+        sx = (int)((long)x * cur_w / uw);
+        sy = (int)((long)y * cur_h / uh);
+    }
+    if (rot == 1) { *ox = cur_h - sy; *oy = sx; }
+    else if (rot == 2) { *ox = cur_w - sx; *oy = cur_h - sy; }
+    else if (rot == 3) { *ox = sy; *oy = cur_w - sx; }
+    else { *ox = sx; *oy = sy; }
+    if (*ox < 0) *ox = 0;
+    if (*oy < 0) *oy = 0;
+    if (*ox >= nat_w) *ox = nat_w - 1;
+    if (*oy >= nat_h) *oy = nat_h - 1;
+}
+
+static void finger(int slot, int action, int x, int y) {
+    if (!dev_ready) return;
+    if (slot < 0 || slot > 9) return;
+    emit(EV_ABS, ABS_MT_SLOT, slot);
+    if (action == 0) {
+        int id = track++;
+        if (track > 60000) track = 1;
+        emit(EV_ABS, ABS_MT_TRACKING_ID, id);
+        emit(EV_ABS, ABS_MT_POSITION_X, x);
+        emit(EV_ABS, ABS_MT_POSITION_Y, y);
+        emit(EV_ABS, ABS_MT_PRESSURE, 40);
+        fingers++;
+        emit(EV_KEY, BTN_TOUCH, 1);
+        emit(EV_KEY, BTN_TOOL_FINGER, 1);
+    } else if (action == 1) {
+        emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+        if (fingers > 0) fingers--;
+        if (fingers == 0) {
+            emit(EV_KEY, BTN_TOUCH, 0);
+            emit(EV_KEY, BTN_TOOL_FINGER, 0);
+        }
+    } else {
+        emit(EV_ABS, ABS_MT_POSITION_X, x);
+        emit(EV_ABS, ABS_MT_POSITION_Y, y);
+    }
+    emit(EV_SYN, SYN_REPORT, 0);
+}
+
+static void lift_all(void) {
+    if (!dev_ready) return;
+    for (int s = 0; s < 10; s++) finger(s, 1, 0, 0);
+    fingers = 0;
+}
+
+static volatile int running = 1;
+static void on_stop(int sig) { (void)sig; running = 0; }
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, on_stop);
+    signal(SIGINT, on_stop);
+    load_cfg();
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) die("socket");
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = 0;
+    memcpy(addr.sun_path + 1, "phisap", 6);
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(sa_family_t) + 7) < 0) die("bind");
+    if (listen(srv, 4) < 0) die("listen");
+    fprintf(stderr, "phisap-tapd ready\n");
+    int client = -1;
+    unsigned char acc[64];
+    int acc_n = 0;
+    while (running) {
+        if (access("/data/local/tmp/phisap-stop", F_OK) == 0) break;
+        struct pollfd fds[2];
+        int nfd = 0;
+        fds[nfd].fd = srv;
+        fds[nfd].events = POLLIN;
+        nfd++;
+        if (client >= 0) {
+            fds[nfd].fd = client;
+            fds[nfd].events = POLLIN;
+            nfd++;
+        }
+        int pr = poll(fds, nfd, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0 && !dev_ready) {
+            static int polls;
+            if ((++polls % 8) == 0) refresh_display();
+        }
+        if (fds[0].revents & POLLIN) {
+            int fd = accept(srv, 0, 0);
+            if (fd >= 0) {
+                if (client >= 0) close(client);
+                client = fd;
+                acc_n = 0;
+            }
+        }
+        if (client >= 0 && nfd == 2 && (fds[1].revents & (POLLIN | POLLHUP))) {
+            unsigned char tmp[256];
+            ssize_t n = read(client, tmp, sizeof tmp);
+            if (n <= 0) { close(client); client = -1; acc_n = 0; continue; }
+            if (acc_n + n > (int)sizeof acc) acc_n = 0;
+            memcpy(acc + acc_n, tmp, (size_t)n);
+            acc_n += (int)n;
+            while (acc_n >= (int)sizeof(struct Msg)) {
+                struct Msg m;
+                memcpy(&m, acc, sizeof m);
+                memmove(acc, acc + sizeof m, (size_t)(acc_n - (int)sizeof m));
+                acc_n -= (int)sizeof m;
+                if (m.magic != MAGIC) { acc_n = 0; break; }
+                if (m.action == 8) {
+                    if (m.x > 100 && m.y > 100) { uw = m.x; uh = m.y; }
+                    continue;
+                }
+                if (!dev_ready) {
+                    refresh_display();
+                    load_cfg();
+                    if (setup_dev() != 0) continue;
+                }
+                int ox, oy;
+                to_dev(m.x, m.y, &ox, &oy);
+                finger(m.slot, m.action, ox, oy);
+            }
+        }
+    }
+    lift_all();
+    if (ufd >= 0) {
+        ioctl(ufd, UI_DEV_DESTROY);
+        close(ufd);
+    }
+    unlink("/data/local/tmp/phisap-stop");
+    return 0;
+}

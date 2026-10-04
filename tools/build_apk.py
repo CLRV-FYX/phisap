@@ -25,7 +25,8 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from app_dex import build_dex  # noqa: E402
+from app_dex import build_dex
+from native_build import build_native  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'android' / 'phisap-pocket.apk'
@@ -500,7 +501,7 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
     central = bytearray()
     for name, data in entries:
         raw_name = name.encode('utf-8')
-        store = name == 'resources.arsc' or name.startswith('META-INF/') or name.endswith('.png')
+        store = name == 'resources.arsc' or name.startswith('META-INF/') or name.endswith('.png') or name.endswith('.so')
         payload = data if store else _raw_deflate(data)
         method = 0 if store else 8
         extra = b''
@@ -538,6 +539,14 @@ def build() -> Path:
         raise RuntimeError('启动界面没有进 dex')
     files = _aapt2_files()
     files.append(('classes.dex', dex))
+    native = build_native()
+    files.append(('lib/arm64-v8a/libphisap.so', native['so']))
+    files.append(('lib/arm64-v8a/libphisap-tapd.so', native['tapd']))
+    files.append(('lib/arm64-v8a/libphisap-inject.so', native['inject']))
+    files.append(('assets/libphisap.so', native['so']))
+    files.append(('assets/phisap-tapd', native['tapd']))
+    files.append(('assets/phisap-inject', native['inject']))
+    files.append(('assets/inside.sh', native['script']))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)
@@ -546,8 +555,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='9'" not in badging:
-        raise RuntimeError('versionCode 不是 9')
+    if "versionCode='10'" not in badging:
+        raise RuntimeError('versionCode 不是 10')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -570,6 +579,20 @@ def build() -> Path:
             raise RuntimeError(f'资源 id 变了: {needle}')
     if b'Lde/robv/android/xposed/IXposedHookLoadPackage;' in dex:
         raise RuntimeError('dex 仍引用不存在的 Xposed 接口')
+    if '正在把钩子送进游戏'.encode() not in dex or b'libphisap.so' not in dex:
+        raise RuntimeError('进程内入口没有进 dex')
+    with zipfile.ZipFile(OUT) as blob:
+        names = set(blob.namelist())
+    for need in (
+        'lib/arm64-v8a/libphisap.so',
+        'lib/arm64-v8a/libphisap-tapd.so',
+        'lib/arm64-v8a/libphisap-inject.so',
+        'assets/inside.sh',
+        'assets/phisap-tapd',
+        'assets/phisap-inject',
+    ):
+        if need not in names:
+            raise RuntimeError(f'安装包缺 {need}')
     return OUT
 
 
