@@ -530,6 +530,38 @@ def _zip_compat(entries: list[tuple[str, bytes]]) -> bytes:
     return bytes(local) + bytes(central) + eocd
 
 
+def _dex_strings(blob: bytes) -> list[str]:
+    if blob[:4] != b'dex\n':
+        raise RuntimeError('不是 dex')
+    count, off = struct.unpack_from('<II', blob, 56)
+    out = []
+    for i in range(count):
+        pos = struct.unpack_from('<I', blob, off + i * 4)[0]
+        while blob[pos] & 0x80:
+            pos += 1
+        pos += 1
+        end = blob.index(b'\x00', pos)
+        out.append(blob[pos:end].decode('utf-8', 'replace'))
+    return out
+
+
+def _require_no_ioctl_int(blob: bytes) -> None:
+    strings = _dex_strings(blob)
+    if 'ioctlInt' in strings:
+        raise RuntimeError('dex 字符串池仍有 ioctlInt')
+    method_count, method_off = struct.unpack_from('<II', blob, 88)
+    found = False
+    for i in range(method_count):
+        _cls, _proto, name_idx = struct.unpack_from('<HHI', blob, method_off + i * 8)
+        name = strings[name_idx]
+        if name == 'ioctlInt':
+            raise RuntimeError('dex 仍有 ioctlInt method id')
+        if name == 'nioctl':
+            found = True
+    if not found:
+        raise RuntimeError('dex 没有 nioctl method id')
+
+
 def build() -> Path:
     key, cert = _load_key()
     dex = build_dex()
@@ -543,9 +575,11 @@ def build() -> Path:
     files.append(('lib/arm64-v8a/libphisap.so', native['so']))
     files.append(('lib/arm64-v8a/libphisap-tapd.so', native['tapd']))
     files.append(('lib/arm64-v8a/libphisap-inject.so', native['inject']))
+    files.append(('lib/arm64-v8a/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/libphisap.so', native['so']))
     files.append(('assets/phisap-tapd', native['tapd']))
     files.append(('assets/phisap-inject', native['inject']))
+    files.append(('assets/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/inside.sh', native['script']))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
@@ -555,8 +589,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='12'" not in badging:
-        raise RuntimeError('versionCode 不是 12')
+    if "versionCode='13'" not in badging:
+        raise RuntimeError('versionCode 不是 13')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -579,10 +613,21 @@ def build() -> Path:
             raise RuntimeError(f'资源 id 变了: {needle}')
     if b'Lde/robv/android/xposed/IXposedHookLoadPackage;' in dex:
         raise RuntimeError('dex 仍引用不存在的 Xposed 接口')
-    if '正在进游戏'.encode() not in dex or '侧边小悬浮球'.encode() not in dex or b'libphisap.so' not in dex:
+    if '正在进游戏'.encode() not in dex or '可看状态并改设置'.encode() not in dex or b'libphisap.so' not in dex:
         raise RuntimeError('进程内入口没有进 dex')
+    if b'ioctlInt' in dex:
+        raise RuntimeError('dex 仍引用 ioctlInt')
+    if '触摸库没加载'.encode() not in dex or b'nioctl' not in dex:
+        raise RuntimeError('触摸库入口没有进 dex')
+    _require_no_ioctl_int(dex)
     with zipfile.ZipFile(OUT) as blob:
         names = set(blob.namelist())
+        inject_blob = blob.read('assets/phisap-inject')
+        ioctl_blob = blob.read('lib/arm64-v8a/libphisap-ioctl.so')
+    if b'phisap-inject-13' not in inject_blob:
+        raise RuntimeError('安装包里的 inject 不是这一版')
+    if b'Java_app_phisap_pocket_Injector_nioctl' not in ioctl_blob:
+        raise RuntimeError('安装包里的触摸库没有 nioctl')
     for need in (
         'lib/arm64-v8a/libphisap.so',
         'lib/arm64-v8a/libphisap-tapd.so',
@@ -590,6 +635,8 @@ def build() -> Path:
         'assets/inside.sh',
         'assets/phisap-tapd',
         'assets/phisap-inject',
+        'assets/libphisap-ioctl.so',
+        'lib/arm64-v8a/libphisap-ioctl.so',
     ):
         if need not in names:
             raise RuntimeError(f'安装包缺 {need}')

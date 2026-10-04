@@ -159,7 +159,7 @@ try_inject() {
   if [ -x "$D/phisap-inject" ] && [ "$D/phisap-inject" != "$INJ" ]; then
     out=$("$D/phisap-inject" "$pid" "$so" 2>&1) && return 0
   fi
-  printf '%s' "$out" | tr '\n' ' ' | cut -c1-42
+  printf '%s' "$out" | tr '\n' ' ' | cut -c1-64
   return 1
 }
 

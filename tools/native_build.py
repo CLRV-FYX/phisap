@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NATIVE = Path(__file__).resolve().parent / 'native'
 ZIG_CANDIDATES = (
     os.environ.get('ZIG', ''),
+    '/tmp/phisap-venv/lib/python3.11/site-packages/ziglang/zig',
     '/tmp/zig-venv/lib/python3.11/site-packages/ziglang/zig',
     str(Path.home() / '.local/share/zig/zig'),
 )
@@ -102,11 +103,21 @@ def build_native() -> dict[str, bytes]:
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
             '-fno-stack-protector', str(NATIVE / 'inject.c'), '-o', str(inject),
         ])
-        blobs = {'so': so.read_bytes(), 'tapd': tapd.read_bytes(), 'inject': inject.read_bytes()}
+        ioctl = out / 'libphisap-ioctl.so'
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
+            '-nostdlib', '-fno-stack-protector', '-fno-builtin', '-O2',
+            '-Wl,-z,max-page-size=16384',
+            str(NATIVE / 'ioctl.c'), '-o', str(ioctl),
+        ])
+        blobs = {
+            'so': so.read_bytes(),
+            'tapd': tapd.read_bytes(),
+            'inject': inject.read_bytes(),
+            'ioctl': ioctl.read_bytes(),
+        }
     else:
-        blobs = _prebuilt_native()
-        if blobs is None:
-            raise RuntimeError('找不到 zig，也没有现成的 aarch64 钩子')
+        raise RuntimeError('找不到 zig，不能用旧包里的 inject 交差')
     blobs['script'] = script
     for name in ('so', 'tapd', 'inject'):
         if _elf_machine(blobs[name]) != 0xB7:
@@ -123,6 +134,14 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('wrap 脚本没有设 LD_PRELOAD')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
+    if b'phisap-inject-13' not in blobs['inject']:
+        raise RuntimeError('inject 不是这一版，不能用旧的')
+    if b'Java_app_phisap_pocket_Injector_nioctl' not in blobs['ioctl']:
+        raise RuntimeError('触摸库没有 nioctl')
+    if blobs['ioctl'][16] != 3:
+        raise RuntimeError('libphisap-ioctl.so 不是动态库')
+    if _elf_machine(blobs['ioctl']) != 0xB7:
+        raise RuntimeError('触摸库不是 aarch64')
     return blobs
 
 

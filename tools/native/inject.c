@@ -1,4 +1,5 @@
 /* 把 libphisap.so 送进指定进程。只做这一件事：远程调用 dlopen。 */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -7,10 +8,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <elf.h>
+
+#ifndef SYS_ptrace
+#define SYS_ptrace 117
+#endif
 
 ssize_t process_vm_writev(pid_t pid, const struct iovec *local_iov, unsigned long liovcnt,
                           const struct iovec *remote_iov, unsigned long riovcnt, unsigned long flags);
@@ -25,6 +31,103 @@ struct pt_regs_arm64 {
     unsigned long long pc;
     unsigned long long pstate;
 };
+
+static const char INJECT_MARK[] = "phisap-inject-13";
+
+static long pt(long req, pid_t pid, void *addr, void *data) {
+    return syscall(SYS_ptrace, req, (long)pid, addr, data);
+}
+
+static int read_regs(pid_t pid, struct pt_regs_arm64 *out, int *err) {
+    unsigned char buf[1024];
+    size_t sizes[] = {272, 304, 528, 1024};
+    int i;
+    for (i = 0; i < 4; i++) {
+        struct iovec iov;
+        memset(buf, 0, sizeof buf);
+        iov.iov_base = buf;
+        iov.iov_len = sizes[i];
+        errno = 0;
+        if (pt(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) == 0 && iov.iov_len >= 272) {
+            memcpy(out, buf, 272);
+            return 0;
+        }
+        if (err) *err = errno ? errno : EIO;
+    }
+    memset(buf, 0, sizeof buf);
+    errno = 0;
+    if (pt(PTRACE_GETREGS, pid, 0, buf) == 0) {
+        memcpy(out, buf, 272);
+        return 0;
+    }
+    if (err) *err = errno ? errno : EIO;
+    return -1;
+}
+
+static int write_regs(pid_t pid, struct pt_regs_arm64 *in) {
+    struct iovec iov;
+    iov.iov_base = in;
+    iov.iov_len = 272;
+    if (pt(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) == 0) return 0;
+    if (pt(PTRACE_SETREGS, pid, 0, in) == 0) return 0;
+    return -1;
+}
+
+static int wait_stop(pid_t pid) {
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) return 0;
+    return WIFSTOPPED(st);
+}
+
+static int read_stopped(pid_t pid, struct pt_regs_arm64 *out, int *err) {
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (read_regs(pid, out, err) == 0) return 1;
+        usleep(20000);
+    }
+    return 0;
+}
+
+static int attach_one(pid_t pid, struct pt_regs_arm64 *out, int *err) {
+    errno = 0;
+    if (pt(PTRACE_ATTACH, pid, 0, 0) == 0) {
+        if (wait_stop(pid) && read_stopped(pid, out, err)) return 1;
+        pt(PTRACE_DETACH, pid, 0, 0);
+        usleep(20000);
+    } else if (err) {
+        *err = errno ? errno : EPERM;
+    }
+    errno = 0;
+    if (pt(PTRACE_SEIZE, pid, 0, 0) == 0) {
+        if (pt(PTRACE_INTERRUPT, pid, 0, 0) == 0 && wait_stop(pid) && read_stopped(pid, out, err)) return 1;
+        pt(PTRACE_DETACH, pid, 0, 0);
+    } else if (err && !*err) {
+        *err = errno ? errno : EPERM;
+    }
+    return 0;
+}
+
+static pid_t attach_any(pid_t pid, struct pt_regs_arm64 *out, int *err) {
+    char path[64];
+    DIR *d;
+    struct dirent *de;
+    int tried = 0;
+    if (attach_one(pid, out, err)) return pid;
+    snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+    d = opendir(path);
+    if (!d) return 0;
+    while ((de = readdir(d)) && tried < 12) {
+        pid_t tid = (pid_t)atoi(de->d_name);
+        if (tid <= 0 || tid == pid) continue;
+        tried++;
+        if (attach_one(tid, out, err)) {
+            closedir(d);
+            return tid;
+        }
+    }
+    closedir(d);
+    return 0;
+}
 
 static volatile int timed_out;
 static void on_alarm(int sig) { (void)sig; timed_out = 1; }
@@ -183,7 +286,7 @@ static int poke(pid_t pid, unsigned long addr, const void *src, size_t n) {
         unsigned long word = 0;
         size_t m = n - i > 8 ? 8 : n - i;
         memcpy(&word, p + i, m);
-        if (ptrace(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0) return -1;
+        if (pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0) return -1;
     }
     return 0;
 }
@@ -197,11 +300,8 @@ static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
     regs.regs[30] = 0;
     regs.pc = fn;
     regs.sp = (a0 - 128) & ~0xful;
-    struct iovec iov = { &regs, sizeof regs };
-    if (ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) < 0
-        || ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
-        iov.iov_base = saved;
-        ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+    if (write_regs(pid, &regs) < 0 || pt(PTRACE_CONT, pid, 0, 0) < 0) {
+        write_regs(pid, saved);
         return -1;
     }
     int got = 0, st = 0;
@@ -210,20 +310,18 @@ static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
         if (!WIFSTOPPED(st)) break;
         int sig = WSTOPSIG(st);
         if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS) { got = 1; break; }
-        if (ptrace(PTRACE_CONT, pid, 0, 0) < 0) break;
+        if (pt(PTRACE_CONT, pid, 0, 0) < 0) break;
     }
-    iov.iov_base = &regs;
-    ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+    read_regs(pid, &regs, 0);
     *out = regs.regs[0];
-    iov.iov_base = saved;
-    ptrace(PTRACE_SETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov);
+    write_regs(pid, saved);
     if (!got || timed_out) return -2;
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "用法: phisap-inject <pid> <so>\n");
+        fprintf(stderr, "%s 用法: phisap-inject <pid> <so>\n", INJECT_MARK);
         return 2;
     }
     pid_t pid = (pid_t)atoi(argv[1]);
@@ -263,28 +361,19 @@ int main(int argc, char **argv) {
     }
     signal(SIGALRM, on_alarm);
     alarm(8);
-    if (ptrace(PTRACE_ATTACH, pid, 0, 0) < 0) {
-        fprintf(stderr, "ptrace 失败: %s\n", strerror(errno));
-        return 1;
-    }
-    int st = 0;
-    if (waitpid(pid, &st, 0) < 0 || !WIFSTOPPED(st)) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        fprintf(stderr, "attach 后没有停住\n");
-        return 1;
-    }
     struct pt_regs_arm64 saved;
-    struct iovec iov = { &saved, sizeof saved };
-    if (ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) < 0) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        fprintf(stderr, "读寄存器失败\n");
+    int reg_err = 0;
+    pid_t traced = attach_any(pid, &saved, &reg_err);
+    if (!traced) {
+        fprintf(stderr, "读寄存器失败 %d\n", reg_err);
         return 1;
     }
+    pid = traced;
     unsigned long remote = (saved.sp - 512) & ~0xful;
     char path[256];
     snprintf(path, sizeof path, "%s", so);
     if (poke(pid, remote, path, strlen(path) + 1) != 0) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+        pt(PTRACE_DETACH, pid, 0, 0);
         fprintf(stderr, "写路径失败\n");
         return 1;
     }
@@ -300,7 +389,7 @@ int main(int argc, char **argv) {
             rc = rc2;
         }
     }
-    ptrace(PTRACE_DETACH, pid, 0, 0);
+    pt(PTRACE_DETACH, pid, 0, 0);
     if (rc == -2 || timed_out) {
         fprintf(stderr, "dlopen 没有返回\n");
         return 1;

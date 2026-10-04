@@ -638,6 +638,12 @@ class Method:
         self.annotated = annotated
 
     @property
+    def ops(self):
+        if self.asm is None:
+            return ()
+        return self.asm.ops
+
+    @property
     def proto(self) -> tuple:
         return (self.ret, self.args)
 
@@ -702,7 +708,7 @@ class DexBuilder:
                 add_type(arg)
         # referenced by code
         for m in self._methods:
-            for op in m.asm.ops:
+            for op in m.ops:
                 if op[0] == 'string':
                     add_str(op[2])
                 elif op[0] in ('type21', 'type22', 'filled'):
@@ -734,7 +740,7 @@ class DexBuilder:
         for m in self._methods:
             protos.add(m.proto)
         for m in self._methods:
-            for op in m.asm.ops:
+            for op in m.ops:
                 if op[0] == 'invoke':
                     protos.add(op[2][2])
 
@@ -749,7 +755,7 @@ class DexBuilder:
         for cls, name, typ, _flags in self._fields:
             fields.add((cls, name, typ))
         for m in self._methods:
-            for op in m.asm.ops:
+            for op in m.ops:
                 if op[0] in ('field22', 'field21'):
                     fields.add(op[-1])
         self.fields = sorted(fields, key=lambda f: (self.type_ids[f[0]], self.string_ids[f[1]], self.type_ids[f[2]]))
@@ -759,7 +765,7 @@ class DexBuilder:
         for m in self._methods:
             methods.add(m.key)
         for m in self._methods:
-            for op in m.asm.ops:
+            for op in m.ops:
                 if op[0] == 'invoke':
                     methods.add(op[2])
         self.methods = sorted(methods, key=lambda m: (
@@ -1072,7 +1078,7 @@ def _patch():
         protos = set()
         for m in self._methods:
             protos.add(m.proto)
-            for op in m.asm.ops:
+            for op in m.ops:
                 if op[0] == 'invoke':
                     protos.add(op[2][2])
         for proto in protos:
