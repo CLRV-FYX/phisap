@@ -79,27 +79,14 @@ def _comfort_s(home, s: float) -> float | None:
     return target
 
 
-# 同一份计划连打两遍会差大约一万分, 断在原来那些贴边的地方。差在注入晚一帧:
-# 模型里这一毫秒还在红场外, 晚 16–24ms 发出去就已经在里面。只对已经按住的手指提前离开,
-# 不改还安全的几何, 也不把短点击在按下那一帧掐掉。
-_JITTER_MS = 24
-_JITTER_HOLD_MS = 40
-
-
-def _red_soon(field: RedField, pos, ms: int) -> bool:
-    """这个点此刻或接下来一帧多会不会进红场。"""
-    for dt in range(0, _JITTER_MS + 1, 8):
-        if field.contains(pos[0], pos[1], (ms + dt) / 1000.0):
-            return True
-    return False
+# 曾经把已经按住的手指提前 24ms 抬起, 想抵消注入晚一帧。实机上原本不断的地方断了,
+# 分数从大约 95 万掉到 93 万。晚一帧是发送时刻的事, 不能写进计划里把长条掐短。
 
 
 def _lift_red(events, field: RedField) -> int:
     """手指停在红场里时立刻抬起。红场会自己移过来, 所以不能只在有事件的那一毫秒查。
 
-    已经按住超过一帧的手指, 红场还有 24ms 才盖到, 也提前抬。晚一帧才发出去的那一下,
-    模型里还在外面, 实机已经在里面。刚按下的短点击不按这条提前掐, 否则一帧延迟会把
-    还没进红场的点击直接废掉。
+    只在这一毫秒已经盖住时抬。不要提前抬: 注入若是准时的, 提前离开会把还安全的长条掐断。
     """
     if not events:
         return 0
@@ -112,9 +99,7 @@ def _lift_red(events, field: RedField) -> int:
     cursor = lo
 
     def leaving(pid: int, pos, ms: int) -> bool:
-        if field.contains(pos[0], pos[1], ms / 1000.0):
-            return True
-        return (ms - down_since.get(pid, ms)) >= _JITTER_HOLD_MS and _red_soon(field, pos, ms)
+        return field.contains(pos[0], pos[1], ms / 1000.0)
 
     def apply(ms: int):
         nonlocal lifted
@@ -167,8 +152,7 @@ def _lift_red(events, field: RedField) -> int:
             del events[ms]
 
     for a, b in ranges:
-        # 往前多看一帧, 才能在红场盖住之前把已经按住的手指抬起来。
-        a, b = max(a - _JITTER_MS, lo), min(b, hi)
+        a, b = max(a, lo), min(b, hi)
         if a > b:
             continue
         while cursor < a:

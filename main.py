@@ -645,10 +645,10 @@ class MainPage(ScrollArea):
         self.export_btn.clicked.connect(self.export_plan)
         self.export_btn.setEnabled(False)
         plan_btn_row.addWidget(self.export_btn)
-        self.device_export_btn = PushButton(FIF.PHONE, '导出到手机')
+        self.device_export_btn = PushButton(FIF.PHONE, '传到手机')
         self.device_export_btn.clicked.connect(self.export_device_plan)
         self.device_export_btn.setEnabled(False)
-        self.device_export_btn.setToolTip('给手机版导入。电脑版照常用 ADB 演奏，规划仍在这边做。')
+        self.device_export_btn.setToolTip('adb 直接把计划传到手机版。电脑版照常用 ADB 演奏，规划仍在这边做。')
         plan_btn_row.addWidget(self.device_export_btn)
         plan_btn_row.addStretch(1)
         plan_group.vBoxLayout.addLayout(plan_btn_row)
@@ -1617,25 +1617,28 @@ class MainPage(ScrollArea):
             InfoBar.success('已导出', fn, parent=self.window(), duration=2000)
 
     def export_device_plan(self):
-        '''手机版只播放，不重新规划。电脑版的 ADB 演奏不受影响。'''
+        '''第一种方式：计划直接 adb 传到手机。电脑版的 ADB 演奏不受影响。'''
         if not self.plan_path:
             return
-        fn, _ = QFileDialog.getSaveFileName(
-            self, '导出到手机', 'phisap-device.json', 'phisap (*.json)')
-        if not fn:
+        serial = self.devices_box.currentText().strip()
+        if not serial:
+            InfoBar.warning('没有设备', '先连上手机的 adb，再传到手机。',
+                            parent=self.window(), duration=4000)
             return
         from device_plan import export_device_plan
+        import io
         try:
             with open(self.plan_path, 'r', encoding='utf-8') as f:
                 ans = load_from_json(f)
-            with open(fn, 'w', encoding='utf-8') as f:
-                export_device_plan(ans, f, name=os.path.basename(self.plan_path))
+            buf = io.StringIO()
+            export_device_plan(ans, buf, name=os.path.basename(self.plan_path))
+            msg = apk_tools.push_device_plan(apk_tools.Adb(serial), buf.getvalue())
         except Exception as e:
-            self.log(f'导出到手机失败: {e}')
-            InfoBar.error('导出失败', str(e), parent=self.window(), duration=4000)
+            self.log(f'传到手机失败: {e}')
+            InfoBar.error('传到手机失败', str(e), parent=self.window(), duration=4000)
             return
-        self.log(f'已导出手机计划: {fn}')
-        InfoBar.success('已导出到手机', '导入手机版即可。这边的 ADB 演奏不变。',
+        self.log(msg)
+        InfoBar.success('已传到手机', '手机版会自己读到。这边的 ADB 演奏不变。',
                         parent=self.window(), duration=3000)
 
     # --- 播放 ---

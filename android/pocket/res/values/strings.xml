@@ -7,7 +7,7 @@
     <string name="status_waiting">还没进游戏</string>
     <string name="status_live">游戏里已加载</string>
     <string name="plan_empty">还没有计划</string>
-    <string name="plan_hint">从电脑版「导出到手机」，再在这里导入。电脑版的 ADB 演奏不用关。</string>
+    <string name="plan_hint">电脑版点「传到手机」，adb 直接送过来。也可以手动导入。电脑版的 ADB 演奏不用关。</string>
     <string name="import_plan">导入计划</string>
     <string name="offset_label">偏移</string>
     <string name="offset_hint">正数延后，负数提前。只留这一个数。</string>

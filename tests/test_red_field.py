@@ -660,8 +660,8 @@ class AlgoredTest(unittest.TestCase):
 
 
 class JitterLiftTest(unittest.TestCase):
-    def test_held_finger_lifts_before_red_arrives(self):
-        """晚一帧才发出去时, 模型里还在外面的长按已经在红场里。提前抬, 不要等盖住。"""
+    def test_held_finger_lifts_when_red_covers_not_before(self):
+        """红场盖住才抬。提前 24ms 抬会把准时的长条掐断。"""
         from algo.algo_base import VirtualTouchEvent
 
         class Block:
@@ -685,8 +685,7 @@ class JitterLiftTest(unittest.TestCase):
         self.assertGreaterEqual(lifted, 1)
         ups = [ms for ms, batch in events.items()
                if any(e.action == TouchAction.UP for e in batch)]
-        self.assertTrue(ups)
-        self.assertLessEqual(min(ups), 200 - algored._JITTER_MS)
+        self.assertEqual(ups, [200])
         self.assertNotIn(300, events)
 
     def test_fresh_tap_is_not_cut_before_it_lands(self):

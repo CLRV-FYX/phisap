@@ -249,6 +249,52 @@ class Adb:
         return self.run('shell', command, timeout=timeout)
 
 
+POCKET_PACKAGE = 'app.phisap.pocket'
+
+
+def push_device_plan(adb: Adb, payload: str) -> str:
+    """第一种方式：计划直接 adb 传到手机，不经过保存对话框。"""
+    import tempfile
+    fd, local = tempfile.mkstemp(suffix='.json')
+    remote_tmp = '/data/local/tmp/phisap-plan.json'
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            out.write(payload)
+        adb.run('push', local, remote_tmp, timeout=60)
+        script = (
+            'mkdir -p /sdcard/phisap; '
+            f'cp {remote_tmp} /sdcard/phisap/plan.json; '
+            'chmod 644 /sdcard/phisap/plan.json; '
+            f'if [ -d /data/data/{POCKET_PACKAGE} ]; then '
+            f'mkdir -p /data/data/{POCKET_PACKAGE}/files; '
+            f'cp {remote_tmp} /data/data/{POCKET_PACKAGE}/files/plan.json; '
+            f'uid=$(stat -c %u /data/data/{POCKET_PACKAGE}); '
+            f'chown "$uid:$uid" /data/data/{POCKET_PACKAGE}/files/plan.json; '
+            f'chmod 600 /data/data/{POCKET_PACKAGE}/files/plan.json; '
+            'fi'
+        )
+        last = None
+        for cmd in (f'su -c {shlex.quote(script)}', script):
+            try:
+                adb.shell(cmd, timeout=25)
+                last = None
+                break
+            except AdbError as e:
+                last = e
+        else:
+            raise AdbError(f'计划没写进手机: {last}')
+        try:
+            adb.shell(f'am start -n {POCKET_PACKAGE}/.MainActivity', timeout=15)
+        except AdbError:
+            pass
+        return '已通过 adb 传到手机'
+    finally:
+        try:
+            os.unlink(local)
+        except OSError:
+            pass
+
+
 @dataclass(frozen=True)
 class Device:
     serial: str
