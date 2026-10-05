@@ -173,6 +173,11 @@ stopped() {
 }
 
 hooked() {
+  for pid in $(game_pids "$PKG"); do
+    if [ -r "/proc/$pid/maps" ] && grep -q libphisap.so "/proc/$pid/maps" 2>/dev/null; then
+      return 0
+    fi
+  done
   side="/data/user/0/$PKG/files/phisap-status"
   if [ -s "$side" ]; then
     return 0
@@ -254,7 +259,7 @@ do_inject() {
   return 1
 }
 
-# 寄存器被锁时不再反复读。让游戏重新起来的那一下把库送进去，包装用完就撤。
+# 不读进程里的代码页。入口从游戏自己的库文件找；找不到再写已解压库的依赖。
 run_boot() {
   say "只打开一次，正在把库送进游戏"
   clear_wrap
@@ -284,7 +289,11 @@ run_boot() {
       return 0
       ;;
   esac
-  say "包装已撤。若图标打不开，先重启手机一次"
+  if [ -n "$(game_pids "$PKG")" ]; then
+    say "游戏已打开，库还没进去"
+  else
+    say "包装已撤，游戏没起来"
+  fi
   return 1
 }
 
@@ -322,6 +331,6 @@ fi
 if [ -n "$(game_pids "$PKG")" ]; then
   say "游戏已打开，库还没进去"
 else
-  say "包装已撤。若图标打不开，先重启手机一次"
+  say "包装已撤，游戏没起来"
 fi
 exit 1

@@ -157,7 +157,7 @@ def build_native() -> dict[str, bytes]:
         ])
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
-            '-fno-stack-protector', str(NATIVE / 'inject.c'), str(NATIVE / 'cave.S'),
+            '-fno-stack-protector', str(NATIVE / 'inject.c'), str(NATIVE / 'elfhelp.c'), str(NATIVE / 'cave.S'),
             '-o', str(inject),
         ])
         ioctl = out / 'libphisap-ioctl.so'
@@ -195,9 +195,9 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('启动脚本没有改走启动时送入')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-19' not in blobs['inject']:
+    if b'phisap-inject-20' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
-    if b'phisap-boot-19' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
+    if b'phisap-boot-20' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
         raise RuntimeError('inject 没有清掉上次的包装')
     if b'phisap-ov' not in blobs['inject']:
         raise RuntimeError('inject 不会撤掉系统库挂载')

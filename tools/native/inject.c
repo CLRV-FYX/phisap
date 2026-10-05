@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <elf.h>
+#include "elfhelp.h"
 
 #ifndef SYS_ptrace
 #define SYS_ptrace 117
@@ -33,11 +34,13 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-19";
+static const char INJECT_MARK[] = "phisap-inject-20";
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
 static volatile pid_t watched_zygote;
+static volatile pid_t stopped_game;
+static void boot_log(const char *s);
 
 struct fly_slot {
     pid_t pid;
@@ -150,6 +153,10 @@ static void on_alarm(int sig) {
     if (zy > 0) {
         syscall(SYS_ptrace, 17, (long)zy, 0, 0);
         watched_zygote = 0;
+    }
+    if (stopped_game > 0) {
+        kill(stopped_game, SIGCONT);
+        stopped_game = 0;
     }
     if (sig == SIGTERM || sig == SIGINT) _exit(0);
 }
@@ -469,6 +476,68 @@ static int peek_mem(pid_t pid, uint64_t addr, void *dst, size_t n) {
     return 0;
 }
 
+static void cont_game(pid_t game) {
+    if (game > 0) kill(game, SIGCONT);
+    if (stopped_game == game) stopped_game = 0;
+}
+
+/* SIGSTOP 之后再阻塞等停住。GETREGS 的 EBUSY 多半是只等了几十毫秒。 */
+static void ensure_stopped(pid_t game, pid_t tid) {
+    int i;
+    if (game > 0) {
+        kill(game, SIGSTOP);
+        stopped_game = game;
+    }
+    for (i = 0; i < 40; i++) {
+        int st = task_state(tid);
+        if (st == 'T' || st == 't') break;
+        usleep(10000);
+    }
+    if (pt(PTRACE_INTERRUPT, tid, 0, 0) == 0)
+        wait_stop(tid, 500);
+    else
+        wait_stop(tid, 200);
+}
+
+#ifndef PTRACE_POKETEXT
+#define PTRACE_POKETEXT 4
+#endif
+
+static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n);
+
+/* 代码页经常不能读。整字写入时不先 peek，避免 XOM 把写入也带失败。 */
+static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
+    struct iovec local;
+    struct iovec remote;
+    char mempath[64];
+    int fd;
+    const unsigned char *p = src;
+    size_t i = 0;
+    local.iov_base = (void *)src;
+    local.iov_len = n;
+    remote.iov_base = (void *)addr;
+    remote.iov_len = n;
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) return 0;
+    snprintf(mempath, sizeof mempath, "/proc/%d/mem", (int)pid);
+    fd = open(mempath, O_WRONLY);
+    if (fd >= 0) {
+        ssize_t w = pwrite(fd, src, n, (off_t)addr);
+        close(fd);
+        if (w == (ssize_t)n) return 0;
+    }
+    if (addr & 7) return poke_exact(pid, addr, src, n);
+    while (i + 8 <= n) {
+        unsigned long word = 0;
+        memcpy(&word, p + i, 8);
+        if (pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0 &&
+            pt(PTRACE_POKETEXT, pid, (void *)(addr + i), (void *)word) < 0)
+            return -1;
+        i += 8;
+    }
+    if (i < n) return poke_exact(pid, addr + i, p + i, n - i);
+    return 0;
+}
+
 static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n) {
     struct iovec local = { (void *)src, n };
     struct iovec remote = { (void *)addr, n };
@@ -692,14 +761,174 @@ static uint64_t scratch_base(pid_t tid) {
     return 0;
 }
 
-/* 读寄存器返回 EBUSY 时，不改寄存器。把 clock_gettime 的第一条指令换成跳转，
+static int path_is_real_so(const char *p) {
+    return p && p[0] == '/' && !strstr(p, ".apk") && !strchr(p, '!');
+}
+
+static void apk_real(const char *in, char *out, size_t n) {
+    const char *bang = strchr(in, '!');
+    size_t len = bang ? (size_t)(bang - in) : strlen(in);
+    if (len + 1 > n) len = n - 1;
+    memcpy(out, in, len);
+    out[len] = 0;
+}
+
+static int map_match_range(pid_t pid, const char *apk, uint64_t data_off, uint64_t data_size,
+                           uint64_t *start, uint64_t *off) {
+    char maps_path[64];
+    FILE *f;
+    char line[512];
+    uint64_t best = ~0ull, best_off = 0;
+    int found = 0;
+    snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", (int)pid);
+    f = fopen(maps_path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, o = 0;
+        char perms[8] = {0};
+        char *slash;
+        char mpath[256];
+        if (sscanf(line, "%llx-%*x %7s %llx", &a, perms, &o) < 2) continue;
+        slash = strchr(line, '/');
+        if (!slash) continue;
+        sscanf(slash, "%255s", mpath);
+        if (strcmp(mpath, apk) != 0) continue;
+        if (o < data_off || o >= data_off + data_size) continue;
+        if (a < best) {
+            best = a;
+            best_off = o;
+            found = 1;
+        }
+    }
+    fclose(f);
+    if (!found) return 0;
+    *start = best;
+    *off = best_off;
+    return 1;
+}
+
+/* 库在 APK 里时，maps 往往只有 base.apk。用 zip 里的偏移对上映射。 */
+static int resolve_lib(pid_t pid, const char *soname, char *path, size_t path_n,
+                       uint64_t *file_base, uint64_t *map_start, uint64_t *map_off) {
+    uint64_t start = 0, off = 0;
+    char mpath[256];
+    mpath[0] = 0;
+    if (map_first(pid, soname, 0, &start, &off, mpath, sizeof mpath) && path_is_real_so(mpath)) {
+        snprintf(path, path_n, "%s", mpath);
+        *file_base = 0;
+        *map_start = start;
+        *map_off = off;
+        return access(path, R_OK) == 0;
+    }
+    if (mpath[0] && (strstr(mpath, ".apk") || strchr(mpath, '!'))) {
+        char apk[256];
+        uint64_t data_off = 0, data_size = 0;
+        apk_real(mpath, apk, sizeof apk);
+        if (zip_find_stored(apk, soname, &data_off, &data_size) == 0 &&
+            map_match_range(pid, apk, data_off, data_size, &start, &off)) {
+            snprintf(path, path_n, "%s", apk);
+            *file_base = data_off;
+            *map_start = start;
+            *map_off = off;
+            return 1;
+        }
+    }
+    {
+        char maps_path[64];
+        FILE *f;
+        char line[512];
+        char seen[8][256];
+        int nseen = 0, i;
+        snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", (int)pid);
+        f = fopen(maps_path, "r");
+        if (!f) return 0;
+        while (fgets(line, sizeof line, f) && nseen < 8) {
+            char *slash = strchr(line, '/');
+            char mpath2[256];
+            int dup = 0;
+            if (!slash || !strstr(slash, ".apk")) continue;
+            sscanf(slash, "%255s", mpath2);
+            for (i = 0; i < nseen; i++) if (strcmp(seen[i], mpath2) == 0) dup = 1;
+            if (dup) continue;
+            snprintf(seen[nseen], sizeof seen[nseen], "%s", mpath2);
+            nseen++;
+        }
+        fclose(f);
+        for (i = 0; i < nseen; i++) {
+            uint64_t data_off = 0, data_size = 0;
+            if (zip_find_stored(seen[i], soname, &data_off, &data_size) != 0) continue;
+            if (!map_match_range(pid, seen[i], data_off, data_size, &start, &off)) continue;
+            snprintf(path, path_n, "%s", seen[i]);
+            *file_base = data_off;
+            *map_start = start;
+            *map_off = off;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 原指令和空隙都从 ELF 文件读。进程内存里的代码页经常读不到。 */
+struct FileSite {
+    char path[256];
+    uint64_t file_base;
+    uint64_t map_start;
+    uint64_t map_off;
+};
+
+static int locate_hook(pid_t game, size_t need, size_t back_off,
+                       uint64_t *hook, uint32_t *orig, uint64_t *cave, uint64_t *app_base,
+                       struct FileSite *site) {
+    static const char *app_libs[] = {"libil2cpp.so", "libunity.so", "libmain.so", 0};
+    static const char *const app_syms[] = {"il2cpp_runtime_invoke", "il2cpp_init", "clock_gettime", "gettimeofday"};
+    static const char *sys_libs[] = {"libc.so", "libdl.so", 0};
+    static const char *const sys_syms[] = {"clock_gettime", "gettimeofday", "ioctl", "__clock_gettime", "memcpy", "read"};
+    int i;
+    *app_base = 0;
+    *hook = 0;
+    *cave = 0;
+    for (i = 0; app_libs[i]; i++) {
+        char path[256];
+        uint64_t base = 0, start = 0, off = 0;
+        if (!resolve_lib(game, app_libs[i], path, sizeof path, &base, &start, &off)) continue;
+        if (!*app_base) *app_base = start;
+        if (elf_hook_site(path, base, start, off, app_syms, 4, need, back_off, hook, orig, cave) == 0) {
+            if (site) {
+                snprintf(site->path, sizeof site->path, "%s", path);
+                site->file_base = base;
+                site->map_start = start;
+                site->map_off = off;
+            }
+            boot_log("site app\n");
+            return 0;
+        }
+    }
+    for (i = 0; sys_libs[i]; i++) {
+        char path[256];
+        uint64_t base = 0, start = 0, off = 0;
+        if (!resolve_lib(game, sys_libs[i], path, sizeof path, &base, &start, &off)) continue;
+        if (elf_hook_site(path, base, start, off, sys_syms, 4, need, back_off, hook, orig, cave) == 0) {
+            if (site) {
+                snprintf(site->path, sizeof site->path, "%s", path);
+                site->file_base = base;
+                site->map_start = start;
+                site->map_off = off;
+            }
+            boot_log(*app_base ? "site libc caller\n" : "site libc\n");
+            return 0;
+        }
+    }
+    boot_log("no file site\n");
+    return -1;
+}
+
+/* 读寄存器返回 EBUSY 时，不改寄存器。把一条热指令换成跳转，
    跳进可执行空隙里的一小段，由它自己保存寄存器并 dlopen。 */
 static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn) {
-    static const char *libs[] = {"libc.so", "libdl.so", "linker64", 0};
-    static const char *syms[] = {"clock_gettime", "gettimeofday", "ioctl", "__clock_gettime", 0};
     uint64_t hook = 0;
     uint32_t orig = 0;
     size_t blob_n;
+    size_t need;
     size_t back_off;
     size_t orig_off;
     size_t flag_off;
@@ -709,17 +938,18 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     size_t open_call_off;
     uint64_t flag_at;
     uint64_t path_at;
-    int mem;
-    int mi;
+    uint64_t app_base = 0;
     int waited;
     uint64_t cave = 0;
     unsigned char tmp[480];
-    char path[64];
-    FILE *maps;
-    char line[512];
+    char note[96];
+    struct FileSite site;
+    memset(&site, 0, sizeof site);
     if (!fn || !fn->addr || !so || !so[0]) return -1;
     blob_n = (size_t)(blob_end - blob);
     if (blob_n < 0x40 || blob_n > sizeof tmp) return -1;
+    need = (blob_n + 7u) & ~7u;
+    if (need > sizeof tmp) return -1;
     orig_off = (size_t)(orig_slot - blob);
     back_off = (size_t)(back_slot - blob);
     flag_off = (size_t)(lit_flag - blob);
@@ -728,74 +958,39 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     path_lit_off = (size_t)(lit_path - blob);
     open_call_off = (size_t)(open_call - blob);
     if (path_lit_off + 8 > blob_n || open_call_off + 4 > blob_n) return -1;
-    for (mi = 0; libs[mi] && !hook; mi++) {
-        int si;
-        for (si = 0; syms[si]; si++) {
-            uint64_t addr = sym_in(game, libs[mi], syms[si]);
-            uint32_t insn = 0;
-            if (!addr) continue;
-            if (peek_mem(tid, addr, &insn, 4) != 0) continue;
-            if ((insn >> 26) == 0x05) {
-                uint32_t raw = insn & 0x03ffffffu;
-                int32_t imm = (int32_t)(raw << 6) >> 6;
-                uint64_t dest = addr + ((int64_t)imm << 2);
-                uint32_t next = 0;
-                if (peek_mem(tid, dest, &next, 4) == 0 && next && next != 0xd503201f && !insn_pcrel(next)) {
-                    hook = dest;
-                    orig = next;
-                    break;
-                }
-                continue;
-            }
-            if (!insn || insn == 0xd503201f || insn_pcrel(insn)) continue;
-            hook = addr;
-            orig = insn;
-            break;
-        }
-    }
-    if (!hook) return -1;
-    snprintf(path, sizeof path, "/proc/%d/maps", (int)game);
-    maps = fopen(path, "r");
-    snprintf(path, sizeof path, "/proc/%d/mem", (int)game);
-    mem = open(path, O_RDONLY);
-    if (!maps || mem < 0) {
-        if (maps) fclose(maps);
-        if (mem >= 0) close(mem);
+    if (locate_hook(game, need, back_off, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
+        boot_log("file hook miss\n");
         return -1;
     }
-    while (!cave && fgets(line, sizeof line, maps)) {
-        unsigned long long a = 0, b = 0;
-        char perms[8] = {0};
-        char *slash;
-        int interesting;
-        uint64_t z;
-        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
-        if (!strchr(perms, 'x') || b <= a) continue;
-        (void)slash;
-        if ((int64_t)b - (int64_t)hook < -(1 << 27) || (int64_t)a - (int64_t)hook >= (1 << 27)) continue;
-        {
-            uint64_t tail = b > a + 8192 ? b - 8192 : a;
-            z = scan_zeros(mem, tail, b, hook, blob_n);
-        }
-        if (!z) z = scan_zeros(mem, a, b, hook, blob_n);
-        if (z && in_branch(hook, z) && in_branch(z + back_off, hook + 4)) cave = z;
-    }
-    fclose(maps);
-    close(mem);
-    if (!cave) return -1;
+    if (app_base) fn->caller = app_base;
+    snprintf(note, sizeof note, "hook %llx cave %llx caller %llx\n",
+             (unsigned long long)hook, (unsigned long long)cave, (unsigned long long)fn->caller);
+    boot_log(note);
+    ensure_stopped(game, tid);
     flag_at = scratch_base(tid);
-    if (!flag_at) return -1;
+    if (!flag_at) {
+        cont_game(game);
+        boot_log("no scratch\n");
+        return -1;
+    }
     path_at = flag_at + 16;
     {
         unsigned char zero = 0;
         char pbuf[300];
         size_t plen = strlen(so);
-        if (!plen || plen > 240) return -1;
+        if (!plen || plen > 240) {
+            cont_game(game);
+            return -1;
+        }
         memset(pbuf, 0, sizeof pbuf);
         memcpy(pbuf, so, plen + 1);
-        if (poke_exact(tid, path_at, pbuf, plen + 1) != 0) return -1;
-        if (poke_exact(tid, flag_at, &zero, 1) != 0) return -1;
+        if (poke_exact(tid, path_at, pbuf, plen + 1) != 0 || poke_exact(tid, flag_at, &zero, 1) != 0) {
+            cont_game(game);
+            boot_log("path poke fail\n");
+            return -1;
+        }
     }
+    memset(tmp, 0, need);
     memcpy(tmp, blob, blob_n);
     memcpy(tmp + orig_off, &orig, 4);
     {
@@ -812,10 +1007,35 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         memcpy(tmp + caller_off, &caller, 8);
         memcpy(tmp + path_lit_off, &path_at, 8);
         memcpy(tmp + open_call_off, &call, 4);
-        if (poke_exact(tid, cave, tmp, blob_n) != 0) return -1;
+        if (poke_text(tid, cave, tmp, need) != 0) {
+            cont_game(game);
+            boot_log("text poke fail\n");
+            return -1;
+        }
         entry = encode_b(hook, cave);
-        if (poke_exact(tid, hook, &entry, 4) != 0) return -1;
+        if ((hook & 7) == 0 && site.path[0]) {
+            uint32_t next = 0;
+            uint32_t pair[2];
+            if (elf_insn_at(site.path, site.file_base, site.map_start, site.map_off, hook + 4, &next) == 0) {
+                pair[0] = entry;
+                pair[1] = next;
+                if (poke_text(tid, hook, pair, 8) != 0 && poke_text(tid, hook, &entry, 4) != 0) {
+                    cont_game(game);
+                    boot_log("branch poke fail\n");
+                    return -1;
+                }
+            } else if (poke_text(tid, hook, &entry, 4) != 0) {
+                cont_game(game);
+                boot_log("branch poke fail\n");
+                return -1;
+            }
+        } else if (poke_text(tid, hook, &entry, 4) != 0) {
+            cont_game(game);
+            boot_log("branch poke fail\n");
+            return -1;
+        }
     }
+    cont_game(game);
     detach_tid(tid);
     waited = 0;
     while (waited < 1500 && !timed_out) {
@@ -1548,7 +1768,7 @@ static int inject_fresh(const char *pkg, const char *so) {
         execl(exe, "phisap-inject", ps, so, (char *)0);
         _exit(127);
     }
-    for (i = 0; i < 80 && !timed_out; i++) {
+    for (i = 0; i < 120 && !timed_out; i++) {
         if (waitpid(child, &st, WNOHANG) == child) break;
         if (hook_live()) break;
         usleep(100000);
@@ -1615,11 +1835,178 @@ static int choose_so(const char *pkg, const char *so, char *out, size_t n) {
     return access(out, R_OK) == 0 ? 0 : -1;
 }
 
+static const char UNDO_PATH[] = "/data/local/tmp/phisap-undo";
+
+static int native_candidate(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    if (strstr(path, ".apk") || strchr(path, '!')) return 0;
+    if (strncmp(path, "/system", 7) == 0 || strncmp(path, "/apex", 5) == 0) return 0;
+    if (!strstr(path, "libmain.so") && !strstr(path, "libunity.so") && !strstr(path, "libil2cpp.so")) return 0;
+    return access(path, R_OK) == 0;
+}
+
+static void list_natives_sh(const char *pkg) {
+    char cmd[1800];
+    snprintf(cmd, sizeof cmd,
+             "pkg='%s'; : > /data/local/tmp/phisap-natives; "
+             "base=$(pm path \"$pkg\" 2>/dev/null | head -n 1 | sed 's/^package://; s#/base.apk##'); "
+             "nd=$(dumpsys package \"$pkg\" 2>/dev/null | tr ' ' '\\n' | sed -n 's/^nativeLibraryDir=//p' | head -n 1); "
+             "for d in \"$base/lib/arm64\" \"$base/lib/arm64-v8a\" \"$nd\"; do "
+             "[ -n \"$d\" ] || continue; "
+             "for n in libmain.so libunity.so libil2cpp.so; do "
+             "[ -f \"$d/$n\" ] && printf '%%s\\n' \"$d/$n\" >> /data/local/tmp/phisap-natives; "
+             "done; done",
+             pkg);
+    run_sh(cmd, 7000);
+}
+
+static int collect_natives(const char *pkg, pid_t pid, char paths[][256], int maxn) {
+    int n = 0;
+    if (pid > 0 && maxn > 0) {
+        char mp[64], line[512];
+        FILE *f;
+        snprintf(mp, sizeof mp, "/proc/%d/maps", (int)pid);
+        f = fopen(mp, "r");
+        if (f) {
+            while (n < maxn && fgets(line, sizeof line, f)) {
+                char *slash = strchr(line, '/');
+                char p[256];
+                int dup = 0, i;
+                if (!slash) continue;
+                sscanf(slash, "%255s", p);
+                if (!native_candidate(p)) continue;
+                for (i = 0; i < n; i++) if (strcmp(paths[i], p) == 0) dup = 1;
+                if (!dup) snprintf(paths[n++], 256, "%s", p);
+            }
+            fclose(f);
+        }
+    }
+    if (n == 0) {
+        FILE *f;
+        list_natives_sh(pkg);
+        f = fopen("/data/local/tmp/phisap-natives", "r");
+        if (f) {
+            char line[256];
+            while (n < maxn && fgets(line, sizeof line, f)) {
+                size_t len = strlen(line);
+                int dup = 0, i;
+                while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+                if (!native_candidate(line)) continue;
+                for (i = 0; i < n; i++) if (strcmp(paths[i], line) == 0) dup = 1;
+                if (!dup) snprintf(paths[n++], 256, "%s", line);
+            }
+            fclose(f);
+        }
+    }
+    return n;
+}
+
+static int place_beside(const char *libpath, const char *src, char *out, size_t n) {
+    char cmd[1400];
+    char dir[512];
+    const char *slash;
+    size_t dlen;
+    if (!libpath || !src || src[0] != '/') return -1;
+    slash = strrchr(libpath, '/');
+    if (!slash || slash == libpath) return -1;
+    dlen = (size_t)(slash - libpath);
+    if (dlen + 20 >= sizeof dir || dlen + 20 >= n) return -1;
+    memcpy(dir, libpath, dlen);
+    dir[dlen] = 0;
+    snprintf(out, n, "%s/libphisap.so", dir);
+    snprintf(cmd, sizeof cmd,
+             "cp -f '%s' '%s' && chmod 755 '%s' ; "
+             "chcon --reference='%s' '%s' 2>/dev/null || "
+             "chcon u:object_r:apk_data_file:s0 '%s' 2>/dev/null || true",
+             src, out, out, libpath, out, out);
+    run_sh(cmd, 4000);
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static int place_next_to_game(const char *pkg, pid_t pid, const char *src, char *out, size_t n) {
+    char paths[8][256];
+    const char *prefer[] = {"libmain.so", "libunity.so", "libil2cpp.so", 0};
+    int count, pi, i;
+    count = collect_natives(pkg, pid, paths, 8);
+    for (pi = 0; prefer[pi]; pi++) {
+        for (i = 0; i < count; i++) {
+            if (!strstr(paths[i], prefer[pi])) continue;
+            if (place_beside(paths[i], src, out, n) == 0) return 0;
+        }
+    }
+    return -1;
+}
+
+static void undo_patch(const char *patched_path) {
+    elf_restore_undo(UNDO_PATH);
+    if (patched_path && patched_path[0] && elf_has_needed(patched_path, "libphisap.so") == 1)
+        elf_drop_needed(patched_path, "libphisap.so");
+}
+
+static int patch_native(const char *pkg, pid_t pid, const char *src, char *so_out, size_t n, char *patched, size_t pn) {
+    char paths[8][256];
+    const char *prefer[] = {"libmain.so", "libunity.so", "libil2cpp.so", 0};
+    int count, pi, i;
+    count = collect_natives(pkg, pid, paths, 8);
+    for (pi = 0; prefer[pi]; pi++) {
+        for (i = 0; i < count; i++) {
+            int rc;
+            if (!strstr(paths[i], prefer[pi])) continue;
+            if (place_beside(paths[i], src, so_out, n) != 0) continue;
+            rc = elf_has_needed(paths[i], "libphisap.so");
+            if (rc < 0) continue;
+            if (rc == 0) rc = elf_add_needed(paths[i], "libphisap.so", UNDO_PATH);
+            if (rc == 0 || rc == 1) {
+                snprintf(patched, pn, "%s", paths[i]);
+                boot_log(rc == 0 ? "needed patched\n" : "needed already\n");
+                return rc;
+            }
+        }
+    }
+    boot_log("no extracted lib\n");
+    return -1;
+}
+
+static void stop_pkg_once(const char *pkg) {
+    char cmd[220];
+    snprintf(cmd, sizeof cmd, "am force-stop --user 0 '%s' 2>/dev/null || am force-stop '%s'", pkg, pkg);
+    run_sh(cmd, 4000);
+    usleep(400000);
+}
+
+static int wait_mapped(const char *pkg, int ms) {
+    int waited = 0, saw = 0, dead = 0;
+    while (waited < ms && !timed_out) {
+        pid_t p = find_exact(pkg);
+        if (p > 0 && (game_has_so(pkg) || hook_live())) return 1;
+        if (p > 0) {
+            saw = 1;
+            dead = 0;
+        } else if (saw) {
+            dead += 100;
+            if (dead >= 1500) return 0;
+        }
+        usleep(100000);
+        waited += 100;
+    }
+    return game_has_so(pkg) || hook_live();
+}
+
+static void boot_ok(const char *pkg) {
+    unlink(UNDO_PATH);
+    alarm(0);
+    timed_out = 0;
+    repair_all(pkg);
+    say_status("已送进进程");
+    printf("ok boot\n");
+}
+
 static int boot_main(const char *pkg, const char *so) {
     char appso[512];
-    int i;
+    char patched[256];
+    int i, disk_tried = 0;
     pid_t game;
-    /* 上次挂了 /system/lib64，包装也可能还在，所以游戏打不开。先撤干净，再送库。不再包装。 */
+    /* 不再包装，也不再挂系统库。先从文件挂入口；挂不上再改已经解压的游戏库。 */
     if (!pkg || !pkg[0] || !so || so[0] != '/') {
         fprintf(stderr, "参数不对\n");
         return 2;
@@ -1627,55 +2014,102 @@ static int boot_main(const char *pkg, const char *so) {
     signal(SIGALRM, on_alarm);
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
-    alarm(40);
+    alarm(80);
     relax_selinux();
     write_target(pkg);
-    repair_all(pkg);
-    boot_log("phisap-boot-19\n");
+    patched[0] = 0;
     if (game_has_so(pkg)) {
+        unlink(UNDO_PATH);
         alarm(0);
         repair_all(pkg);
         say_status("库已在进程里");
         printf("ok boot\n");
         return 0;
     }
+    /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
+    elf_restore_undo(UNDO_PATH);
+    repair_all(pkg);
+    boot_log("phisap-boot-20\n");
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
         snprintf(appso, sizeof appso, "%s", so);
     game = find_exact(pkg);
     if (game <= 0) {
-        say_status("正在打开游戏");
+        if (patch_native(pkg, 0, so, appso, sizeof appso, patched, sizeof patched) >= 0) {
+            disk_tried = 1;
+            say_status("已写入游戏库，正在打开");
+        } else {
+            say_status("正在打开游戏");
+        }
         start_pkg(pkg);
+        if (disk_tried && wait_mapped(pkg, 8000)) {
+            boot_ok(pkg);
+            return 0;
+        }
+        if (disk_tried) {
+            boot_log("needed start missed\n");
+            say_status("库没进去，已还原游戏库，正在重新打开");
+            undo_patch(patched);
+            patched[0] = 0;
+            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
+            start_pkg(pkg);
+        }
     }
     for (i = 0; i < 40 && !timed_out; i++) {
         game = find_exact(pkg);
-        if (game > 0 && (caller_of(game) || i > 25)) break;
+        if (game > 0 && (caller_of(game) || i > 20)) break;
         usleep(200000);
     }
     game = find_exact(pkg);
     if (game <= 0) {
         alarm(0);
         repair_all(pkg);
-        say_status("包装已撤，游戏没起来。若图标打不开，请重启手机一次");
+        say_status("游戏没起来，没有改系统库");
         fprintf(stderr, "启动加载失败，包装已撤\n");
         return 1;
     }
+    if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
+        boot_log("so beside game lib\n");
     run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
     say_status("游戏已打开，正在送进进程");
     if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
-        alarm(0);
-        timed_out = 0;
-        repair_all(pkg);
-        say_status("已送进进程");
-        printf("ok boot\n");
+        boot_ok(pkg);
         return 0;
+    }
+    /* 进程里写不进代码页时，只改已经解压出来的 so，并只重新打开一次。 */
+    if (!disk_tried) {
+        char again[256];
+        int pr;
+        again[0] = 0;
+        pr = patch_native(pkg, find_exact(pkg), so, appso, sizeof appso, again, sizeof again);
+        if (pr >= 0) {
+            say_status("已写入游戏库，正在重新打开一次");
+            boot_log("reload once\n");
+            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
+            start_pkg(pkg);
+            if (wait_mapped(pkg, 8000)) {
+                boot_ok(pkg);
+                return 0;
+            }
+            boot_log("reload missed, restore\n");
+            say_status("库没进去，已还原游戏库，正在重新打开");
+            undo_patch(again);
+            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
+            start_pkg(pkg);
+            for (i = 0; i < 25 && find_exact(pkg) <= 0 && !timed_out; i++) usleep(200000);
+            if (find_exact(pkg) > 0 && (inject_fresh(pkg, appso) == 0 || loaded(pkg))) {
+                boot_ok(pkg);
+                return 0;
+            }
+        }
     }
     alarm(0);
     timed_out = 0;
     repair_all(pkg);
+    cont_game(find_exact(pkg));
     if (find_exact(pkg) > 0)
-        say_status("游戏开着，库还没进去。没有再改系统库");
+        say_status("游戏开着，库还没进去");
     else
-        say_status("包装已撤，游戏没保持打开。若图标打不开，请重启手机一次");
+        say_status("游戏没保持打开，没有改系统库");
     fprintf(stderr, "启动加载失败，包装已撤\n");
     return 1;
 }
@@ -1730,7 +2164,7 @@ int main(int argc, char **argv) {
     signal(SIGALRM, on_alarm);
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
-    alarm(12);
+    alarm(20);
     struct pt_regs_arm64 saved;
     int reg_err = 0;
     int got_regs = 0;
