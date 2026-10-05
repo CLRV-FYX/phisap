@@ -3,7 +3,7 @@
     <string name="app_name">phisap</string>
     <string name="xposed_description">phisap 手机版。Phigros 可在进程里播放；Phira 走 root 真实触摸。规划仍在电脑版。</string>
     <string name="brand">phisap</string>
-    <string name="brand_sub">手机版 2.8</string>
+    <string name="brand_sub">手机版 2.9</string>
     <string name="status_waiting">还没进游戏</string>
     <string name="status_live">游戏里已加载</string>
     <string name="plan_empty">还没有计划</string>

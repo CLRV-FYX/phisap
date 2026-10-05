@@ -195,10 +195,12 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('启动脚本没有改走启动时送入')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-20' not in blobs['inject']:
+    if b'phisap-inject-21' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
-    if b'phisap-boot-20' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
+    if b'phisap-boot-21' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
         raise RuntimeError('inject 没有清掉上次的包装')
+    if b'zygisk_module_entry' not in blobs['so']:
+        raise RuntimeError('钩子没有 Zygisk 入口')
     if b'phisap-ov' not in blobs['inject']:
         raise RuntimeError('inject 不会撤掉系统库挂载')
     if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:

@@ -174,7 +174,7 @@ stopped() {
 
 hooked() {
   for pid in $(game_pids "$PKG"); do
-    if [ -r "/proc/$pid/maps" ] && grep -q libphisap.so "/proc/$pid/maps" 2>/dev/null; then
+    if [ -r "/proc/$pid/maps" ] && grep -E -q 'libphisap.so|/phisap/zygisk/' "/proc/$pid/maps" 2>/dev/null; then
       return 0
     fi
   done
@@ -275,6 +275,10 @@ run_boot() {
   printf '%s\n' "$out" >> "$D/phisap-boot.log" 2>/dev/null || true
   clear_wrap
   case "$out" in
+    *handoff*)
+      say "正在重开系统界面一次，把库送进游戏"
+      exit 0
+      ;;
     *ok*)
       j=0
       while [ "$j" -lt 20 ]; do

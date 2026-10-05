@@ -1251,6 +1251,59 @@ void phisap_start(void) {
     signal(13, (void (*)(int))1);
     if (pthread_create(&th, 0, worker, 0) != 0) write_status("钩子线程没起来");
 }
+
+/* Zygisk 在应用进程里 dlopen 这个库。构造函数那时名字可能还是 zygote，所以等专门化之后再开工。
+ * 只调用 registerModule。版本不对就返回，不碰别的函数指针，避免把别的应用弄崩。 */
+struct ZygiskAbi {
+    long api_version;
+    void *impl;
+    void (*pre_app)(void *, void *);
+    void (*post_app)(void *, void *);
+    void (*pre_server)(void *, void *);
+    void (*post_server)(void *, void *);
+};
+struct ZygiskTable {
+    void *impl;
+    int (*register_module)(void *, struct ZygiskAbi *);
+};
+static void zygisk_nop(void *impl, void *args) {
+    (void)impl;
+    (void)args;
+}
+static void zygisk_post_app(void *impl, void *args) {
+    char pkg[160];
+    (void)impl;
+    (void)args;
+    if (!read_self_cmd(pkg, sizeof pkg)) return;
+    if (!known_game(pkg)) return;
+    log_raw("phisap-hook-12\n");
+    phisap_start();
+}
+__attribute__((visibility("default")))
+void zygisk_module_entry(void *table, void *env) {
+    struct ZygiskTable *t = table;
+    static struct ZygiskAbi abi;
+    static int dummy;
+    int fd;
+    (void)env;
+    fd = open("/data/adb/modules/phisap/disable", 0, 0);
+    if (fd >= 0) {
+        close(fd);
+        return;
+    }
+    if (!t || !t->register_module) return;
+    abi.impl = &dummy;
+    abi.pre_app = zygisk_nop;
+    abi.post_app = zygisk_post_app;
+    abi.pre_server = zygisk_nop;
+    abi.post_server = zygisk_nop;
+    abi.api_version = 5;
+    if (t->register_module(t, &abi)) return;
+    abi.api_version = 4;
+    if (t->register_module(t, &abi)) return;
+    abi.api_version = 1;
+    t->register_module(t, &abi);
+}
 __attribute__((constructor)) void phisap_init(void) {
     static int once;
     char pkg[160];

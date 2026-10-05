@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include <elf.h>
 #include "elfhelp.h"
 
@@ -34,7 +35,8 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-20";
+static const char INJECT_MARK[] = "phisap-inject-21";
+static char last_why[96];
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
@@ -413,7 +415,7 @@ static int so_mapped(pid_t pid) {
     f = fopen(path, "r");
     if (!f) return 0;
     while (fgets(line, sizeof line, f)) {
-        if (strstr(line, "libphisap.so")) {
+        if (strstr(line, "libphisap.so") || strstr(line, "/phisap/zygisk/")) {
             fclose(f);
             return 1;
         }
@@ -1992,6 +1994,330 @@ static int wait_mapped(const char *pkg, int ms) {
     return game_has_so(pkg) || hook_live();
 }
 
+
+static int addr_writable(pid_t pid, uint64_t addr) {
+    char path[64], line[512];
+    FILE *f;
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)pid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
+        if (addr >= a && addr < b && strchr(perms, 'w')) {
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static uint64_t biggest_app_exec(pid_t pid) {
+    char path[64], line[512];
+    FILE *f;
+    uint64_t best = 0, best_sz = 0;
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)pid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
+        if (!strchr(perms, 'x') || b <= a) continue;
+        if (!strstr(line, "/data/app/")) continue;
+        if (b - a > best_sz) {
+            best_sz = b - a;
+            best = a;
+        }
+    }
+    fclose(f);
+    return best;
+}
+
+static int read_sp(pid_t tid, uint64_t *sp) {
+    char path[64], buf[200], *s;
+    int fd, n, nc = 0;
+    uint64_t nums[12];
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)tid);
+    fd = open(path, O_RDONLY);
+    n = fd >= 0 ? (int)read(fd, buf, sizeof buf - 1) : 0;
+    if (fd >= 0) close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    if (strncmp(buf, "running", 7) == 0) return -1;
+    s = buf;
+    while (nc < 12 && *s) {
+        char *end = 0;
+        unsigned long long v;
+        while (*s == ' ' || *s == '\n') s++;
+        if (!*s) break;
+        v = strtoull(s, &end, 16);
+        if (end == s) break;
+        nums[nc++] = v;
+        s = end;
+    }
+    if (nc < 2) return -1;
+    *sp = nums[nc - 2];
+    return *sp > 0x10000 ? 0 : -1;
+}
+
+static uint64_t find_spin(pid_t pid) {
+    uint64_t at = sym_in(pid, "libc.so", "pause");
+    if (!at) at = sym_in(pid, "libc.so", "__pause");
+    return at;
+}
+
+static int idle_waiter(pid_t tid) {
+    char path[64], buf[64];
+    int fd, n;
+    snprintf(path, sizeof path, "/proc/%d/wchan", (int)tid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return strstr(buf, "ep_poll") || strstr(buf, "poll_schedule") || strstr(buf, "nanosleep") || strstr(buf, "hrtimer");
+}
+
+static pid_t side_thread(pid_t pid) {
+    char path[64];
+    DIR *d;
+    struct dirent *de;
+    pid_t found = 0;
+    snprintf(path, sizeof path, "/proc/%d/task", (int)pid);
+    d = opendir(path);
+    if (!d) return 0;
+    while ((de = readdir(d))) {
+        pid_t tid = (pid_t)atoi(de->d_name);
+        if (tid <= 0 || tid == pid) continue;
+        if (task_state(tid) != 'S') continue;
+        if (idle_waiter(tid)) {
+            found = tid;
+            break;
+        }
+        if (!found) found = tid;
+    }
+    closedir(d);
+    return found;
+}
+
+/* 不读寄存器。停住一根后台线程，直接把 PC 设成 dlopen，返回地址设成 pause。
+ * 主线程不动，避免把游戏界面冻住。 */
+static int call_dlopen_blind(pid_t game, const char *so) {
+    struct OpenFn fn;
+    struct pt_regs_arm64 regs;
+    struct pt_regs_arm64 dummy;
+    pid_t tid;
+    uint64_t caller, spin, sp = 0, remote;
+    int err = 0, got = 0, i;
+    char pathbuf[300];
+    char note[80];
+    if (!game || !so || !so[0]) return -1;
+    fn = resolve_open(game);
+    if (!fn.addr) {
+        snprintf(last_why, sizeof last_why, "找不到 dlopen");
+        return -1;
+    }
+    caller = fn.caller ? fn.caller : biggest_app_exec(game);
+    if (fn.loader && !caller) boot_log("blind no caller\n");
+    spin = find_spin(game);
+    if (!spin) {
+        snprintf(last_why, sizeof last_why, "找不到返回点");
+        return -1;
+    }
+    tid = side_thread(game);
+    if (tid <= 0) {
+        snprintf(last_why, sizeof last_why, "没有后台线程");
+        return -1;
+    }
+    stopped_game = game;
+    if (!attach_one(tid, &dummy, &err, &got)) {
+        snprintf(last_why, sizeof last_why, "附加上不去 %d", err);
+        cont_game(game);
+        kill(tid, SIGCONT);
+        return -1;
+    }
+    for (i = 0; i < 20 && read_sp(tid, &sp) != 0; i++) usleep(10000);
+    if (!sp || !addr_writable(game, sp - 64)) {
+        detach_tid(tid);
+        cont_game(game);
+        kill(tid, SIGCONT);
+        snprintf(last_why, sizeof last_why, "读不到栈");
+        return -1;
+    }
+    remote = (sp - 768) & ~15ull;
+    if (!addr_writable(game, remote) || !addr_writable(game, remote + 240))
+        remote = (sp - 256) & ~15ull;
+    memset(pathbuf, 0, sizeof pathbuf);
+    snprintf(pathbuf, sizeof pathbuf, "%s", so);
+    if (poke_exact(tid, remote, pathbuf, strlen(pathbuf) + 1) != 0) {
+        detach_tid(tid);
+        cont_game(game);
+        kill(tid, SIGCONT);
+        snprintf(last_why, sizeof last_why, "路径写不进");
+        return -1;
+    }
+    memset(&regs, 0, sizeof regs);
+    regs.regs[0] = remote;
+    regs.regs[1] = 2;
+    if (fn.loader) regs.regs[2] = caller;
+    regs.regs[30] = spin;
+    regs.sp = (sp - 128) & ~15ull;
+    regs.pc = fn.addr;
+    regs.pstate = 0;
+    if (write_regs(tid, &regs) != 0) {
+        snprintf(note, sizeof note, "setregs %d\n", errno);
+        boot_log(note);
+        snprintf(last_why, sizeof last_why, "写寄存器失败 %d", errno);
+        detach_tid(tid);
+        cont_game(game);
+        kill(tid, SIGCONT);
+        return -1;
+    }
+    boot_log("blind dlopen\n");
+    detach_tid(tid);
+    cont_game(game);
+    kill(tid, SIGCONT);
+    for (i = 0; i < 50 && !timed_out; i++) {
+        if (so_mapped(game) || hook_live()) return 0;
+        usleep(40000);
+    }
+    snprintf(last_why, sizeof last_why, "dlopen 没把库映射进来");
+    return -1;
+}
+
+static int recent_file(const char *path, int sec) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (int)(time(0) - st.st_mtime) >= 0 && (int)(time(0) - st.st_mtime) < sec;
+}
+
+static int file_has(const char *path, const char *needle) {
+    char buf[1024];
+    int fd, n;
+    if (!path || !needle) return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return strstr(buf, needle) != 0;
+}
+
+static int module_on(const char *dir) {
+    char dis[192];
+    if (!dir || access(dir, F_OK) != 0) return 0;
+    snprintf(dis, sizeof dis, "%s/disable", dir);
+    return access(dis, F_OK) != 0;
+}
+
+/* 只有已经在用的 Zygisk 才值得重开一次系统界面。没开就不要为了装模块去重启。 */
+static int zygisk_ready(void) {
+    if (module_on("/data/adb/modules/zygisksu")) return 1;
+    if (module_on("/data/adb/modules/zygisk_next")) return 1;
+    if (module_on("/data/adb/modules/zn_magisk_compat")) return 1;
+    if (file_has("/data/adb/magisk/config", "ZYGISK=true")) return 1;
+    if (file_has("/data/adb/magisk/config", "ZYGISK=1")) return 1;
+    run_sh("getprop ro.dalvik.vm.native.bridge > /data/local/tmp/phisap-bridge 2>/dev/null", 1500);
+    if (file_has("/data/local/tmp/phisap-bridge", "zygisk")) return 1;
+    return 0;
+}
+
+static const char ZYGOTE_SH[] =
+    "#!/system/bin/sh\n"
+    "PKG=$1\n"
+    "log() { printf '%s\\n' \"$*\" >> /data/local/tmp/phisap-zygote.log; }\n"
+    "log start\n"
+    "old=$(pidof zygote64 2>/dev/null || pidof zygote 2>/dev/null || true)\n"
+    "setprop ctl.restart zygote\n"
+    "sleep 2\n"
+    "now=$(pidof zygote64 2>/dev/null || pidof zygote 2>/dev/null || true)\n"
+    "if [ -n \"$old\" ] && [ \"$old\" = \"$now\" ]; then\n"
+    "  kill -TERM $old 2>/dev/null || true\n"
+    "fi\n"
+    "i=0\n"
+    "while [ \"$i\" -lt 45 ]; do\n"
+    "  if pidof system_server >/dev/null 2>&1 && pm path \"$PKG\" >/dev/null 2>&1; then\n"
+    "    break\n"
+    "  fi\n"
+    "  i=$((i + 1))\n"
+    "  sleep 1\n"
+    "done\n"
+    "if ! pm path \"$PKG\" >/dev/null 2>&1; then\n"
+    "  touch /data/adb/modules/phisap/disable\n"
+    "  setprop ctl.restart zygote\n"
+    "  printf '%s\\n' '系统没起来，已关掉模块并再开一次' > /data/local/tmp/phisap-status\n"
+    "  exit 1\n"
+    "fi\n"
+    "ss=$(pidof system_server 2>/dev/null || true)\n"
+    "sleep 12\n"
+    "ss2=$(pidof system_server 2>/dev/null || true)\n"
+    "if [ -z \"$ss2\" ] || [ \"$ss\" != \"$ss2\" ]; then\n"
+    "  touch /data/adb/modules/phisap/disable\n"
+    "  setprop ctl.restart zygote\n"
+    "  printf '%s\\n' '模块让系统不稳，已关掉并再开一次' > /data/local/tmp/phisap-status\n"
+    "  exit 1\n"
+    "fi\n"
+    "am start --user 0 -n app.phisap.pocket/.MainActivity >/dev/null 2>&1 || true\n"
+    "log relaunched\n"
+    "exit 0\n";
+
+static int install_zygisk_module(const char *so) {
+    char cmd[1400];
+    if (!so || so[0] != '/') return -1;
+    snprintf(cmd, sizeof cmd,
+             "mkdir -p /data/adb/modules/phisap/zygisk; "
+             "cp -f '%s' /data/adb/modules/phisap/zygisk/arm64-v8a.so; "
+             "chmod 755 /data/adb/modules/phisap /data/adb/modules/phisap/zygisk; "
+             "chmod 644 /data/adb/modules/phisap/zygisk/arm64-v8a.so; "
+             "printf '%%s\\n' 'id=phisap' 'name=phisap' 'version=2.9' 'versionCode=21' 'author=phisap' 'description=load hook into the game' > /data/adb/modules/phisap/module.prop; "
+             "rm -f /data/adb/modules/phisap/disable /data/adb/modules/phisap/remove; "
+             "chcon u:object_r:system_file:s0 /data/adb/modules/phisap/zygisk/arm64-v8a.so /data/adb/modules/phisap/module.prop 2>/dev/null || true; "
+             "touch /data/local/tmp/phisap-zygote-stamp",
+             so);
+    run_sh(cmd, 5000);
+    return access("/data/adb/modules/phisap/zygisk/arm64-v8a.so", R_OK) == 0 ? 0 : -1;
+}
+
+static int handoff_zygote(const char *pkg) {
+    int fd, logfd, devnull;
+    pid_t p;
+    fd = open("/data/local/tmp/phisap-zygote.sh", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0) return -1;
+    if (write(fd, ZYGOTE_SH, sizeof ZYGOTE_SH - 1) != (ssize_t)(sizeof ZYGOTE_SH - 1)) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    chmod("/data/local/tmp/phisap-zygote.sh", 0755);
+    p = fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        signal(SIGHUP, SIG_IGN);
+        signal(SIGPIPE, SIG_IGN);
+        signal(SIGALRM, SIG_IGN);
+        setsid();
+        logfd = open("/data/local/tmp/phisap-zygote.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            close(devnull);
+        }
+        if (logfd >= 0) {
+            dup2(logfd, 1);
+            dup2(logfd, 2);
+            if (logfd > 2) close(logfd);
+        }
+        execl("/system/bin/sh", "sh", "/data/local/tmp/phisap-zygote.sh", pkg, (char *)0);
+        _exit(127);
+    }
+    return 0;
+}
+
 static void boot_ok(const char *pkg) {
     unlink(UNDO_PATH);
     alarm(0);
@@ -2029,11 +2355,15 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-20\n");
+    boot_log("phisap-boot-21\n");
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
         snprintf(appso, sizeof appso, "%s", so);
     game = find_exact(pkg);
-    if (game <= 0) {
+    if (game <= 0 && recent_file("/data/local/tmp/phisap-zygote-stamp", 180)) {
+        say_status("正在打开游戏，等 Zygisk 送入库");
+        start_pkg(pkg);
+        disk_tried = 1;
+    } else if (game <= 0) {
         if (patch_native(pkg, 0, so, appso, sizeof appso, patched, sizeof patched) >= 0) {
             disk_tried = 1;
             say_status("已写入游戏库，正在打开");
@@ -2069,9 +2399,22 @@ static int boot_main(const char *pkg, const char *so) {
     }
     if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
         boot_log("so beside game lib\n");
+    if (recent_file("/data/local/tmp/phisap-zygote-stamp", 180)) {
+        say_status("正在等 Zygisk 把库送进游戏");
+        for (i = 0; i < 40 && !loaded(pkg) && !timed_out; i++) usleep(200000);
+        if (loaded(pkg)) {
+            boot_ok(pkg);
+            return 0;
+        }
+        disk_tried = 1;
+    }
     run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
     say_status("游戏已打开，正在送进进程");
     if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
+        boot_ok(pkg);
+        return 0;
+    }
+    if (call_dlopen_blind(find_exact(pkg), appso) == 0 || loaded(pkg)) {
         boot_ok(pkg);
         return 0;
     }
@@ -2096,19 +2439,38 @@ static int boot_main(const char *pkg, const char *so) {
             if (find_exact(pkg) > 0) stop_pkg_once(pkg);
             start_pkg(pkg);
             for (i = 0; i < 25 && find_exact(pkg) <= 0 && !timed_out; i++) usleep(200000);
-            if (find_exact(pkg) > 0 && (inject_fresh(pkg, appso) == 0 || loaded(pkg))) {
+            if (find_exact(pkg) > 0 && (inject_fresh(pkg, appso) == 0 || loaded(pkg) || call_dlopen_blind(find_exact(pkg), appso) == 0)) {
                 boot_ok(pkg);
                 return 0;
             }
+        }
+    }
+    cont_game(find_exact(pkg));
+    if (!recent_file("/data/local/tmp/phisap-zygote-stamp", 180) && zygisk_ready() && install_zygisk_module(so) == 0) {
+        say_status("正在重开系统界面一次，把库送进游戏");
+        boot_log("zygisk handoff\n");
+        if (handoff_zygote(pkg) == 0) {
+            printf("handoff\n");
+            return 0;
         }
     }
     alarm(0);
     timed_out = 0;
     repair_all(pkg);
     cont_game(find_exact(pkg));
-    if (find_exact(pkg) > 0)
-        say_status("游戏开着，库还没进去");
-    else
+    if (find_exact(pkg) <= 0) {
+        start_pkg(pkg);
+        for (i = 0; i < 20 && find_exact(pkg) <= 0; i++) usleep(200000);
+    }
+    if (find_exact(pkg) > 0) {
+        if (last_why[0]) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "游戏开着，库还没进去：%s", last_why);
+            say_status(msg);
+        } else {
+            say_status("游戏开着，库还没进去");
+        }
+    } else
         say_status("游戏没保持打开，没有改系统库");
     fprintf(stderr, "启动加载失败，包装已撤\n");
     return 1;
