@@ -67,17 +67,8 @@ chmod 666 "$D/phisap-hook.cfg"
 : > "$D/phisap-hook.log"
 chmod 666 "$D/phisap-hook.log"
 
-WRAPSO="$SO"
-if [ -n "$GAMESO" ]; then
-  WRAPSO="$GAMESO"
-fi
-cat > "$D/phisap-wrap.sh" << END
-#!/system/bin/sh
-export LD_PRELOAD=$WRAPSO
-exec "\$@"
-END
-chmod 755 "$D/phisap-wrap.sh"
-setprop "wrap.$PKG" "$D/phisap-wrap.sh"
+# 不设置 wrap.包名。PhiSkin 也是正常启动游戏再进进程。
+# wrap 会让系统每次拉起游戏都先跑脚本，脚本一失败，图标点了也打不开。
 
 if ! pidof phisap-tapd >/dev/null 2>&1; then
   cp -f "$TAP" "$D/phisap-tapd" 2>/dev/null || true
@@ -101,7 +92,24 @@ restore() {
     setenforce 1 2>/dev/null || true
   fi
 }
-trap restore EXIT
+clear_wrap() {
+  setprop "wrap.$PKG" "" 2>/dev/null || true
+  setprop wrap.com.PigeonGames.Phigros "" 2>/dev/null || true
+  setprop wrap.org.flos.phira "" 2>/dev/null || true
+  setprop wrap.org.flos.phira.modded "" 2>/dev/null || true
+  resetprop --delete "wrap.$PKG" 2>/dev/null || true
+  resetprop --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true
+  resetprop --delete wrap.org.flos.phira 2>/dev/null || true
+  resetprop --delete wrap.org.flos.phira.modded 2>/dev/null || true
+  rm -f "$D/phisap-wrap.sh"
+}
+unlock_game() {
+  clear_wrap
+  killall phisap-inject 2>/dev/null || true
+  killall libphisap-inject.so 2>/dev/null || true
+}
+trap 'unlock_game; restore' EXIT
+unlock_game
 
 if ! pm path "$PKG" >/dev/null 2>&1; then
   say "没找到 $PKG"
@@ -116,6 +124,15 @@ game_pids() {
       "$1"|"$1 "*|"$1:"*)
         echo "${d##*/}"
         ;;
+    esac
+  done
+}
+
+unstick() {
+  for pid in $(game_pids "$PKG"); do
+    st=$(awk '/^State:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null || true)
+    case "$st" in
+      t|T) kill -CONT "$pid" 2>/dev/null || true ;;
     esac
   done
 }
@@ -146,7 +163,17 @@ relay() {
 }
 
 launch() {
-  am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "$PKG" >/dev/null 2>&1 || true
+  clear_wrap
+  comp=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$PKG" 2>/dev/null | tail -n 1)
+  case "$comp" in
+    */*)
+      am start --user 0 -n "$comp" >/dev/null 2>&1 || true
+      ;;
+    *)
+      am start --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "$PKG" >/dev/null 2>&1 || true
+      monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+      ;;
+  esac
 }
 
 try_inject() {
@@ -188,18 +215,19 @@ do_inject() {
       esac
     done
   done
-  # 这里不恢复 SELinux。后面若要重启游戏，wrap 才能在宽松模式下把库送进去。
-  # 脚本退出时 trap 会改回来。
+  if [ "$OLD" = "Enforcing" ]; then
+    setenforce 1 2>/dev/null || true
+  fi
   printf '%s\n' "$err" > "$D/phisap-inject.err" 2>/dev/null || true
   printf '%s\n' "$err" >> "$D/phisap-inject.log" 2>/dev/null || true
   return 1
 }
 
+unstick
+say "正在打开游戏"
 launch
 i=0
 last=-8
-saw_pid=0
-restarted=0
 while [ "$i" -lt 480 ]; do
   if stopped; then
     say "已停止"
@@ -213,39 +241,30 @@ while [ "$i" -lt 480 ]; do
   fi
   pids=$(game_pids "$PKG")
   if [ -z "$pids" ]; then
-    say "正在等游戏进程"
-    if [ $((i % 6)) -eq 0 ]; then
+    say "正在打开游戏"
+    if [ $((i % 4)) -eq 0 ]; then
       launch
     fi
   else
-    saw_pid=1
-    if [ $((i - last)) -ge 6 ]; then
+    say "已打开游戏，正在送进进程"
+    if [ $((i - last)) -ge 4 ]; then
       last=$i
       if ! do_inject "$pids"; then
-        if [ "$restarted" = 0 ]; then
-          restarted=1
-          last=-8
-          say "进不了进程，重启游戏再送"
-          am force-stop "$PKG" >/dev/null 2>&1 || true
-          sleep 0.4
-          launch
+        err=$(tr '\n' ' ' < "$D/phisap-inject.err" 2>/dev/null | cut -c1-40)
+        if [ -n "$err" ]; then
+          say "游戏开着，还在送进进程 $err"
         else
-          err=$(tr '\n' ' ' < "$D/phisap-inject.err" 2>/dev/null | cut -c1-48)
-          if [ -n "$err" ]; then
-            say "注入失败 $err"
-          else
-            say "注入失败"
-          fi
+          say "游戏开着，还在送进进程"
         fi
       fi
-      sleep 0.3
+      sleep 0.2
       if hooked; then
         relay || say "钩子已在游戏里"
       fi
     fi
   fi
   i=$((i + 1))
-  sleep 0.5
+  sleep 0.4
 done
 
 if hooked; then

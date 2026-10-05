@@ -131,11 +131,13 @@ def build_native() -> dict[str, bytes]:
     for needle in (b'JudgeLineControl', b'UpdateInfo', b'libil2cpp.so', b'phisap-hook'):
         if needle not in blobs['so']:
             raise RuntimeError(f'钩子里没有 {needle.decode()}')
-    if b'LD_PRELOAD=' not in blobs['script']:
-        raise RuntimeError('wrap 脚本没有设 LD_PRELOAD')
+    if b'clear_wrap' not in blobs['script'] or b'force-stop' in blobs['script']:
+        raise RuntimeError('启动脚本还在包装或强停游戏，会让游戏打不开')
+    if b'setprop "wrap.$PKG" "$D/phisap-wrap.sh"' in blobs['script']:
+        raise RuntimeError('启动脚本还在设置 wrap')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-14' not in blobs['inject']:
+    if b'phisap-inject-15' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in blobs['ioctl']:
         raise RuntimeError('触摸库没有 nioctl')

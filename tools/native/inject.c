@@ -32,9 +32,10 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-14";
+static const char INJECT_MARK[] = "phisap-inject-15";
 
 static volatile int timed_out;
+static volatile pid_t attached_tid;
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -115,7 +116,18 @@ static int write_regs(pid_t pid, struct pt_regs_arm64 *in) {
 }
 
 static void detach_tid(pid_t tid) {
-    pt(PTRACE_DETACH, tid, 0, 0);
+    if (tid > 0) pt(PTRACE_DETACH, tid, 0, 0);
+    if (attached_tid == tid) attached_tid = 0;
+}
+
+static void on_alarm(int sig) {
+    pid_t tid = attached_tid;
+    timed_out = 1;
+    if (tid > 0) {
+        syscall(SYS_ptrace, 17, (long)tid, 0, 0);
+        attached_tid = 0;
+    }
+    if (sig == SIGTERM || sig == SIGINT) _exit(0);
 }
 
 /* 停住了但 GETREGSET 返回 EBUSY 时，先迈进一次系统调用再读。D 状态线程不在这里耗。 */
@@ -139,6 +151,7 @@ static int attach_one(pid_t tid, struct pt_regs_arm64 *out, int *err, int *got_r
     if (st == 'D' || st == 'Z' || st == 'X') return 0;
     if (pt(PTRACE_SEIZE, tid, 0, 0) == 0) {
         if (pt(PTRACE_INTERRUPT, tid, 0, 0) == 0 && wait_stop(tid, 80)) {
+            attached_tid = tid;
             if (read_after_stop(tid, out, err) == 0) *got_regs = 1;
             return 1;
         }
@@ -150,6 +163,7 @@ static int attach_one(pid_t tid, struct pt_regs_arm64 *out, int *err, int *got_r
         if (err) *err = errno ? errno : EPERM;
         return 0;
     }
+    attached_tid = tid;
     if (!wait_stop(tid, 100)) {
         pt(PTRACE_INTERRUPT, tid, 0, 0);
         if (!wait_stop(tid, 60)) {
@@ -189,7 +203,7 @@ static pid_t attach_any(pid_t pid, struct pt_regs_arm64 *out, int *err, int *got
     return 0;
 }
 
-static void on_alarm(int sig) { (void)sig; timed_out = 1; }
+
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -734,6 +748,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     signal(SIGALRM, on_alarm);
+    signal(SIGTERM, on_alarm);
+    signal(SIGINT, on_alarm);
     alarm(12);
     struct pt_regs_arm64 saved;
     int reg_err = 0;
