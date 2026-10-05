@@ -195,10 +195,12 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('启动脚本没有改走启动时送入')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-18' not in blobs['inject']:
+    if b'phisap-inject-19' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
-    if b'phisap-boot-18' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
-        raise RuntimeError('inject 没有启动时送入')
+    if b'phisap-boot-19' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
+        raise RuntimeError('inject 没有清掉上次的包装')
+    if b'phisap-ov' not in blobs['inject']:
+        raise RuntimeError('inject 不会撤掉系统库挂载')
     if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:
         raise RuntimeError('钩子不会在进程启动后再开工')
     if not _needed_libc(blobs['so']):

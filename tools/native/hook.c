@@ -1257,15 +1257,9 @@ __attribute__((constructor)) void phisap_init(void) {
     if (once) return;
     once = 1;
     signal(13, (void (*)(int))1);
-    if (!read_self_cmd(pkg, sizeof pkg)) {
-        phisap_start();
-        return;
-    }
-    /* zygote 里开线程会让 ART 拒绝特化。包装启动时名字是 app_process，要开工。 */
-    if (streq(pkg, "zygote") || streq(pkg, "zygote64") || streq(pkg, "zygote32")
-        || streq(pkg, "usap64") || streq(pkg, "usap32")
-        || streq(pkg, "<pre-initialized>"))
-        return;
+    if (!read_self_cmd(pkg, sizeof pkg)) return;
+    /* 包装提前加载时名字还是 app_process。这时开线程会把游戏打死，所以只在已经是游戏时开工。 */
+    if (!known_game(pkg)) return;
     log_raw("phisap-hook-12\n");
     phisap_start();
 }

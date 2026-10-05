@@ -6,9 +6,10 @@
 .global lit_flag
 .global lit_open
 .global lit_caller
-.global path_start
+.global lit_path
+.global open_call
 
-// 整段一起搬进游戏的可执行空隙。标记放在可写内存里，不改这一页的权限。
+// 整段一起搬进游戏的可执行空隙。路径和标记放在可写内存里，这一段只留指针。
 // 第一次进来调用 dlopen，之后执行原来的那条指令，再跳回原函数的下一条。
 blob:
     ldr x16, lit_flag
@@ -19,17 +20,16 @@ blob:
 
     stp x0, x1, [sp, #-16]!
     stp x2, x8, [sp, #-16]!
-    stp x16, x17, [sp, #-16]!
-    stp x30, xzr, [sp, #-16]!
+    stp x16, x30, [sp, #-16]!
 
-    adr x0, path_start
+    ldr x0, lit_path
     mov x1, #2
     ldr x2, lit_caller
     ldr x16, lit_open
+open_call:
     blr x16
 
-    ldp x30, xzr, [sp], #16
-    ldp x16, x17, [sp], #16
+    ldp x16, x30, [sp], #16
     ldp x2, x8, [sp], #16
     ldp x0, x1, [sp], #16
 
@@ -46,6 +46,6 @@ lit_open:
     .quad 0
 lit_caller:
     .quad 0
-path_start:
-    .space 240
+lit_path:
+    .quad 0
 blob_end:

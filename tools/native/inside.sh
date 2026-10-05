@@ -104,14 +104,38 @@ clear_wrap() {
   setprop wrap.com.PigeonGames.Phigros "" 2>/dev/null || true
   setprop wrap.org.flos.phira "" 2>/dev/null || true
   setprop wrap.org.flos.phira.modded "" 2>/dev/null || true
-  resetprop --delete "wrap.$PKG" 2>/dev/null || true
-  resetprop --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true
-  resetprop --delete wrap.org.flos.phira 2>/dev/null || true
-  resetprop --delete wrap.org.flos.phira.modded 2>/dev/null || true
-  rm -f "$D/phisap-wrap.sh"
+  for rp in resetprop /data/adb/magisk/resetprop /debug_ramdisk/resetprop; do
+    if [ -x "$rp" ] || command -v "$rp" >/dev/null 2>&1; then
+      "$rp" --delete "wrap.$PKG" 2>/dev/null || true
+      "$rp" -p --delete "wrap.$PKG" 2>/dev/null || true
+      "$rp" --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true
+      "$rp" -p --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true
+      "$rp" --delete wrap.org.flos.phira 2>/dev/null || true
+      "$rp" -p --delete wrap.org.flos.phira 2>/dev/null || true
+      "$rp" --delete wrap.org.flos.phira.modded 2>/dev/null || true
+      "$rp" -p --delete wrap.org.flos.phira.modded 2>/dev/null || true
+    fi
+  done
+  rm -f "$D/phisap-wrap.sh" "$D/phisap-place.sh"
+}
+repair_mount() {
+  if grep -q phisap-ov /proc/mounts 2>/dev/null; then
+    umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true
+  fi
+  if [ ! -e /system/lib64/libc.so ]; then
+    umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true
+  fi
+  if [ -f /system/lib64/libphisap.so ] && grep -a -q phisap-hook /system/lib64/libphisap.so 2>/dev/null; then
+    mount -o rw,remount /system 2>/dev/null || mount -o rw,remount / 2>/dev/null || true
+    rm -f /system/lib64/libphisap.so 2>/dev/null || true
+  fi
 }
 unlock_game() {
   clear_wrap
+  repair_mount
+  if command -v nsenter >/dev/null 2>&1; then
+    nsenter -t 1 -m -- /system/bin/sh -c 'if grep -q phisap-ov /proc/mounts; then umount /system/lib64 || umount -l /system/lib64; fi' 2>/dev/null || true
+  fi
   killall phisap-inject 2>/dev/null || true
   killall libphisap-inject.so 2>/dev/null || true
 }
@@ -260,10 +284,15 @@ run_boot() {
       return 0
       ;;
   esac
-  say "启动时没送进，包装已撤，游戏可以自己打开"
+  say "包装已撤。若图标打不开，先重启手机一次"
   return 1
 }
 
+say "正在清掉上次的包装和系统库挂载"
+repair_mount
+if command -v nsenter >/dev/null 2>&1; then
+  nsenter -t 1 -m -- /system/bin/sh -c 'if grep -q phisap-ov /proc/mounts; then umount /system/lib64 || umount -l /system/lib64; fi; if [ ! -e /system/lib64/libc.so ]; then umount /system/lib64 || umount -l /system/lib64; fi' 2>/dev/null || true
+fi
 unstick
 say "正在打开游戏"
 # 不要先 launch 再强停。boot 自己只打开一次；失败也不要循环再开。
@@ -290,5 +319,9 @@ if hooked; then
   relay || say "钩子已在游戏里"
   exit 0
 fi
-say "没能把钩子送进游戏"
+if [ -n "$(game_pids "$PKG")" ]; then
+  say "游戏已打开，库还没进去"
+else
+  say "包装已撤。若图标打不开，先重启手机一次"
+fi
 exit 1

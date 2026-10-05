@@ -33,7 +33,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-18";
+static const char INJECT_MARK[] = "phisap-inject-19";
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
@@ -395,7 +395,8 @@ extern char back_slot[];
 extern char lit_flag[];
 extern char lit_open[];
 extern char lit_caller[];
-extern char path_start[];
+extern char lit_path[];
+extern char open_call[];
 
 static int so_mapped(pid_t pid) {
     char path[64];
@@ -433,6 +434,11 @@ static int in_branch(uint64_t from, uint64_t to) {
 static uint32_t encode_b(uint64_t from, uint64_t to) {
     int32_t imm = (int32_t)(((int64_t)to - (int64_t)from) >> 2);
     return 0x14000000u | ((uint32_t)imm & 0x03ffffffu);
+}
+
+static uint32_t encode_bl(uint64_t from, uint64_t to) {
+    int32_t imm = (int32_t)(((int64_t)to - (int64_t)from) >> 2);
+    return 0x94000000u | ((uint32_t)imm & 0x03ffffffu);
 }
 
 static int peek_mem(pid_t pid, uint64_t addr, void *dst, size_t n) {
@@ -606,6 +612,86 @@ static uint64_t flag_byte(pid_t tid) {
     return 0;
 }
 
+/* 栈指针下面通常没人用。放标记和库路径，避免改到堆。 */
+static uint64_t scratch_base(pid_t tid) {
+    char path[64];
+    char buf[180];
+    char line[512];
+    int fd, n, nc = 0;
+    char *s;
+    uint64_t nums[12];
+    uint64_t sp = 0, lo = 0;
+    FILE *f;
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)tid);
+    fd = open(path, O_RDONLY);
+    n = fd >= 0 ? (int)read(fd, buf, sizeof buf - 1) : 0;
+    if (fd >= 0) close(fd);
+    if (n > 0) buf[n] = 0;
+    else buf[0] = 0;
+    if (n > 0 && strncmp(buf, "running", 7) != 0) {
+        s = buf;
+        while (nc < 12 && *s) {
+            char *end = 0;
+            unsigned long long v;
+            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+            if (!*s) break;
+            v = strtoull(s, &end, 16);
+            if (end == s) break;
+            nums[nc++] = v;
+            s = end;
+        }
+        if (nc >= 2) sp = nums[nc - 2];
+        if (sp >= 0x10000) {
+            snprintf(path, sizeof path, "/proc/%d/maps", (int)tid);
+            f = fopen(path, "r");
+            if (f) {
+                while (fgets(line, sizeof line, f)) {
+                    unsigned long long a = 0, b = 0;
+                    char perms[8] = {0};
+                    if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
+                    if (!strchr(perms, 'w') || strchr(perms, 'x')) continue;
+                    if (sp >= a && sp < b) { lo = a; break; }
+                }
+                fclose(f);
+            }
+        }
+        if (lo && sp >= lo + 8704) return sp - 8192;
+    }
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)tid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0;
+        char perms[8] = {0};
+        int mfd;
+        unsigned char bufb[4096];
+        ssize_t got;
+        unsigned long long at;
+        int run = 0, i;
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
+        if (!strchr(perms, 'w') || strchr(perms, 'x') || b < a + 65536) continue;
+        if (strchr(line, '/')) continue;
+        snprintf(path, sizeof path, "/proc/%d/mem", (int)tid);
+        mfd = open(path, O_RDONLY);
+        if (mfd < 0) continue;
+        at = a + 8192;
+        got = pread(mfd, bufb, sizeof bufb, (off_t)at);
+        close(mfd);
+        if (got < 320) continue;
+        for (i = 0; i < got; i++) {
+            if (bufb[i] == 0) {
+                run++;
+                if (run >= 320) {
+                    fclose(f);
+                    return at + (unsigned)(i - 319);
+                }
+            } else run = 0;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
 /* 读寄存器返回 EBUSY 时，不改寄存器。把 clock_gettime 的第一条指令换成跳转，
    跳进可执行空隙里的一小段，由它自己保存寄存器并 dlopen。 */
 static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn) {
@@ -619,8 +705,10 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     size_t flag_off;
     size_t open_off;
     size_t caller_off;
-    size_t path_off;
+    size_t path_lit_off;
+    size_t open_call_off;
     uint64_t flag_at;
+    uint64_t path_at;
     int mem;
     int mi;
     int waited;
@@ -631,14 +719,15 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     char line[512];
     if (!fn || !fn->addr || !so || !so[0]) return -1;
     blob_n = (size_t)(blob_end - blob);
-    if (blob_n < 0x80 || blob_n > sizeof tmp) return -1;
+    if (blob_n < 0x40 || blob_n > sizeof tmp) return -1;
     orig_off = (size_t)(orig_slot - blob);
     back_off = (size_t)(back_slot - blob);
     flag_off = (size_t)(lit_flag - blob);
     open_off = (size_t)(lit_open - blob);
     caller_off = (size_t)(lit_caller - blob);
-    path_off = (size_t)(path_start - blob);
-    if (path_off >= blob_n || blob_n - path_off < 48) return -1;
+    path_lit_off = (size_t)(lit_path - blob);
+    open_call_off = (size_t)(open_call - blob);
+    if (path_lit_off + 8 > blob_n || open_call_off + 4 > blob_n) return -1;
     for (mi = 0; libs[mi] && !hook; mi++) {
         int si;
         for (si = 0; syms[si]; si++) {
@@ -694,10 +783,17 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     fclose(maps);
     close(mem);
     if (!cave) return -1;
-    flag_at = flag_byte(tid);
+    flag_at = scratch_base(tid);
     if (!flag_at) return -1;
+    path_at = flag_at + 16;
     {
         unsigned char zero = 0;
+        char pbuf[300];
+        size_t plen = strlen(so);
+        if (!plen || plen > 240) return -1;
+        memset(pbuf, 0, sizeof pbuf);
+        memcpy(pbuf, so, plen + 1);
+        if (poke_exact(tid, path_at, pbuf, plen + 1) != 0) return -1;
         if (poke_exact(tid, flag_at, &zero, 1) != 0) return -1;
     }
     memcpy(tmp, blob, blob_n);
@@ -707,14 +803,15 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         uint64_t open = fn->addr;
         uint64_t caller = fn->loader ? fn->caller : 0;
         uint32_t entry;
-        size_t plen = strlen(so);
-        if (!plen || plen > 200 || plen + 1 > blob_n - path_off) return -1;
+        uint32_t call;
+        if (in_branch(cave + open_call_off, open)) call = encode_bl(cave + open_call_off, open);
+        else call = 0xd63f0200u; /* blr x16 */
         memcpy(tmp + back_off, &back, 4);
         memcpy(tmp + flag_off, &flag_at, 8);
         memcpy(tmp + open_off, &open, 8);
         memcpy(tmp + caller_off, &caller, 8);
-        memset(tmp + path_off, 0, blob_n - path_off);
-        memcpy(tmp + path_off, so, plen + 1);
+        memcpy(tmp + path_lit_off, &path_at, 8);
+        memcpy(tmp + open_call_off, &call, 4);
         if (poke_exact(tid, cave, tmp, blob_n) != 0) return -1;
         entry = encode_b(hook, cave);
         if (poke_exact(tid, hook, &entry, 4) != 0) return -1;
@@ -1303,104 +1400,103 @@ static int loaded(const char *pkg) {
     return find_exact(pkg) > 0 && hook_live();
 }
 
-static const char PLACE_SH[] =
+static const char REPAIR_SH[] =
     "#!/system/bin/sh\n"
-    "if [ -z \"$PHISAP_NS\" ] && command -v nsenter >/dev/null 2>&1; then\n"
-    "  export PHISAP_NS=1\n"
-    "  nsenter -t 1 -m -- /system/bin/sh \"$0\" \"$1\"\n"
-    "  exit $?\n"
-    "fi\n"
-    "SRC=$1\n"
-    "DST=/system/lib64/libphisap.so\n"
-    "ok_so() {\n"
-    "  [ -f \"$1\" ] || return 1\n"
-    "  grep -a -q phisap-hook-12 \"$1\" && return 0\n"
-    "  [ \"$(wc -c < \"$1\" 2>/dev/null)\" -gt 80000 ]\n"
+    "# old wrap value was LD_PRELOAD=/system/lib64/libphisap.so\n"
+    "PKG=$1\n"
+    "clean_wrap() {\n"
+    "  setprop \"wrap.$PKG\" '' 2>/dev/null || true\n"
+    "  setprop wrap.com.PigeonGames.Phigros '' 2>/dev/null || true\n"
+    "  setprop wrap.org.flos.phira '' 2>/dev/null || true\n"
+    "  setprop wrap.org.flos.phira.modded '' 2>/dev/null || true\n"
+    "  for rp in resetprop /data/adb/magisk/resetprop /debug_ramdisk/resetprop; do\n"
+    "    if [ -x \"$rp\" ] || command -v \"$rp\" >/dev/null 2>&1; then\n"
+    "      \"$rp\" --delete \"wrap.$PKG\" 2>/dev/null || true\n"
+    "      \"$rp\" -p --delete \"wrap.$PKG\" 2>/dev/null || true\n"
+    "      \"$rp\" --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true\n"
+    "      \"$rp\" -p --delete wrap.com.PigeonGames.Phigros 2>/dev/null || true\n"
+    "      \"$rp\" --delete wrap.org.flos.phira 2>/dev/null || true\n"
+    "      \"$rp\" -p --delete wrap.org.flos.phira 2>/dev/null || true\n"
+    "      \"$rp\" --delete wrap.org.flos.phira.modded 2>/dev/null || true\n"
+    "      \"$rp\" -p --delete wrap.org.flos.phira.modded 2>/dev/null || true\n"
+    "    fi\n"
+    "  done\n"
+    "  rm -f /data/local/tmp/phisap-wrap.sh /data/local/tmp/phisap-place.sh\n"
     "}\n"
-    "if [ ! -f /system/lib64/libc.so ]; then\n"
-    "  umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true\n"
-    "fi\n"
-    "[ -f /system/lib64/libc.so ] || exit 1\n"
-    "mount -o rw,remount /system 2>/dev/null || true\n"
-    "mount -o rw,remount / 2>/dev/null || true\n"
-    "if cp -f \"$SRC\" \"$DST\" 2>/dev/null; then\n"
-    "  chmod 644 \"$DST\" 2>/dev/null || true\n"
-    "  chcon u:object_r:system_lib_file:s0 \"$DST\" 2>/dev/null || true\n"
-    "  ok_so \"$DST\" && exit 0\n"
-    "fi\n"
-    "U=/data/local/tmp/phisap-ov/upper\n"
-    "W=/data/local/tmp/phisap-ov/work\n"
-    "L=/data/local/tmp/phisap-ov/lower\n"
-    "mkdir -p \"$U\" \"$L\"\n"
-    "rm -rf \"$W\"\n"
-    "mkdir -p \"$W\"\n"
-    "cp -f \"$SRC\" \"$U/libphisap.so\" || exit 1\n"
-    "chmod 644 \"$U/libphisap.so\" 2>/dev/null || true\n"
-    "chcon u:object_r:system_lib_file:s0 \"$U/libphisap.so\" 2>/dev/null || true\n"
-    "if grep -q upperdir=/data/local/tmp/phisap-ov/upper /proc/mounts 2>/dev/null; then\n"
-    "  ok_so \"$DST\"\n"
-    "  exit $?\n"
-    "fi\n"
-    "mount --bind /system/lib64 \"$L\" 2>/dev/null || true\n"
-    "[ -f \"$L/libc.so\" ] || exit 1\n"
-    "mount -t overlay overlay -o lowerdir=$L,upperdir=$U,workdir=$W /system/lib64 \\\n"
-    "  || mount -t overlay -o lowerdir=$L,upperdir=$U,workdir=$W overlay /system/lib64 \\\n"
-    "  || exit 1\n"
-    "if [ ! -f /system/lib64/libc.so ] || [ ! -f /system/lib64/libdl.so ] || ! ok_so \"$DST\"; then\n"
-    "  umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true\n"
-    "  exit 1\n"
-    "fi\n"
+    "clean_mount() {\n"
+    "  if grep -q phisap-ov /proc/mounts 2>/dev/null; then\n"
+    "    umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true\n"
+    "  fi\n"
+    "  if [ ! -e /system/lib64/libc.so ]; then\n"
+    "    umount /system/lib64 2>/dev/null || umount -l /system/lib64 2>/dev/null || true\n"
+    "  fi\n"
+    "  if [ -f /system/lib64/libphisap.so ] && grep -a -q phisap-hook /system/lib64/libphisap.so 2>/dev/null; then\n"
+    "    mount -o rw,remount /system 2>/dev/null || mount -o rw,remount / 2>/dev/null || true\n"
+    "    rm -f /system/lib64/libphisap.so 2>/dev/null || true\n"
+    "  fi\n"
+    "}\n"
+    "clean_wrap\n"
+    "clean_mount\n"
     "exit 0\n";
 
-static int place_system_so(const char *so) {
+static void repair_all(const char *pkg) {
     int fd;
-    char cmd[512];
-    if (!so || so[0] != '/') return -1;
-    fd = open("/data/local/tmp/phisap-place.sh", O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (fd < 0) return -1;
-    if (write(fd, PLACE_SH, sizeof PLACE_SH - 1) != (ssize_t)(sizeof PLACE_SH - 1)) {
-        close(fd);
-        return -1;
+    char cmd[320];
+    if (!pkg || !pkg[0]) return;
+    fd = open("/data/local/tmp/phisap-repair.sh", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd >= 0) {
+        if (write(fd, REPAIR_SH, sizeof REPAIR_SH - 1) == (ssize_t)(sizeof REPAIR_SH - 1)) {
+            close(fd);
+            chmod("/data/local/tmp/phisap-repair.sh", 0755);
+            snprintf(cmd, sizeof cmd, "sh /data/local/tmp/phisap-repair.sh '%s'", pkg);
+            run_sh(cmd, 8000);
+            snprintf(cmd, sizeof cmd, "nsenter -t 1 -m -- sh /data/local/tmp/phisap-repair.sh '%s'", pkg);
+            run_sh(cmd, 8000);
+        } else close(fd);
     }
-    close(fd);
-    chmod("/data/local/tmp/phisap-place.sh", 0755);
-    snprintf(cmd, sizeof cmd, "sh /data/local/tmp/phisap-place.sh '%s'", so);
-    return run_sh_status(cmd, 15000) == 0 ? 0 : -1;
+    clear_wraps_hard(pkg);
 }
 
-static int preload_once(const char *pkg, const char *so) {
-    char cmd[320];
-    int i;
-    /* 应用私有目录不在 app_process 的链接器命名空间里，上次库被悄悄丢掉。
-       放到 /system/lib64，属性值也远短于 91。包装用完就撤，不留脚本。 */
-    if (place_system_so(so) != 0) {
-        boot_log("place system so failed\n");
-        return -1;
-    }
-    boot_log("place system so ok\n");
-    clear_wraps_hard(pkg);
-    run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
+static int stage_app_lib(const char *pkg, const char *so, char *out, size_t n) {
+    char cmd[2048];
+    char path[512];
+    int fd, k;
+    if (!pkg || !so || so[0] != '/' || !out || n < 8) return -1;
+    snprintf(out, n, "/data/local/tmp/libphisap.so");
     snprintf(cmd, sizeof cmd,
-             "setprop wrap.%s 'LD_PRELOAD=/system/lib64/libphisap.so' ; "
-             "resetprop wrap.%s 'LD_PRELOAD=/system/lib64/libphisap.so' 2>/dev/null || true",
-             pkg, pkg);
-    run_sh(cmd, 2000);
-    boot_log("preload once\n");
-    if (find_exact(pkg) > 0) {
-        snprintf(cmd, sizeof cmd, "am force-stop '%s'", pkg);
-        run_sh(cmd, 4000);
-        usleep(300000);
-    }
-    start_pkg(pkg);
-    for (i = 0; i < 50 && !timed_out; i++) {
-        if (loaded(pkg)) {
-            clear_wraps_hard(pkg);
+             "src='%s'; pkg='%s'; base=$(pm path \"$pkg\" 2>/dev/null | head -n 1 | sed 's/^package://; s#/base.apk##'); "
+             "mkdir -p /data/local/tmp \"/data/user/0/$pkg/files\"; "
+             "cp -f \"$src\" /data/local/tmp/libphisap.so; chmod 755 /data/local/tmp/libphisap.so; "
+             "cp -f \"$src\" \"/data/user/0/$pkg/files/libphisap.so\"; chmod 755 \"/data/user/0/$pkg/files/libphisap.so\"; "
+             "owner=$(stat -c %%u \"/data/user/0/$pkg\" 2>/dev/null); "
+             "if [ -n \"$owner\" ]; then chown \"$owner:$owner\" \"/data/user/0/$pkg/files/libphisap.so\" 2>/dev/null || true; fi; "
+             "chcon u:object_r:app_data_file:s0 \"/data/user/0/$pkg/files/libphisap.so\" 2>/dev/null || true; "
+             "if [ -n \"$base\" ] && [ -f \"$base/base.apk\" ]; then "
+             "mkdir -p \"$base/lib/arm64\"; cp -f \"$src\" \"$base/lib/arm64/libphisap.so\"; chmod 755 \"$base/lib/arm64/libphisap.so\"; "
+             "chcon --reference=\"$base/base.apk\" \"$base/lib/arm64/libphisap.so\" 2>/dev/null || "
+             "chcon u:object_r:apk_data_file:s0 \"$base/lib/arm64/libphisap.so\" 2>/dev/null || true; "
+             "printf '%%s\\n' \"$base/lib/arm64/libphisap.so\" > /data/local/tmp/phisap-libdir; "
+             "else printf '%%s\\n' \"/data/user/0/$pkg/files/libphisap.so\" > /data/local/tmp/phisap-libdir; fi",
+             so, pkg);
+    run_sh(cmd, 6000);
+    fd = open("/data/local/tmp/phisap-libdir", O_RDONLY);
+    if (fd < 0) return access(out, R_OK) == 0 ? 0 : -1;
+    k = (int)read(fd, path, sizeof path - 1);
+    close(fd);
+    if (k > 0) {
+        path[k] = 0;
+        if (path[k - 1] == '\n') path[k - 1] = 0;
+        if (path[0] == '/' && strlen(path) + 1 < n && access(path, R_OK) == 0) {
+            snprintf(out, n, "%s", path);
             return 0;
         }
-        usleep(100000);
     }
-    clear_wraps_hard(pkg);
-    return loaded(pkg) ? 0 : -1;
+    snprintf(path, sizeof path, "/data/user/0/%s/files/libphisap.so", pkg);
+    if (access(path, R_OK) == 0 && strlen(path) + 1 < n) {
+        snprintf(out, n, "%s", path);
+        return 0;
+    }
+    return access(out, R_OK) == 0 ? 0 : -1;
 }
 
 static int place_so(const char *pkg, const char *so, char *out, size_t n) {
@@ -1452,7 +1548,7 @@ static int inject_fresh(const char *pkg, const char *so) {
         execl(exe, "phisap-inject", ps, so, (char *)0);
         _exit(127);
     }
-    for (i = 0; i < 30 && !timed_out; i++) {
+    for (i = 0; i < 80 && !timed_out; i++) {
         if (waitpid(child, &st, WNOHANG) == child) break;
         if (hook_live()) break;
         usleep(100000);
@@ -1520,8 +1616,10 @@ static int choose_so(const char *pkg, const char *so, char *out, size_t n) {
 }
 
 static int boot_main(const char *pkg, const char *so) {
-    char appso[256];
-    /* 已经开着就先直接送，不重启。送不进才用系统库路径包装，并且只打开一次。 */
+    char appso[512];
+    int i;
+    pid_t game;
+    /* 上次挂了 /system/lib64，包装也可能还在，所以游戏打不开。先撤干净，再送库。不再包装。 */
     if (!pkg || !pkg[0] || !so || so[0] != '/') {
         fprintf(stderr, "参数不对\n");
         return 2;
@@ -1529,58 +1627,59 @@ static int boot_main(const char *pkg, const char *so) {
     signal(SIGALRM, on_alarm);
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
-    alarm(60);
+    alarm(40);
     relax_selinux();
     write_target(pkg);
-    clear_wraps_hard(pkg);
-    stage_so(so);
-    boot_log("phisap-boot-18\n");
-    if (choose_so(pkg, so, appso, sizeof appso) != 0) {
-        snprintf(appso, sizeof appso, "%s", so);
-    }
+    repair_all(pkg);
+    boot_log("phisap-boot-19\n");
     if (game_has_so(pkg)) {
         alarm(0);
-        clear_wraps_hard(pkg);
+        repair_all(pkg);
         say_status("库已在进程里");
-        printf("ok preload\n");
+        printf("ok boot\n");
         return 0;
     }
-    if (find_exact(pkg) > 0) {
-        say_status("游戏已开，直接送进进程");
-        if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
-            alarm(0);
-            timed_out = 0;
-            clear_wraps_hard(pkg);
-            say_status("已送进进程");
-            printf("ok boot\n");
-            return 0;
-        }
+    if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
+        snprintf(appso, sizeof appso, "%s", so);
+    game = find_exact(pkg);
+    if (game <= 0) {
+        say_status("正在打开游戏");
+        start_pkg(pkg);
     }
-    say_status("只重新打开一次，正在送入");
-    if (preload_once(pkg, appso) == 0 || loaded(pkg)) {
+    for (i = 0; i < 40 && !timed_out; i++) {
+        game = find_exact(pkg);
+        if (game > 0 && (caller_of(game) || i > 25)) break;
+        usleep(200000);
+    }
+    game = find_exact(pkg);
+    if (game <= 0) {
+        alarm(0);
+        repair_all(pkg);
+        say_status("包装已撤，游戏没起来。若图标打不开，请重启手机一次");
+        fprintf(stderr, "启动加载失败，包装已撤\n");
+        return 1;
+    }
+    run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
+    say_status("游戏已打开，正在送进进程");
+    if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
         alarm(0);
         timed_out = 0;
-        clear_wraps_hard(pkg);
-        say_status("已在启动时送入");
-        printf("ok preload\n");
-        return 0;
-    }
-    alarm(0);
-    timed_out = 0;
-    clear_wraps_hard(pkg);
-    if (find_exact(pkg) > 0 && (inject_fresh(pkg, appso) == 0 || loaded(pkg))) {
-        clear_wraps_hard(pkg);
+        repair_all(pkg);
         say_status("已送进进程");
         printf("ok boot\n");
         return 0;
     }
-    clear_wraps_hard(pkg);
-    if (!find_exact(pkg)) reopen_plain(pkg);
-    clear_wraps_hard(pkg);
-    say_status("包装已撤，库没进进程，游戏保持打开");
+    alarm(0);
+    timed_out = 0;
+    repair_all(pkg);
+    if (find_exact(pkg) > 0)
+        say_status("游戏开着，库还没进去。没有再改系统库");
+    else
+        say_status("包装已撤，游戏没保持打开。若图标打不开，请重启手机一次");
     fprintf(stderr, "启动加载失败，包装已撤\n");
     return 1;
 }
+
 
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "boot") == 0)
@@ -1637,6 +1736,10 @@ int main(int argc, char **argv) {
     int got_regs = 0;
     pid_t traced = attach_any(pid, &saved, &reg_err, &got_regs);
     if (!traced) {
+        if (hook_inject(pid, pid, so, &fn) == 0) {
+            printf("ok hook\n");
+            return 0;
+        }
         fprintf(stderr, "附加上不去 %d\n", reg_err);
         return 1;
     }
@@ -1672,9 +1775,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     detach_tid(traced);
-    if (!got_regs)
-        fprintf(stderr, "读寄存器失败 %d\n", reg_err ? reg_err : EBUSY);
-    else
-        fprintf(stderr, "入口没挂上\n");
+    fprintf(stderr, "入口没挂上\n");
     return 1;
 }
