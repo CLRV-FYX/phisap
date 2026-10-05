@@ -33,7 +33,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-16";
+static const char INJECT_MARK[] = "phisap-inject-17";
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
@@ -1201,22 +1201,116 @@ static int zygote_watch(const char *pkg, const char *so) {
     return hook_live() ? 0 : -1;
 }
 
+static int prop_empty(const char *key) {
+    char cmd[192];
+    char buf[96];
+    int fd, n, i;
+    snprintf(cmd, sizeof cmd, "getprop %s > /data/local/tmp/phisap-prop", key);
+    run_sh(cmd, 1500);
+    fd = open("/data/local/tmp/phisap-prop", O_RDONLY);
+    if (fd < 0) return 1;
+    n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 1;
+    buf[n] = 0;
+    for (i = 0; i < n; i++) {
+        if (buf[i] != '\n' && buf[i] != '\r' && buf[i] != ' ' && buf[i] != '\t') return 0;
+    }
+    return 1;
+}
+
+static void clear_wraps_hard(const char *pkg) {
+    char key[96];
+    int i;
+    snprintf(key, sizeof key, "wrap.%s", pkg);
+    for (i = 0; i < 3; i++) {
+        clear_wraps(pkg);
+        if (prop_empty(key)) return;
+        usleep(100000);
+    }
+}
+
 static int preload_once(const char *pkg, const char *so) {
     char cmd[640];
     int i;
-    if (!so || so[0] != '/' || strchr(so, ' ') || strchr(so, '\'') || strchr(so, '"')) return -1;
+    if (!so || !so[0] || strchr(so, ' ') || strchr(so, '\'') || strchr(so, '"')) return -1;
+    if (so[0] != '/' && strchr(so, '/')) return -1;
     if (strlen(so) + 12 > 91) return -1;
-    clear_wraps(pkg);
+    clear_wraps_hard(pkg);
     snprintf(cmd, sizeof cmd, "setprop wrap.%s LD_PRELOAD=%s", pkg, so);
     run_sh(cmd, 2000);
     boot_log("preload set\n");
     snprintf(cmd, sizeof cmd, "am force-stop '%s'", pkg);
     run_sh(cmd, 4000);
     start_pkg(pkg);
-    for (i = 0; i < 40 && !timed_out; i++) {
+    for (i = 0; i < 30 && !timed_out; i++) {
         if (hook_live()) return 0;
         usleep(100000);
     }
+    return hook_live() ? 0 : -1;
+}
+
+static int place_so(const char *pkg, const char *so, char *out, size_t n) {
+    char cmd[960];
+    snprintf(out, n, "/data/user/0/%s/files/p.so", pkg);
+    snprintf(cmd, sizeof cmd,
+             "mkdir -p '/data/user/0/%s/files' /data/local/tmp ; "
+             "cp -f '%s' '%s' ; cp -f '%s' /data/local/tmp/libphisap.so ; "
+             "chmod 755 '%s' /data/local/tmp/libphisap.so /data/local/tmp ; "
+             "owner=$(stat -c %%u '/data/user/0/%s' 2>/dev/null) ; "
+             "if [ -n \"$owner\" ]; then chown \"$owner:$owner\" '%s' 2>/dev/null || true ; fi ; "
+             "chcon u:object_r:app_data_file:s0 '%s' 2>/dev/null || true ; "
+             "chcon u:object_r:system_file:s0 /data/local/tmp/libphisap.so 2>/dev/null || true",
+             pkg, so, out, so, out, pkg, out, out);
+    run_sh(cmd, 4000);
+    if (access(out, R_OK) == 0) return 0;
+    snprintf(out, n, "/data/local/tmp/libphisap.so");
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static int try_system_so(const char *so) {
+    char cmd[512];
+    snprintf(cmd, sizeof cmd,
+             "cp -f '%s' /system/lib64/libphisap.so 2>/dev/null || "
+             "(mount -o rw,remount /system 2>/dev/null ; mount -o rw,remount / 2>/dev/null ; "
+             "cp -f '%s' /system/lib64/libphisap.so) ; "
+             "chmod 644 /system/lib64/libphisap.so 2>/dev/null || true",
+             so, so);
+    run_sh(cmd, 4000);
+    return access("/system/lib64/libphisap.so", R_OK) == 0;
+}
+
+static int inject_fresh(const char *pkg, const char *so) {
+    char exe[256];
+    char ps[16];
+    pid_t game, child;
+    int st = 0, i;
+    ssize_t n;
+    game = find_exact(pkg);
+    if (game <= 0) return -1;
+    if (hook_live()) return 0;
+    n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return -1;
+    exe[n] = 0;
+    snprintf(ps, sizeof ps, "%d", (int)game);
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        execl(exe, "phisap-inject", ps, so, (char *)0);
+        _exit(127);
+    }
+    for (i = 0; i < 30 && !timed_out; i++) {
+        if (waitpid(child, &st, WNOHANG) == child) break;
+        if (hook_live()) break;
+        usleep(100000);
+    }
+    if (waitpid(child, &st, WNOHANG) != child) {
+        kill(child, SIGTERM);
+        usleep(150000);
+        kill(child, SIGKILL);
+        waitpid(child, &st, 0);
+    }
+    kill(game, SIGCONT);
     return hook_live() ? 0 : -1;
 }
 
@@ -1228,7 +1322,8 @@ static void reopen_plain(const char *pkg) {
 
 static int boot_main(const char *pkg, const char *so) {
     char appso[256];
-    const char *watch_so = "/data/local/tmp/libphisap.so";
+    /* 不再盯 zygote，也不杀 usap。那条路仍要读寄存器，而且会把整机停住。
+       这里只在进程启动时加载库，包装用完立刻核对并撤掉。 */
     if (!pkg || !pkg[0] || !so || so[0] != '/') {
         fprintf(stderr, "参数不对\n");
         return 2;
@@ -1236,36 +1331,45 @@ static int boot_main(const char *pkg, const char *so) {
     signal(SIGALRM, on_alarm);
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
-    alarm(22);
+    alarm(40);
     relax_selinux();
     write_target(pkg);
-    clear_wraps(pkg);
+    clear_wraps_hard(pkg);
     stage_so(so);
-    say_status("正在启动时送入，游戏会自己重新打开");
-    if (zygote_watch(pkg, watch_so) == 0 || hook_live()) {
+    boot_log("phisap-boot-17\n");
+    say_status("正在启动时加载，随后会撤掉包装");
+    if (place_so(pkg, so, appso, sizeof appso) != 0)
+        snprintf(appso, sizeof appso, "%s", "/data/local/tmp/libphisap.so");
+    if (try_system_so(so) && preload_once(pkg, "libphisap.so") == 0) {
         alarm(0);
-        clear_wraps(pkg);
-        say_status("已在启动时送入");
-        printf("ok boot\n");
-        return 0;
-    }
-    alarm(0);
-    timed_out = 0;
-    say_status("改为启动时加载库");
-    if (ensure_app_so(pkg, so, appso, sizeof appso) != 0)
-        snprintf(appso, sizeof appso, "%s", watch_so);
-    if (preload_once(pkg, appso) == 0 ||
-        (strcmp(appso, watch_so) != 0 && preload_once(pkg, watch_so) == 0)) {
-        clear_wraps(pkg);
+        timed_out = 0;
+        clear_wraps_hard(pkg);
         say_status("已在启动时送入");
         printf("ok preload\n");
         return 0;
     }
     alarm(0);
     timed_out = 0;
-    clear_wraps(pkg);
+    clear_wraps_hard(pkg);
+    if (preload_once(pkg, appso) == 0) {
+        clear_wraps_hard(pkg);
+        say_status("已在启动时送入");
+        printf("ok preload\n");
+        return 0;
+    }
+    clear_wraps_hard(pkg);
+    timed_out = 0;
     reopen_plain(pkg);
-    clear_wraps(pkg);
+    if (inject_fresh(pkg, appso) == 0 || hook_live()) {
+        clear_wraps_hard(pkg);
+        say_status("已在启动时送入");
+        printf("ok boot\n");
+        return 0;
+    }
+    timed_out = 0;
+    clear_wraps_hard(pkg);
+    if (!find_exact(pkg)) reopen_plain(pkg);
+    clear_wraps_hard(pkg);
     say_status("包装已撤，游戏可以自己打开");
     fprintf(stderr, "启动加载失败，包装已撤\n");
     return 1;

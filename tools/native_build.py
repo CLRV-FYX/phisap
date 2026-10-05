@@ -78,6 +78,46 @@ def _prebuilt_native() -> dict[str, bytes] | None:
     return {'so': so, 'tapd': tapd, 'inject': inject}
 
 
+def _needed_libc(blob: bytes) -> bool:
+    if blob[:4] != b'\x7fELF' or blob[4] != 2:
+        return False
+    e_phoff = struct.unpack_from('<Q', blob, 32)[0]
+    e_phentsize, e_phnum = struct.unpack_from('<HH', blob, 54)
+    dyn_off = dyn_sz = 0
+    loads = []
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, _, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from('<IIQQQQQQ', blob, off)
+        if p_type == 1:
+            loads.append((p_vaddr, p_offset, p_filesz))
+        if p_type == 2:
+            dyn_off, dyn_sz = p_offset, p_filesz
+    if not dyn_off:
+        return False
+
+    def v2off(v: int):
+        for pv, po, psz in loads:
+            if pv <= v < pv + psz:
+                return po + (v - pv)
+        return None
+
+    str_v = 0
+    needed = []
+    for n in range(0, dyn_sz, 16):
+        tag, val = struct.unpack_from('<qQ', blob, dyn_off + n)
+        if tag == 0:
+            break
+        if tag == 5:
+            str_v = val
+        if tag == 1:
+            needed.append(val)
+    stro = v2off(str_v)
+    if stro is None:
+        return False
+    names = [blob[stro + v:stro + v + 32].split(b'\0', 1)[0] for v in needed]
+    return b'libc.so' in names and b'libdl.so' in names
+
+
 def build_native() -> dict[str, bytes]:
     script = (NATIVE / 'inside.sh').read_bytes().replace(b'\r\n', b'\n')
     try:
@@ -90,11 +130,26 @@ def build_native() -> dict[str, bytes]:
         so = out / 'libphisap.so'
         tapd = out / 'phisap-tapd'
         inject = out / 'phisap-inject'
+        stub_dir = out / 'stub'
+        stub_dir.mkdir(parents=True, exist_ok=True)
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
-            '-nostdlib', '-fno-stack-protector', '-O2', '-fno-exceptions',
-            '-Wl,-z,max-page-size=16384', '-Wl,--export-dynamic',
-            str(NATIVE / 'hook.c'), str(NATIVE / 'hook.S'), '-o', str(so),
+            '-nostdlib', '-fno-stack-protector', '-O2',
+            '-Wl,-z,max-page-size=16384', '-Wl,-soname,libc.so',
+            str(NATIVE / 'stub.c'), '-o', str(stub_dir / 'libc.so'),
+        ])
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
+            '-nostdlib', '-fno-stack-protector', '-O2',
+            '-Wl,-z,max-page-size=16384', '-Wl,-soname,libdl.so',
+            str(NATIVE / 'stubdl.c'), '-o', str(stub_dir / 'libdl.so'),
+        ])
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
+            '-nostdlib', '-fno-stack-protector', '-O2', '-fno-exceptions', '-fno-builtin',
+            '-Wl,-z,max-page-size=16384', '-Wl,--export-dynamic', '-Wl,--no-as-needed',
+            str(NATIVE / 'hook.c'), str(NATIVE / 'hook.S'),
+            str(stub_dir / 'libdl.so'), str(stub_dir / 'libc.so'), '-o', str(so),
         ])
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
@@ -140,12 +195,14 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('启动脚本没有改走启动时送入')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-16' not in blobs['inject']:
+    if b'phisap-inject-17' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
-    if b'LD_PRELOAD=' not in blobs['inject'] or b'watching zygote' not in blobs['inject']:
+    if b'phisap-boot-17' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
         raise RuntimeError('inject 没有启动时送入')
     if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:
         raise RuntimeError('钩子不会在进程启动后再开工')
+    if not _needed_libc(blobs['so']):
+        raise RuntimeError('钩子没有按正常动态库依赖 libc')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in blobs['ioctl']:
         raise RuntimeError('触摸库没有 nioctl')
     if blobs['ioctl'][16] != 3:
