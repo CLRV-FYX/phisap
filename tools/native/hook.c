@@ -33,6 +33,19 @@ extern int connect(int fd, const void *addr, unsigned int len);
 extern long send(int fd, const void *buf, unsigned long n, int flags);
 extern void (*signal(int sig, void (*fn)(int)))(int);
 
+/* 不依赖 bionic 是否导出这个符号。加载失败时游戏会直接起不来。 */
+void __clear_cache(void *start, void *end) {
+    unsigned long s = (unsigned long)start & ~63ul;
+    unsigned long e = (unsigned long)end;
+    unsigned long p;
+    for (p = s; p < e; p += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (p = s; p < e; p += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+
 struct timespec_ { long tv_sec; long tv_nsec; };
 
 static int streq(const char *a, const char *b) {
@@ -1172,7 +1185,7 @@ static void *worker(void *arg) {
     (void)arg;
     /* 可能是在 zygote 子进程里被提前送入的。名字还不是游戏时不要写状态，
        也不要去碰别的应用。specialize 之后才会变成目标包名。 */
-    for (i = 0; i < 400; i++) {
+    for (i = 0; i < 800; i++) {
         if (!read_self_cmd(pkg, sizeof pkg)) { usleep(50000); continue; }
         if (known_game(pkg)) break;
         if (!holder_name(pkg)) return 0;
@@ -1244,6 +1257,15 @@ __attribute__((constructor)) void phisap_init(void) {
     if (once) return;
     once = 1;
     signal(13, (void (*)(int))1);
-    if (!read_self_cmd(pkg, sizeof pkg)) return;
-    if (known_game(pkg)) phisap_start();
+    if (!read_self_cmd(pkg, sizeof pkg)) {
+        phisap_start();
+        return;
+    }
+    /* zygote 里开线程会让 ART 拒绝特化。包装启动时名字是 app_process，要开工。 */
+    if (streq(pkg, "zygote") || streq(pkg, "zygote64") || streq(pkg, "zygote32")
+        || streq(pkg, "usap64") || streq(pkg, "usap32")
+        || streq(pkg, "<pre-initialized>"))
+        return;
+    log_raw("phisap-hook-12\n");
+    phisap_start();
 }

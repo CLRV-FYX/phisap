@@ -66,6 +66,7 @@ printf 'dw=%s\ndh=%s\nrot=%s\nuw=0\nuh=0\n' "$DW" "$DH" "$ROT" > "$D/phisap-hook
 chmod 666 "$D/phisap-hook.cfg"
 : > "$D/phisap-hook.log"
 chmod 666 "$D/phisap-hook.log"
+rm -f "/data/user/0/$PKG/files/phisap-status"
 printf '%s\n' "$PKG" > "$D/phisap-target"
 chmod 666 "$D/phisap-target" 2>/dev/null || true
 SO_USE="$D/libphisap.so"
@@ -231,7 +232,7 @@ do_inject() {
 
 # 寄存器被锁时不再反复读。让游戏重新起来的那一下把库送进去，包装用完就撤。
 run_boot() {
-  say "寄存器被锁，改为启动时送入"
+  say "只打开一次，正在把库送进游戏"
   clear_wrap
   if [ "$OLD" = "Enforcing" ]; then
     setenforce 0 2>/dev/null || true
@@ -265,61 +266,21 @@ run_boot() {
 
 unstick
 say "正在打开游戏"
-launch
+# 不要先 launch 再强停。boot 自己只打开一次；失败也不要循环再开。
+if ! run_boot; then
+  if [ -z "$(game_pids "$PKG")" ]; then
+    launch
+  fi
+fi
 i=0
-last=-8
-skip_inject=0
-while [ "$i" -lt 480 ]; do
+while [ "$i" -lt 80 ]; do
   if stopped; then
     say "已停止"
     exit 0
   fi
   if hooked; then
     relay || say "钩子已在游戏里"
-    i=$((i + 1))
-    sleep 0.5
-    continue
-  fi
-  pids=$(game_pids "$PKG")
-  if [ -z "$pids" ]; then
-    if [ "$skip_inject" -eq 0 ]; then
-      say "正在打开游戏"
-    fi
-    if [ $((i % 4)) -eq 0 ]; then
-      launch
-    fi
-  elif [ "$skip_inject" -eq 0 ]; then
-    say "已打开游戏，正在送进进程"
-    if [ $((i - last)) -ge 4 ]; then
-      last=$i
-      if ! do_inject "$pids"; then
-        err=$(tr '\n' ' ' < "$D/phisap-inject.err" 2>/dev/null | cut -c1-40)
-        case "$err" in
-          *读寄存器*|*附加上不去*)
-            skip_inject=1
-            if ! run_boot; then
-              launch
-              exit 1
-            fi
-            ;;
-          *)
-            if [ -n "$err" ]; then
-              say "游戏开着，还在送进进程 $err"
-            else
-              say "游戏开着，还在送进进程"
-            fi
-            ;;
-        esac
-      fi
-      sleep 0.2
-      if hooked; then
-        relay || say "钩子已在游戏里"
-      fi
-    fi
-  fi
-  if [ "$skip_inject" -eq 1 ] && [ "$i" -gt 80 ] && ! hooked; then
-    say "库送进去了但没有回报，包装已撤，游戏可以自己打开"
-    exit 1
+    exit 0
   fi
   i=$((i + 1))
   sleep 0.4
