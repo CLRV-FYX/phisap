@@ -101,7 +101,8 @@ def build_native() -> dict[str, bytes]:
         ])
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
-            '-fno-stack-protector', str(NATIVE / 'inject.c'), '-o', str(inject),
+            '-fno-stack-protector', str(NATIVE / 'inject.c'), str(NATIVE / 'cave.S'),
+            '-o', str(inject),
         ])
         ioctl = out / 'libphisap-ioctl.so'
         subprocess.check_call([
@@ -134,7 +135,7 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('wrap 脚本没有设 LD_PRELOAD')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-13' not in blobs['inject']:
+    if b'phisap-inject-14' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in blobs['ioctl']:
         raise RuntimeError('触摸库没有 nioctl')

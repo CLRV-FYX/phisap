@@ -178,18 +178,20 @@ do_inject() {
     for so in $GAMESO "$D/libphisap.so" "$SO"; do
       [ -n "$so" ] && [ -f "$so" ] || continue
       err=$(try_inject "$pid" "$so") && {
-        restore
         say "已送进，等钩子回报"
         return 0
       }
+      case "$err" in
+        *读寄存器*|*附加上不去*)
+          break 2
+          ;;
+      esac
     done
   done
-  restore
-  if [ -n "$err" ]; then
-    say "注入失败 $err"
-  else
-    say "注入失败"
-  fi
+  # 这里不恢复 SELinux。后面若要重启游戏，wrap 才能在宽松模式下把库送进去。
+  # 脚本退出时 trap 会改回来。
+  printf '%s\n' "$err" > "$D/phisap-inject.err" 2>/dev/null || true
+  printf '%s\n' "$err" >> "$D/phisap-inject.log" 2>/dev/null || true
   return 1
 }
 
@@ -219,20 +221,28 @@ while [ "$i" -lt 480 ]; do
     saw_pid=1
     if [ $((i - last)) -ge 6 ]; then
       last=$i
-      do_inject "$pids" || true
+      if ! do_inject "$pids"; then
+        if [ "$restarted" = 0 ]; then
+          restarted=1
+          last=-8
+          say "进不了进程，重启游戏再送"
+          am force-stop "$PKG" >/dev/null 2>&1 || true
+          sleep 0.4
+          launch
+        else
+          err=$(tr '\n' ' ' < "$D/phisap-inject.err" 2>/dev/null | cut -c1-48)
+          if [ -n "$err" ]; then
+            say "注入失败 $err"
+          else
+            say "注入失败"
+          fi
+        fi
+      fi
       sleep 0.3
       if hooked; then
         relay || say "钩子已在游戏里"
       fi
     fi
-  fi
-  if [ "$i" -eq 36 ] && [ "$restarted" = 0 ] && [ "$saw_pid" = 1 ] && ! hooked; then
-    restarted=1
-    last=-8
-    say "注入没进去，重启游戏再送一次"
-    am force-stop "$PKG" >/dev/null 2>&1 || true
-    sleep 0.4
-    launch
   fi
   i=$((i + 1))
   sleep 0.5

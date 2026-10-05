@@ -473,15 +473,21 @@ class RedField:
         s 是沿 (-sa, ca) 走的像素。投影(判定)不变。红场在动, 只看这一下的位置。
         """
         nx, ny = _unit(sa, ca)
-        lo, hi = _perpendicular_room(x, y, nx, ny)
-        lo, hi = lo + _SCREEN_INSET, hi - _SCREEN_INSET
-        if hi <= lo:
-            return []
+        room_lo, room_hi = _perpendicular_room(x, y, nx, ny)
+        lo, hi = room_lo + _SCREEN_INSET, room_hi - _SCREEN_INSET
         red = self._red_at(x, y, nx, ny, t, max(0.0, RED_MARGIN_PX + clearance))
         pause = _pause_cut(x, y, nx, ny)
         if pause is not None:
             red = _merge(red + [pause])
-        return _subtract_one((lo, hi), red)
+        if hi > lo:
+            found = _subtract_one((lo, hi), red)
+            if found:
+                return found
+        # 2 像素内缩会把贴边的唯一空缝丢掉，整条垂线就被判成没位置。
+        # 内缩找不到时才用到屏幕边缘，仍然减去红场，不把触点放进噪区。
+        if room_hi <= room_lo:
+            return []
+        return _subtract_one((room_lo, room_hi), red)
 
     def _pick(self, x: float, y: float, nx: float, ny: float, ivs, prefer_s: float):
         best = None
