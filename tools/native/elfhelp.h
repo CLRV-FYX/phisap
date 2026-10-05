@@ -2,6 +2,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* 用哈希找符号运行时地址。成功返回 0。 */
+int elf_find_sym(const char *path, uint64_t file_base, uint64_t map_start, uint64_t map_off,
+                 const char *sym, uint64_t *addr);
+
 /* 在 zip 里找未压缩的库，返回文件内数据起点。找不到返回 -1。 */
 int zip_find_stored(const char *apk, const char *suffix, uint64_t *data_off, uint64_t *data_size);
 

@@ -35,7 +35,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-21";
+static const char INJECT_MARK[] = "phisap-inject-22";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -43,6 +43,7 @@ static volatile pid_t attached_tid;
 static volatile pid_t watched_zygote;
 static volatile pid_t stopped_game;
 static void boot_log(const char *s);
+static void write_why(const char *s);
 
 struct fly_slot {
     pid_t pid;
@@ -177,13 +178,13 @@ static int read_after_stop(pid_t tid, struct pt_regs_arm64 *out, int *err) {
     return read_regs(tid, out, err);
 }
 
-/* 返回 1 表示已经停住并仍附在这个线程上。*got_regs 为 1 才能走远程 dlopen。 */
+/* 返回 1 表示已经停住并仍附在这个线程上。读不到寄存器也算附上，挂钩不需要寄存器。 */
 static int attach_one(pid_t tid, struct pt_regs_arm64 *out, int *err, int *got_regs) {
     int st = task_state(tid);
     *got_regs = 0;
     if (st == 'D' || st == 'Z' || st == 'X') return 0;
     if (pt(PTRACE_SEIZE, tid, 0, 0) == 0) {
-        if (pt(PTRACE_INTERRUPT, tid, 0, 0) == 0 && wait_stop(tid, 80)) {
+        if (pt(PTRACE_INTERRUPT, tid, 0, 0) == 0 && wait_stop(tid, 1200)) {
             attached_tid = tid;
             if (read_after_stop(tid, out, err) == 0) *got_regs = 1;
             return 1;
@@ -197,9 +198,9 @@ static int attach_one(pid_t tid, struct pt_regs_arm64 *out, int *err, int *got_r
         return 0;
     }
     attached_tid = tid;
-    if (!wait_stop(tid, 100)) {
+    if (!wait_stop(tid, 1200)) {
         pt(PTRACE_INTERRUPT, tid, 0, 0);
-        if (!wait_stop(tid, 60)) {
+        if (!wait_stop(tid, 400)) {
             if (err) *err = errno ? errno : EBUSY;
             detach_tid(tid);
             return 0;
@@ -224,12 +225,12 @@ static pid_t attach_any(pid_t pid, struct pt_regs_arm64 *out, int *err, int *got
             int st;
             if (tid <= 0 || tid == pid) continue;
             st = task_state(tid);
-            if (st == 'S' || st == 'R' || st == 't') order[n++] = tid;
+            if (st == 'S' || st == 'R' || st == 't' || st == 'T') order[n++] = tid;
         }
         closedir(d);
     }
     if (n < 32) order[n++] = pid;
-    kill(pid, SIGCONT);
+    /* 不要先 SIGCONT。信号停住的线程上读寄存器会返回 EBUSY。 */
     for (i = 0; i < n && !timed_out; i++) {
         if (attach_one(order[i], out, err, got_regs)) return order[i];
     }
@@ -255,63 +256,8 @@ static uint64_t v2off(Elf64_Phdr *ph, int nph, uint64_t v) {
 }
 
 static uint64_t find_sym_file(const char *path, uint64_t map_start, uint64_t map_off, const char *want) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    Elf64_Ehdr eh;
-    if (read(fd, &eh, sizeof eh) != (ssize_t)sizeof eh || memcmp(eh.e_ident, ELFMAG, 4) != 0) {
-        close(fd);
-        return 0;
-    }
-    if (eh.e_machine != EM_AARCH64 || eh.e_phnum > 64) { close(fd); return 0; }
-    Elf64_Phdr ph[64];
-    if (lseek(fd, (off_t)eh.e_phoff, SEEK_SET) < 0) { close(fd); return 0; }
-    for (int i = 0; i < eh.e_phnum; i++) {
-        if (read(fd, &ph[i], sizeof ph[i]) != (ssize_t)sizeof ph[i]) { close(fd); return 0; }
-    }
-    uint64_t bias = map_start;
-    for (int i = 0; i < eh.e_phnum; i++) {
-        if (ph[i].p_type == PT_LOAD && map_off >= ph[i].p_offset && map_off < ph[i].p_offset + ph[i].p_filesz) {
-            bias = map_start - ph[i].p_vaddr - map_off + ph[i].p_offset;
-            break;
-        }
-    }
-    uint64_t dyn_off = 0, dyn_sz = 0, sym_v = 0, str_v = 0, hash_v = 0;
-    for (int i = 0; i < eh.e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) { dyn_off = ph[i].p_offset; dyn_sz = ph[i].p_filesz; }
-    if (!dyn_off || lseek(fd, (off_t)dyn_off, SEEK_SET) < 0) { close(fd); return 0; }
-    for (uint64_t n = 0; n + sizeof(Elf64_Dyn) <= dyn_sz; n += sizeof(Elf64_Dyn)) {
-        Elf64_Dyn d;
-        if (read(fd, &d, sizeof d) != (ssize_t)sizeof d) break;
-        if (d.d_tag == DT_NULL) break;
-        if (d.d_tag == DT_SYMTAB) sym_v = d.d_un.d_ptr;
-        if (d.d_tag == DT_STRTAB) str_v = d.d_un.d_ptr;
-        if (d.d_tag == DT_HASH) hash_v = d.d_un.d_ptr;
-    }
-    if (!sym_v || !str_v) { close(fd); return 0; }
-    uint64_t sym_off = v2off(ph, eh.e_phnum, sym_v);
-    uint64_t str_off = v2off(ph, eh.e_phnum, str_v);
-    uint32_t nsyms = 0;
-    if (hash_v) {
-        uint32_t head[2];
-        if (lseek(fd, (off_t)v2off(ph, eh.e_phnum, hash_v), SEEK_SET) >= 0 && read(fd, head, 8) == 8)
-            nsyms = head[1];
-    }
-    if (!nsyms || nsyms > 200000) nsyms = 80000;
-    for (uint32_t i = 0; i < nsyms; i++) {
-        Elf64_Sym sym;
-        if (lseek(fd, (off_t)(sym_off + i * sizeof sym), SEEK_SET) < 0) break;
-        if (read(fd, &sym, sizeof sym) != (ssize_t)sizeof sym) break;
-        if (!sym.st_name || !sym.st_value) continue;
-        char name[64];
-        if (lseek(fd, (off_t)(str_off + sym.st_name), SEEK_SET) < 0) continue;
-        ssize_t nr = read(fd, name, sizeof name - 1);
-        if (nr <= 0) continue;
-        name[nr] = 0;
-        if (strcmp(name, want) == 0) {
-            close(fd);
-            return bias + sym.st_value;
-        }
-    }
-    close(fd);
+    uint64_t addr = 0;
+    if (elf_find_sym(path, 0, map_start, map_off, want, &addr) == 0) return addr;
     return 0;
 }
 
@@ -403,9 +349,10 @@ extern char orig_slot[];
 extern char back_slot[];
 extern char lit_flag[];
 extern char lit_open[];
+extern char lit_ext[];
+extern char lit_dlopen[];
 extern char lit_caller[];
 extern char lit_path[];
-extern char open_call[];
 
 static int so_mapped(pid_t pid) {
     char path[64];
@@ -683,6 +630,8 @@ static uint64_t flag_byte(pid_t tid) {
     return 0;
 }
 
+static uint64_t scratch_maps(pid_t tid);
+
 /* 栈指针下面通常没人用。放标记和库路径，避免改到堆。 */
 static uint64_t scratch_base(pid_t tid) {
     char path[64];
@@ -760,7 +709,37 @@ static uint64_t scratch_base(pid_t tid) {
         }
     }
     fclose(f);
-    return 0;
+    return scratch_maps(tid);
+}
+
+/* 停在用户态时 /proc/pid/syscall 是 running，/proc/pid/mem 也经常读不到。
+ * 主线程栈底几页没人用，直接当标记和路径，不必先读出来。 */
+static uint64_t scratch_maps(pid_t tid) {
+    char path[64], line[512];
+    FILE *f;
+    uint64_t stack = 0, anon = 0;
+    snprintf(path, sizeof path, "/proc/%d/maps", (int)tid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0;
+        char perms[8] = {0};
+        unsigned long long sz;
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3) continue;
+        if (!strchr(perms, 'w') || strchr(perms, 'x') || b < a + 65536) continue;
+        sz = b - a;
+        if (strstr(line, "[stack]")) {
+            stack = a + 0x2000;
+            break;
+        }
+        if (strchr(line, '/') || strstr(line, "[heap]")) continue;
+        if (!anon && (sz == 0x100000 || sz == 0xff000 || sz == 0x800000 || sz == 0x7ff000 ||
+                      sz == 0x400000 || sz == 0x200000))
+            anon = a + 0x1000;
+    }
+    fclose(f);
+    if (stack) return stack;
+    return anon;
 }
 
 static int path_is_real_so(const char *p) {
@@ -909,7 +888,7 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
         char path[256];
         uint64_t base = 0, start = 0, off = 0;
         if (!resolve_lib(game, sys_libs[i], path, sizeof path, &base, &start, &off)) continue;
-        if (elf_hook_site(path, base, start, off, sys_syms, 4, need, back_off, hook, orig, cave) == 0) {
+        if (elf_hook_site(path, base, start, off, sys_syms, 6, need, back_off, hook, orig, cave) == 0) {
             if (site) {
                 snprintf(site->path, sizeof site->path, "%s", path);
                 site->file_base = base;
@@ -924,55 +903,69 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
     return -1;
 }
 
-/* 读寄存器返回 EBUSY 时，不改寄存器。把一条热指令换成跳转，
-   跳进可执行空隙里的一小段，由它自己保存寄存器并 dlopen。 */
+static uint64_t biggest_app_exec(pid_t pid);
+
+/* 不改寄存器。把一条热指令换成跳转，由空隙里的代码自己 open 库再用 fd 加载。
+ * 这样不靠应用命名空间是否允许这条路径。用完把原指令写回去。 */
 static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn) {
     uint64_t hook = 0;
-    uint32_t orig = 0;
-    size_t blob_n;
-    size_t need;
-    size_t back_off;
-    size_t orig_off;
-    size_t flag_off;
-    size_t open_off;
-    size_t caller_off;
-    size_t path_lit_off;
-    size_t open_call_off;
-    uint64_t flag_at;
-    uint64_t path_at;
-    uint64_t app_base = 0;
-    int waited;
-    uint64_t cave = 0;
-    unsigned char tmp[480];
+    uint32_t orig = 0, next = 0;
+    size_t blob_n, need, back_off, orig_off, flag_off, open_off, ext_off, dlopen_off, caller_off, path_lit_off;
+    uint64_t flag_at, path_at, app_base = 0, cave = 0;
+    uint64_t open_fn = 0, ext_fn = 0;
+    int waited, wrote8 = 0, mapped;
+    unsigned char tmp[512];
     char note[96];
     struct FileSite site;
+    struct pt_regs_arm64 dummy;
+    int aerr = 0, agot = 0;
     memset(&site, 0, sizeof site);
     if (!fn || !fn->addr || !so || !so[0]) return -1;
     blob_n = (size_t)(blob_end - blob);
-    if (blob_n < 0x40 || blob_n > sizeof tmp) return -1;
+    if (blob_n < 0x40 || blob_n > sizeof tmp) {
+        write_why("跳板太长");
+        return -1;
+    }
     need = (blob_n + 7u) & ~7u;
-    if (need > sizeof tmp) return -1;
     orig_off = (size_t)(orig_slot - blob);
     back_off = (size_t)(back_slot - blob);
     flag_off = (size_t)(lit_flag - blob);
     open_off = (size_t)(lit_open - blob);
+    ext_off = (size_t)(lit_ext - blob);
+    dlopen_off = (size_t)(lit_dlopen - blob);
     caller_off = (size_t)(lit_caller - blob);
     path_lit_off = (size_t)(lit_path - blob);
-    open_call_off = (size_t)(open_call - blob);
-    if (path_lit_off + 8 > blob_n || open_call_off + 4 > blob_n) return -1;
+    if (path_lit_off + 8 > blob_n || dlopen_off + 8 > blob_n) return -1;
     if (locate_hook(game, need, back_off, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
         boot_log("file hook miss\n");
+        write_why("找不到游戏库入口");
         return -1;
     }
     if (app_base) fn->caller = app_base;
-    snprintf(note, sizeof note, "hook %llx cave %llx caller %llx\n",
-             (unsigned long long)hook, (unsigned long long)cave, (unsigned long long)fn->caller);
+    if (!fn->caller) fn->caller = caller_of(game);
+    if (!fn->caller) fn->caller = biggest_app_exec(game);
+    open_fn = sym_in(game, "libc.so", "open");
+    ext_fn = sym_in(game, "libdl.so", "android_dlopen_ext");
+    if (!ext_fn) ext_fn = sym_in(game, "linker64", "android_dlopen_ext");
+    snprintf(note, sizeof note, "hook %llx cave %llx ext %llx\n",
+             (unsigned long long)hook, (unsigned long long)cave, (unsigned long long)ext_fn);
     boot_log(note);
+    if (!attached_tid) {
+        pid_t held = attach_any(game, &dummy, &aerr, &agot);
+        if (!held) {
+            write_why("附加上不去");
+            cont_game(game);
+            return -1;
+        }
+        tid = held;
+    }
     ensure_stopped(game, tid);
     flag_at = scratch_base(tid);
     if (!flag_at) {
         cont_game(game);
+        detach_tid(tid);
         boot_log("no scratch\n");
+        write_why("没有可写内存");
         return -1;
     }
     path_at = flag_at + 16;
@@ -980,72 +973,83 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         unsigned char zero = 0;
         char pbuf[300];
         size_t plen = strlen(so);
+        uint64_t caller = fn->caller;
+        uint32_t back = encode_b(cave + back_off, hook + 4);
+        uint32_t entry;
         if (!plen || plen > 240) {
             cont_game(game);
+            detach_tid(tid);
+            write_why("库路径太长");
             return -1;
         }
         memset(pbuf, 0, sizeof pbuf);
         memcpy(pbuf, so, plen + 1);
         if (poke_exact(tid, path_at, pbuf, plen + 1) != 0 || poke_exact(tid, flag_at, &zero, 1) != 0) {
             cont_game(game);
+            detach_tid(tid);
             boot_log("path poke fail\n");
+            write_why("路径写不进");
             return -1;
         }
-    }
-    memset(tmp, 0, need);
-    memcpy(tmp, blob, blob_n);
-    memcpy(tmp + orig_off, &orig, 4);
-    {
-        uint32_t back = encode_b(cave + back_off, hook + 4);
-        uint64_t open = fn->addr;
-        uint64_t caller = fn->loader ? fn->caller : 0;
-        uint32_t entry;
-        uint32_t call;
-        if (in_branch(cave + open_call_off, open)) call = encode_bl(cave + open_call_off, open);
-        else call = 0xd63f0200u; /* blr x16 */
+        memset(tmp, 0, need);
+        memcpy(tmp, blob, blob_n);
+        memcpy(tmp + orig_off, &orig, 4);
         memcpy(tmp + back_off, &back, 4);
         memcpy(tmp + flag_off, &flag_at, 8);
-        memcpy(tmp + open_off, &open, 8);
+        memcpy(tmp + open_off, &open_fn, 8);
+        memcpy(tmp + ext_off, &ext_fn, 8);
+        memcpy(tmp + dlopen_off, &fn->addr, 8);
         memcpy(tmp + caller_off, &caller, 8);
         memcpy(tmp + path_lit_off, &path_at, 8);
-        memcpy(tmp + open_call_off, &call, 4);
         if (poke_text(tid, cave, tmp, need) != 0) {
             cont_game(game);
+            detach_tid(tid);
             boot_log("text poke fail\n");
+            write_why("写不进代码页");
             return -1;
         }
         entry = encode_b(hook, cave);
-        if ((hook & 7) == 0 && site.path[0]) {
-            uint32_t next = 0;
+        if ((hook & 7) == 0 && site.path[0] &&
+            elf_insn_at(site.path, site.file_base, site.map_start, site.map_off, hook + 4, &next) == 0) {
             uint32_t pair[2];
-            if (elf_insn_at(site.path, site.file_base, site.map_start, site.map_off, hook + 4, &next) == 0) {
-                pair[0] = entry;
-                pair[1] = next;
-                if (poke_text(tid, hook, pair, 8) != 0 && poke_text(tid, hook, &entry, 4) != 0) {
-                    cont_game(game);
-                    boot_log("branch poke fail\n");
-                    return -1;
-                }
-            } else if (poke_text(tid, hook, &entry, 4) != 0) {
-                cont_game(game);
-                boot_log("branch poke fail\n");
-                return -1;
-            }
-        } else if (poke_text(tid, hook, &entry, 4) != 0) {
+            pair[0] = entry;
+            pair[1] = next;
+            wrote8 = poke_text(tid, hook, pair, 8) == 0;
+        }
+        if (!wrote8 && poke_text(tid, hook, &entry, 4) != 0) {
             cont_game(game);
+            detach_tid(tid);
             boot_log("branch poke fail\n");
+            write_why("写不进代码页");
             return -1;
         }
     }
     cont_game(game);
     detach_tid(tid);
     waited = 0;
-    while (waited < 1500 && !timed_out) {
-        if (so_mapped(game)) return 0;
+    while (waited < 3000 && !timed_out) {
+        if (so_mapped(game)) break;
         usleep(20000);
         waited += 20;
     }
-    return -1;
+    mapped = so_mapped(game);
+    {
+        pid_t held = attach_any(game, &dummy, &aerr, &agot);
+        if (held) {
+            if (wrote8) {
+                uint32_t pair[2];
+                pair[0] = orig;
+                pair[1] = next;
+                poke_text(held, hook, pair, 8);
+            } else {
+                poke_text(held, hook, &orig, 4);
+            }
+            detach_tid(held);
+        }
+    }
+    cont_game(game);
+    if (!mapped) write_why(ext_fn ? "打开了但库没映射" : "没有 android_dlopen_ext");
+    return mapped ? 0 : -1;
 }
 
 static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
@@ -1097,6 +1101,17 @@ static void boot_log(const char *s) {
     if (fd < 0) return;
     write(fd, s, strlen(s));
     close(fd);
+}
+
+static void write_why(const char *s) {
+    int fd;
+    if (!s || !s[0]) return;
+    snprintf(last_why, sizeof last_why, "%s", s);
+    fd = open("/data/local/tmp/phisap-why", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return;
+    write(fd, s, strlen(s));
+    close(fd);
+    chmod("/data/local/tmp/phisap-why", 0666);
 }
 
 static void say_status(const char *s) {
@@ -1770,7 +1785,7 @@ static int inject_fresh(const char *pkg, const char *so) {
         execl(exe, "phisap-inject", ps, so, (char *)0);
         _exit(127);
     }
-    for (i = 0; i < 120 && !timed_out; i++) {
+    for (i = 0; i < 220 && !timed_out; i++) {
         if (waitpid(child, &st, WNOHANG) == child) break;
         if (hook_live()) break;
         usleep(100000);
@@ -2355,34 +2370,15 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-21\n");
+    boot_log("phisap-boot-22\n");
+    unlink("/data/local/tmp/phisap-why");
+    last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
         snprintf(appso, sizeof appso, "%s", so);
     game = find_exact(pkg);
-    if (game <= 0 && recent_file("/data/local/tmp/phisap-zygote-stamp", 180)) {
-        say_status("正在打开游戏，等 Zygisk 送入库");
+    if (game <= 0) {
+        say_status("正在打开游戏");
         start_pkg(pkg);
-        disk_tried = 1;
-    } else if (game <= 0) {
-        if (patch_native(pkg, 0, so, appso, sizeof appso, patched, sizeof patched) >= 0) {
-            disk_tried = 1;
-            say_status("已写入游戏库，正在打开");
-        } else {
-            say_status("正在打开游戏");
-        }
-        start_pkg(pkg);
-        if (disk_tried && wait_mapped(pkg, 8000)) {
-            boot_ok(pkg);
-            return 0;
-        }
-        if (disk_tried) {
-            boot_log("needed start missed\n");
-            say_status("库没进去，已还原游戏库，正在重新打开");
-            undo_patch(patched);
-            patched[0] = 0;
-            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
-            start_pkg(pkg);
-        }
     }
     for (i = 0; i < 40 && !timed_out; i++) {
         game = find_exact(pkg);
@@ -2399,73 +2395,26 @@ static int boot_main(const char *pkg, const char *so) {
     }
     if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
         boot_log("so beside game lib\n");
-    if (recent_file("/data/local/tmp/phisap-zygote-stamp", 180)) {
-        say_status("正在等 Zygisk 把库送进游戏");
-        for (i = 0; i < 40 && !loaded(pkg) && !timed_out; i++) usleep(200000);
-        if (loaded(pkg)) {
-            boot_ok(pkg);
-            return 0;
-        }
-        disk_tried = 1;
-    }
     run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
     say_status("游戏已打开，正在送进进程");
     if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
         boot_ok(pkg);
         return 0;
     }
-    if (call_dlopen_blind(find_exact(pkg), appso) == 0 || loaded(pkg)) {
-        boot_ok(pkg);
-        return 0;
-    }
-    /* 进程里写不进代码页时，只改已经解压出来的 so，并只重新打开一次。 */
-    if (!disk_tried) {
-        char again[256];
-        int pr;
-        again[0] = 0;
-        pr = patch_native(pkg, find_exact(pkg), so, appso, sizeof appso, again, sizeof again);
-        if (pr >= 0) {
-            say_status("已写入游戏库，正在重新打开一次");
-            boot_log("reload once\n");
-            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
-            start_pkg(pkg);
-            if (wait_mapped(pkg, 8000)) {
-                boot_ok(pkg);
-                return 0;
-            }
-            boot_log("reload missed, restore\n");
-            say_status("库没进去，已还原游戏库，正在重新打开");
-            undo_patch(again);
-            if (find_exact(pkg) > 0) stop_pkg_once(pkg);
-            start_pkg(pkg);
-            for (i = 0; i < 25 && find_exact(pkg) <= 0 && !timed_out; i++) usleep(200000);
-            if (find_exact(pkg) > 0 && (inject_fresh(pkg, appso) == 0 || loaded(pkg) || call_dlopen_blind(find_exact(pkg), appso) == 0)) {
-                boot_ok(pkg);
-                return 0;
-            }
-        }
-    }
     cont_game(find_exact(pkg));
-    if (!recent_file("/data/local/tmp/phisap-zygote-stamp", 180) && zygisk_ready() && install_zygisk_module(so) == 0) {
-        say_status("正在重开系统界面一次，把库送进游戏");
-        boot_log("zygisk handoff\n");
-        if (handoff_zygote(pkg) == 0) {
-            printf("handoff\n");
-            return 0;
-        }
-    }
     alarm(0);
     timed_out = 0;
     repair_all(pkg);
     cont_game(find_exact(pkg));
-    if (find_exact(pkg) <= 0) {
-        start_pkg(pkg);
-        for (i = 0; i < 20 && find_exact(pkg) <= 0; i++) usleep(200000);
-    }
     if (find_exact(pkg) > 0) {
-        if (last_why[0]) {
-            char msg[160];
-            snprintf(msg, sizeof msg, "游戏开着，库还没进去：%s", last_why);
+        char why[80];
+        char msg[160];
+        int fd = open("/data/local/tmp/phisap-why", O_RDONLY);
+        int n = fd >= 0 ? (int)read(fd, why, sizeof why - 1) : 0;
+        if (fd >= 0) close(fd);
+        if (n > 0) {
+            why[n] = 0;
+            snprintf(msg, sizeof msg, "游戏开着，库还没进去：%s", why);
             say_status(msg);
         } else {
             say_status("游戏开着，库还没进去");
@@ -2526,7 +2475,7 @@ int main(int argc, char **argv) {
     signal(SIGALRM, on_alarm);
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
-    alarm(20);
+    alarm(25);
     struct pt_regs_arm64 saved;
     int reg_err = 0;
     int got_regs = 0;
@@ -2571,6 +2520,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     detach_tid(traced);
+    cont_game(pid);
     fprintf(stderr, "入口没挂上\n");
     return 1;
 }

@@ -293,7 +293,9 @@ run_boot() {
       return 0
       ;;
   esac
-  if [ -n "$(game_pids "$PKG")" ]; then
+  if [ -s "$D/phisap-why" ]; then
+    say "库还没进去：$(tr '\n' ' ' < "$D/phisap-why" | cut -c1-36)"
+  elif [ -n "$(game_pids "$PKG")" ]; then
     say "游戏已打开，库还没进去"
   else
     say "包装已撤，游戏没起来"
@@ -332,7 +334,9 @@ if hooked; then
   relay || say "钩子已在游戏里"
   exit 0
 fi
-if [ -n "$(game_pids "$PKG")" ]; then
+if [ -s "$D/phisap-why" ]; then
+  say "库还没进去：$(tr '\n' ' ' < "$D/phisap-why" | cut -c1-36)"
+elif [ -n "$(game_pids "$PKG")" ]; then
   say "游戏已打开，库还没进去"
 else
   say "包装已撤，游戏没起来"

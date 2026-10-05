@@ -189,12 +189,101 @@ static int in_branch(uint64_t from, uint64_t to) {
     return (d & 3) == 0 && d >= -(1 << 27) && d < (1 << 27);
 }
 
+#ifndef DT_GNU_HASH
+#define DT_GNU_HASH 0x6ffffef5
+#endif
+
+static int name_eq(int fd, uint64_t str_file, uint32_t st_name, const char *want) {
+    char name[96];
+    ssize_t nr;
+    if (!st_name || !want) return 0;
+    nr = pread(fd, name, sizeof name - 1, (off_t)(str_file + st_name));
+    if (nr <= 0) return 0;
+    name[nr] = 0;
+    return strcmp(name, want) == 0;
+}
+
+static uint32_t gnu_hash(const char *s) {
+    uint32_t h = 5381;
+    while (*s) h = (h << 5) + h + (unsigned char)*s++;
+    return h;
+}
+
+static uint32_t sysv_hash(const char *s) {
+    uint32_t h = 0, g;
+    while (*s) {
+        h = (h << 4) + (unsigned char)*s++;
+        g = h & 0xf0000000u;
+        if (g) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+
+static int sym_at(int fd, uint64_t sym_file, uint64_t str_file, uint32_t idx, const char *want, uint64_t bias, uint64_t *addr) {
+    Elf64_Sym sym;
+    if (pread_full(fd, &sym, sizeof sym, sym_file + (uint64_t)idx * sizeof sym) != 0) return 0;
+    if (!sym.st_value || !name_eq(fd, str_file, sym.st_name, want)) return 0;
+    *addr = bias + sym.st_value;
+    return 1;
+}
+
+static int sym_by_gnu(int fd, uint64_t hash_file, uint64_t sym_file, uint64_t str_file, const char *want, uint64_t bias, uint64_t *addr) {
+    uint32_t hdr[4];
+    uint32_t nbuckets, symoffset, bloom_size, bloom_shift, h, idx, steps;
+    uint64_t bloom_off, buckets_off, chain_off;
+    uint32_t bucket = 0;
+    if (pread_full(fd, hdr, sizeof hdr, hash_file) != 0) return 0;
+    nbuckets = hdr[0];
+    symoffset = hdr[1];
+    bloom_size = hdr[2];
+    bloom_shift = hdr[3];
+    if (!nbuckets || nbuckets > 1000000 || bloom_size > 1000000) return 0;
+    h = gnu_hash(want);
+    bloom_off = hash_file + 16;
+    buckets_off = bloom_off + (uint64_t)bloom_size * 8;
+    chain_off = buckets_off + (uint64_t)nbuckets * 4;
+    if (bloom_size) {
+        uint64_t word = 0;
+        uint32_t bit = h % 64;
+        uint32_t bit2 = (h >> bloom_shift) % 64;
+        if (pread_full(fd, &word, 8, bloom_off + (uint64_t)((h / 64) % bloom_size) * 8) != 0) return 0;
+        if ((word & (1ull << bit)) == 0 || (word & (1ull << bit2)) == 0) return 0;
+    }
+    if (pread_full(fd, &bucket, 4, buckets_off + (uint64_t)(h % nbuckets) * 4) != 0) return 0;
+    if (bucket < symoffset) return 0;
+    idx = bucket;
+    for (steps = 0; steps < 8192; steps++) {
+        uint32_t cv = 0;
+        if (pread_full(fd, &cv, 4, chain_off + (uint64_t)(idx - symoffset) * 4) != 0) return 0;
+        if ((cv | 1u) == (h | 1u) && sym_at(fd, sym_file, str_file, idx, want, bias, addr)) return 1;
+        if (cv & 1u) return 0;
+        idx++;
+    }
+    return 0;
+}
+
+static int sym_by_sysv(int fd, uint64_t hash_file, uint64_t sym_file, uint64_t str_file, const char *want, uint64_t bias, uint64_t *addr) {
+    uint32_t nbucket = 0, nchain = 0, idx = 0, steps;
+    uint32_t h;
+    if (pread_full(fd, &nbucket, 4, hash_file) != 0 || pread_full(fd, &nchain, 4, hash_file + 4) != 0) return 0;
+    if (!nbucket || nbucket > 1000000 || !nchain || nchain > 1000000) return 0;
+    h = sysv_hash(want);
+    if (pread_full(fd, &idx, 4, hash_file + 8 + (uint64_t)(h % nbucket) * 4) != 0) return 0;
+    for (steps = 0; idx && steps < 8192; steps++) {
+        if (idx >= nchain) return 0;
+        if (sym_at(fd, sym_file, str_file, idx, want, bias, addr)) return 1;
+        if (pread_full(fd, &idx, 4, hash_file + 8 + (uint64_t)nbucket * 4 + (uint64_t)idx * 4) != 0) return 0;
+    }
+    return 0;
+}
+
 static int sym_addr(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph, uint64_t bias, const char *want, uint64_t *addr) {
     Elf64_Phdr dynph;
-    uint64_t dyn_off = 0, dyn_sz = 0, sym_v = 0, str_v = 0, hash_v = 0;
-    uint64_t sym_off, str_off;
+    uint64_t dyn_off = 0, dyn_sz = 0, sym_v = 0, str_v = 0, hash_v = 0, gnu_v = 0;
+    uint64_t sym_off, str_off, str_file;
     uint32_t nsyms = 0;
-    int i, found = 0;
+    int i;
     memset(&dynph, 0, sizeof dynph);
     for (i = 0; i < nph; i++) {
         if (ph[i].p_type == PT_DYNAMIC) dynph = ph[i];
@@ -209,38 +298,43 @@ static int sym_addr(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph, u
         if (d.d_tag == DT_SYMTAB) sym_v = d.d_un.d_ptr;
         if (d.d_tag == DT_STRTAB) str_v = d.d_un.d_ptr;
         if (d.d_tag == DT_HASH) hash_v = d.d_un.d_ptr;
+        if (d.d_tag == DT_GNU_HASH) gnu_v = d.d_un.d_ptr;
     }
     if (!sym_v || !str_v) return -1;
     sym_off = v2off(ph, nph, sym_v);
     str_off = v2off(ph, nph, str_v);
     if (sym_off == (uint64_t)-1 || str_off == (uint64_t)-1) return -1;
+    str_file = file_base + str_off;
+    if (gnu_v) {
+        uint64_t goff = v2off(ph, nph, gnu_v);
+        if (goff != (uint64_t)-1 && sym_by_gnu(fd, file_base + goff, file_base + sym_off, str_file, want, bias, addr))
+            return 0;
+    }
     if (hash_v) {
         uint64_t hoff = v2off(ph, nph, hash_v);
         uint32_t head[2];
-        if (hoff != (uint64_t)-1 && pread_full(fd, head, 8, file_base + hoff) == 0) nsyms = head[1];
+        if (hoff != (uint64_t)-1) {
+            if (sym_by_sysv(fd, file_base + hoff, file_base + sym_off, str_file, want, bias, addr)) return 0;
+            if (pread_full(fd, head, 8, file_base + hoff) == 0) nsyms = head[1];
+        }
     }
-    if (!nsyms || nsyms > 400000) nsyms = 120000;
-    for (uint32_t si = 0; si < nsyms && !found; ) {
+    if (!nsyms || nsyms > 4096) nsyms = 4096;
+    for (uint32_t si = 0; si < nsyms; ) {
         Elf64_Sym batch[64];
         uint32_t cnt = nsyms - si;
+        uint32_t j;
         if (cnt > 64) cnt = 64;
         if (pread_full(fd, batch, cnt * sizeof(Elf64_Sym), file_base + sym_off + (uint64_t)si * sizeof(Elf64_Sym)) != 0) break;
-        for (uint32_t j = 0; j < cnt; j++) {
-            char name[96];
-            ssize_t nr;
-            if (!batch[j].st_name || !batch[j].st_value) continue;
-            nr = pread(fd, name, sizeof name - 1, (off_t)(file_base + str_off + batch[j].st_name));
-            if (nr <= 0) continue;
-            name[nr] = 0;
-            if (strcmp(name, want) == 0) {
+        for (j = 0; j < cnt; j++) {
+            if (!batch[j].st_value) continue;
+            if (name_eq(fd, str_file, batch[j].st_name, want)) {
                 *addr = bias + batch[j].st_value;
-                found = 1;
-                break;
+                return 0;
             }
         }
         si += cnt;
     }
-    return found ? 0 : -1;
+    return -1;
 }
 
 static int read_insn(int fd, uint64_t file_base, const Elf64_Phdr *ph, int nph, uint64_t bias, uint64_t addr, uint32_t *insn) {
@@ -287,6 +381,24 @@ static uint64_t file_cave(int fd, uint64_t file_base, const Elf64_Phdr *ph, int 
             pos += (uint64_t)n - need;
         }
     }
+    return 0;
+}
+
+int elf_find_sym(const char *path, uint64_t file_base, uint64_t map_start, uint64_t map_off,
+                 const char *sym, uint64_t *addr) {
+    int fd;
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[64];
+    uint64_t bias = 0;
+    if (!path || !sym || !addr) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (load_elf(fd, file_base, &eh, ph, 64) != 0 || bias_of(ph, eh.e_phnum, map_start, map_off, file_base, &bias) != 0 ||
+        sym_addr(fd, file_base, ph, eh.e_phnum, bias, sym, addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
     return 0;
 }
 
