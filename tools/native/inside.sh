@@ -66,6 +66,12 @@ printf 'dw=%s\ndh=%s\nrot=%s\nuw=0\nuh=0\n' "$DW" "$DH" "$ROT" > "$D/phisap-hook
 chmod 666 "$D/phisap-hook.cfg"
 : > "$D/phisap-hook.log"
 chmod 666 "$D/phisap-hook.log"
+printf '%s\n' "$PKG" > "$D/phisap-target"
+chmod 666 "$D/phisap-target" 2>/dev/null || true
+SO_USE="$D/libphisap.so"
+if [ -n "$GAMESO" ] && [ -f "$GAMESO" ]; then
+  SO_USE="$GAMESO"
+fi
 
 # 不设置 wrap.包名。PhiSkin 也是正常启动游戏再进进程。
 # wrap 会让系统每次拉起游戏都先跑脚本，脚本一失败，图标点了也打不开。
@@ -223,11 +229,46 @@ do_inject() {
   return 1
 }
 
+# 寄存器被锁时不再反复读。让游戏重新起来的那一下把库送进去，包装用完就撤。
+run_boot() {
+  say "寄存器被锁，改为启动时送入"
+  clear_wrap
+  if [ "$OLD" = "Enforcing" ]; then
+    setenforce 0 2>/dev/null || true
+  fi
+  out=""
+  if [ -x "$D/phisap-inject" ]; then
+    out=$("$D/phisap-inject" boot "$PKG" "$SO_USE" 2>&1) || true
+  elif [ -x "$INJ" ]; then
+    out=$("$INJ" boot "$PKG" "$SO_USE" 2>&1) || true
+  fi
+  printf '%s\n' "$out" >> "$D/phisap-boot.log" 2>/dev/null || true
+  clear_wrap
+  case "$out" in
+    *ok*)
+      j=0
+      while [ "$j" -lt 20 ]; do
+        if hooked; then
+          relay || say "钩子已在游戏里"
+          return 0
+        fi
+        j=$((j + 1))
+        sleep 0.3
+      done
+      say "库已送进，等钩子回报"
+      return 0
+      ;;
+  esac
+  say "启动时没送进，包装已撤，游戏可以自己打开"
+  return 1
+}
+
 unstick
 say "正在打开游戏"
 launch
 i=0
 last=-8
+skip_inject=0
 while [ "$i" -lt 480 ]; do
   if stopped; then
     say "已停止"
@@ -241,27 +282,44 @@ while [ "$i" -lt 480 ]; do
   fi
   pids=$(game_pids "$PKG")
   if [ -z "$pids" ]; then
-    say "正在打开游戏"
+    if [ "$skip_inject" -eq 0 ]; then
+      say "正在打开游戏"
+    fi
     if [ $((i % 4)) -eq 0 ]; then
       launch
     fi
-  else
+  elif [ "$skip_inject" -eq 0 ]; then
     say "已打开游戏，正在送进进程"
     if [ $((i - last)) -ge 4 ]; then
       last=$i
       if ! do_inject "$pids"; then
         err=$(tr '\n' ' ' < "$D/phisap-inject.err" 2>/dev/null | cut -c1-40)
-        if [ -n "$err" ]; then
-          say "游戏开着，还在送进进程 $err"
-        else
-          say "游戏开着，还在送进进程"
-        fi
+        case "$err" in
+          *读寄存器*|*附加上不去*)
+            skip_inject=1
+            if ! run_boot; then
+              launch
+              exit 1
+            fi
+            ;;
+          *)
+            if [ -n "$err" ]; then
+              say "游戏开着，还在送进进程 $err"
+            else
+              say "游戏开着，还在送进进程"
+            fi
+            ;;
+        esac
       fi
       sleep 0.2
       if hooked; then
         relay || say "钩子已在游戏里"
       fi
     fi
+  fi
+  if [ "$skip_inject" -eq 1 ] && [ "$i" -gt 80 ] && ! hooked; then
+    say "库送进去了但没有回报，包装已撤，游戏可以自己打开"
+    exit 1
   fi
   i=$((i + 1))
   sleep 0.4

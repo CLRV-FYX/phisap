@@ -60,6 +60,54 @@ static void scopy(char *d, const char *s, unsigned long n) {
     for (; i + 1 < n && s[i]; i++) d[i] = s[i];
     d[i] = 0;
 }
+static int read_self_cmd(char *buf, int cap) {
+    int fd;
+    long n;
+    if (!buf || cap < 2) return 0;
+    fd = open("/proc/self/cmdline", 0, 0);
+    if (fd < 0) return 0;
+    n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return 1;
+}
+static char cfg_pkg[128];
+static int cfg_loaded;
+static void load_cfg_pkg(void) {
+    int fd, n, i;
+    if (cfg_loaded) return;
+    cfg_loaded = 1;
+    cfg_pkg[0] = 0;
+    fd = open("/data/local/tmp/phisap-target", 0, 0);
+    if (fd < 0) return;
+    n = (int)read(fd, cfg_pkg, sizeof cfg_pkg - 1);
+    close(fd);
+    if (n <= 0) { cfg_pkg[0] = 0; return; }
+    cfg_pkg[n] = 0;
+    for (i = 0; cfg_pkg[i]; i++) {
+        if (cfg_pkg[i] == '\n' || cfg_pkg[i] == '\r' || cfg_pkg[i] == ' ') {
+            cfg_pkg[i] = 0;
+            break;
+        }
+    }
+}
+static int known_game(const char *pkg) {
+    if (!pkg || !pkg[0]) return 0;
+    if (streq(pkg, "com.PigeonGames.Phigros")) return 1;
+    if (streq(pkg, "org.flos.phira")) return 1;
+    if (streq(pkg, "org.flos.phira.modded")) return 1;
+    load_cfg_pkg();
+    return cfg_pkg[0] && streq(pkg, cfg_pkg);
+}
+static int holder_name(const char *pkg) {
+    if (!pkg || !pkg[0]) return 1;
+    if (streq(pkg, "zygote") || streq(pkg, "zygote64") || streq(pkg, "zygote32")) return 1;
+    if (streq(pkg, "usap64") || streq(pkg, "usap32")) return 1;
+    if (streq(pkg, "<pre-initialized>")) return 1;
+    if (streq(pkg, "app_process") || streq(pkg, "app_process64")) return 1;
+    return 0;
+}
 static int finite_f(float v) { return v == v && v < 1e7f && v > -1e7f; }
 static float sqrt_local(float x) {
     if (x <= 0.f) return 0.f;
@@ -1119,7 +1167,19 @@ static void wait_if_stopped(void) {
     }
 }
 static void *worker(void *arg) {
+    char pkg[160];
+    int i;
     (void)arg;
+    /* 可能是在 zygote 子进程里被提前送入的。名字还不是游戏时不要写状态，
+       也不要去碰别的应用。specialize 之后才会变成目标包名。 */
+    for (i = 0; i < 400; i++) {
+        if (!read_self_cmd(pkg, sizeof pkg)) { usleep(50000); continue; }
+        if (known_game(pkg)) break;
+        if (!holder_name(pkg)) return 0;
+        usleep(50000);
+    }
+    if (i >= 400) return 0;
+    log_raw("phisap-hook-12\n");
     write_status("钩子已进进程");
     for (int i = 0; i < 900; i++) {
         wait_if_stopped();
@@ -1167,13 +1227,23 @@ static void *worker(void *arg) {
     return 0;
 }
 
+/* 已经在游戏里就直接开工。若是 zygote 刚 fork 出来的，先别开线程，
+   等注入器看到进程名变成游戏后再调 phisap_start。 */
+__attribute__((visibility("default")))
+void phisap_start(void) {
+    static int started;
+    unsigned long th = 0;
+    if (started) return;
+    started = 1;
+    signal(13, (void (*)(int))1);
+    if (pthread_create(&th, 0, worker, 0) != 0) write_status("钩子线程没起来");
+}
 __attribute__((constructor)) void phisap_init(void) {
     static int once;
+    char pkg[160];
     if (once) return;
     once = 1;
     signal(13, (void (*)(int))1);
-    log_raw("phisap-hook-11\n");
-    write_status("钩子已进进程");
-    unsigned long th = 0;
-    if (pthread_create(&th, 0, worker, 0) != 0) write_status("钩子线程没起来");
+    if (!read_self_cmd(pkg, sizeof pkg)) return;
+    if (known_game(pkg)) phisap_start();
 }

@@ -93,6 +93,7 @@ def build_native() -> dict[str, bytes]:
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
             '-nostdlib', '-fno-stack-protector', '-O2', '-fno-exceptions',
+            '-Wl,-z,max-page-size=16384', '-Wl,--export-dynamic',
             str(NATIVE / 'hook.c'), str(NATIVE / 'hook.S'), '-o', str(so),
         ])
         subprocess.check_call([
@@ -135,10 +136,16 @@ def build_native() -> dict[str, bytes]:
         raise RuntimeError('启动脚本还在包装或强停游戏，会让游戏打不开')
     if b'setprop "wrap.$PKG" "$D/phisap-wrap.sh"' in blobs['script']:
         raise RuntimeError('启动脚本还在设置 wrap')
+    if b'boot' not in blobs['script'] or '包装已撤'.encode() not in blobs['script']:
+        raise RuntimeError('启动脚本没有改走启动时送入')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-15' not in blobs['inject']:
+    if b'phisap-inject-16' not in blobs['inject']:
         raise RuntimeError('inject 不是这一版，不能用旧的')
+    if b'LD_PRELOAD=' not in blobs['inject'] or b'watching zygote' not in blobs['inject']:
+        raise RuntimeError('inject 没有启动时送入')
+    if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:
+        raise RuntimeError('钩子不会在进程启动后再开工')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in blobs['ioctl']:
         raise RuntimeError('触摸库没有 nioctl')
     if blobs['ioctl'][16] != 3:

@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <elf.h>
 
@@ -32,10 +33,19 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-15";
+static const char INJECT_MARK[] = "phisap-inject-16";
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
+static volatile pid_t watched_zygote;
+
+struct fly_slot {
+    pid_t pid;
+    int live;
+    int ticks;
+    struct pt_regs_arm64 saved;
+};
+static struct fly_slot fly[8];
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -120,12 +130,26 @@ static void detach_tid(pid_t tid) {
     if (attached_tid == tid) attached_tid = 0;
 }
 
+static int write_regs(pid_t pid, struct pt_regs_arm64 *in);
+
 static void on_alarm(int sig) {
     pid_t tid = attached_tid;
+    pid_t zy = watched_zygote;
+    int i;
     timed_out = 1;
     if (tid > 0) {
         syscall(SYS_ptrace, 17, (long)tid, 0, 0);
         attached_tid = 0;
+    }
+    for (i = 0; i < 8; i++) {
+        if (!fly[i].live) continue;
+        write_regs(fly[i].pid, &fly[i].saved);
+        syscall(SYS_ptrace, 17, (long)fly[i].pid, 0, 0);
+        fly[i].live = 0;
+    }
+    if (zy > 0) {
+        syscall(SYS_ptrace, 17, (long)zy, 0, 0);
+        watched_zygote = 0;
     }
     if (sig == SIGTERM || sig == SIGINT) _exit(0);
 }
@@ -703,9 +727,555 @@ static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
     return 0;
 }
 
+#ifndef PTRACE_O_TRACEFORK
+#define PTRACE_O_TRACEFORK 0x00000002
+#endif
+#ifndef PTRACE_O_TRACEVFORK
+#define PTRACE_O_TRACEVFORK 0x00000004
+#endif
+#ifndef PTRACE_EVENT_FORK
+#define PTRACE_EVENT_FORK 1
+#endif
+#ifndef PTRACE_EVENT_VFORK
+#define PTRACE_EVENT_VFORK 2
+#endif
+#ifndef PTRACE_GETEVENTMSG
+#define PTRACE_GETEVENTMSG 0x4201
+#endif
+
+static void boot_log(const char *s) {
+    int fd = open("/data/local/tmp/phisap-boot.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return;
+    write(fd, s, strlen(s));
+    close(fd);
+}
+
+static void say_status(const char *s) {
+    int fd = open("/data/local/tmp/phisap-status", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return;
+    write(fd, s, strlen(s));
+    write(fd, "\n", 1);
+    close(fd);
+    chmod("/data/local/tmp/phisap-status", 0666);
+}
+
+static void run_sh(const char *cmd, int ms) {
+    pid_t p;
+    int st = 0;
+    int waited = 0;
+    if (!cmd || !cmd[0]) return;
+    p = fork();
+    if (p < 0) return;
+    if (p == 0) {
+        execl("/system/bin/sh", "sh", "-c", cmd, (char *)0);
+        _exit(127);
+    }
+    if (ms < 200) ms = 200;
+    while (waited < ms && !timed_out) {
+        if (waitpid(p, &st, WNOHANG) == p) return;
+        usleep(20000);
+        waited += 20;
+    }
+    kill(p, SIGKILL);
+    waitpid(p, &st, 0);
+}
+
+static int read_cmdline(pid_t pid, char *buf, size_t n) {
+    char path[64];
+    int fd, k;
+    if (n < 2) return 0;
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    k = (int)read(fd, buf, n - 1);
+    close(fd);
+    if (k <= 0) return 0;
+    buf[k] = 0;
+    return 1;
+}
+
+static pid_t find_exact(const char *name) {
+    DIR *d;
+    struct dirent *de;
+    pid_t found = 0;
+    if (!name || !name[0]) return 0;
+    d = opendir("/proc");
+    if (!d) return 0;
+    while ((de = readdir(d))) {
+        pid_t pid;
+        char buf[160];
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        pid = (pid_t)atoi(de->d_name);
+        if (pid <= 1) continue;
+        if (!read_cmdline(pid, buf, sizeof buf)) continue;
+        if (strcmp(buf, name) == 0) { found = pid; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static int hook_live(void) {
+    char buf[512];
+    int fd, n;
+    fd = open("/data/local/tmp/phisap-hook.log", O_RDONLY);
+    if (fd < 0) return 0;
+    n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return strstr(buf, "phisap-hook-12") != 0;
+}
+
+static int game_has_so(const char *pkg) {
+    DIR *d;
+    struct dirent *de;
+    int found = 0;
+    d = opendir("/proc");
+    if (!d) return 0;
+    while ((de = readdir(d))) {
+        pid_t pid;
+        char buf[160];
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        pid = (pid_t)atoi(de->d_name);
+        if (!read_cmdline(pid, buf, sizeof buf)) continue;
+        if (strcmp(buf, pkg) == 0 && so_mapped(pid)) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static void clear_wraps(const char *pkg) {
+    char cmd[768];
+    snprintf(cmd, sizeof cmd,
+             "setprop wrap.%s '' ; resetprop --delete wrap.%s 2>/dev/null ; "
+             "setprop wrap.com.PigeonGames.Phigros '' ; "
+             "setprop wrap.org.flos.phira '' ; "
+             "setprop wrap.org.flos.phira.modded '' ; "
+             "resetprop --delete wrap.com.PigeonGames.Phigros 2>/dev/null ; "
+             "resetprop --delete wrap.org.flos.phira 2>/dev/null ; "
+             "resetprop --delete wrap.org.flos.phira.modded 2>/dev/null ; "
+             "rm -f /data/local/tmp/phisap-wrap.sh",
+             pkg, pkg);
+    run_sh(cmd, 2500);
+}
+
+static void write_target(const char *pkg) {
+    int fd = open("/data/local/tmp/phisap-target", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return;
+    write(fd, pkg, strlen(pkg));
+    write(fd, "\n", 1);
+    close(fd);
+    chmod("/data/local/tmp/phisap-target", 0666);
+}
+
+static void relax_selinux(void) {
+    FILE *f = fopen("/sys/fs/selinux/enforce", "w");
+    if (!f) return;
+    fputc('0', f);
+    fclose(f);
+}
+
+static void stage_so(const char *so) {
+    char cmd[640];
+    if (!so || so[0] != '/') return;
+    snprintf(cmd, sizeof cmd,
+             "mkdir -p /data/local/tmp ; cp -f '%s' /data/local/tmp/libphisap.so ; "
+             "chmod 755 /data/local/tmp/libphisap.so ; "
+             "chcon u:object_r:system_file:s0 /data/local/tmp/libphisap.so 2>/dev/null || true",
+             so);
+    run_sh(cmd, 2500);
+}
+
+static int ensure_app_so(const char *pkg, const char *so, char *out, size_t n) {
+    char cmd[800];
+    snprintf(out, n, "/data/user/0/%s/files/libphisap.so", pkg);
+    snprintf(cmd, sizeof cmd,
+             "mkdir -p '/data/user/0/%s/files' && cp -f '%s' '%s' && chmod 755 '%s' ; "
+             "owner=$(stat -c %%u '/data/user/0/%s' 2>/dev/null) ; "
+             "if [ -n \"$owner\" ]; then chown \"$owner:$owner\" '%s' 2>/dev/null || true ; fi ; "
+             "chcon u:object_r:app_data_file:s0 '%s' 2>/dev/null || true",
+             pkg, so, out, out, pkg, out, out);
+    run_sh(cmd, 3000);
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static void start_pkg(const char *pkg) {
+    char cmd[640];
+    snprintf(cmd, sizeof cmd,
+             "comp=$(cmd package resolve-activity --brief -a android.intent.action.MAIN "
+             "-c android.intent.category.LAUNCHER '%s' 2>/dev/null | tail -n 1) ; "
+             "case \"$comp\" in "
+             "*/*) am start --user 0 -n \"$comp\" ;; "
+             "*) am start --user 0 -a android.intent.action.MAIN "
+             "-c android.intent.category.LAUNCHER -p '%s' ;; esac",
+             pkg, pkg);
+    run_sh(cmd, 6000);
+}
+
+static void drop_fly(void) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (!fly[i].live) continue;
+        write_regs(fly[i].pid, &fly[i].saved);
+        pt(PTRACE_DETACH, fly[i].pid, 0, 0);
+        fly[i].live = 0;
+    }
+}
+
+static void detach_zygote(void) {
+    pid_t zy = watched_zygote;
+    if (zy > 0) {
+        pt(PTRACE_DETACH, zy, 0, 0);
+        watched_zygote = 0;
+    }
+}
+
+static int begin_remote(pid_t child, const char *so, struct fly_slot *slot) {
+    struct OpenFn fn;
+    struct pt_regs_arm64 regs;
+    int err = 0;
+    char path[256];
+    unsigned long remote;
+    fn = resolve_open(child);
+    if (!fn.addr || read_regs(child, &slot->saved, &err) != 0) {
+        pt(PTRACE_DETACH, child, 0, 0);
+        return -1;
+    }
+    remote = (slot->saved.sp - 512) & ~0xful;
+    snprintf(path, sizeof path, "%s", so);
+    if (poke(child, remote, path, strlen(path) + 1) != 0) {
+        pt(PTRACE_DETACH, child, 0, 0);
+        return -1;
+    }
+    regs = slot->saved;
+    regs.regs[0] = remote;
+    regs.regs[1] = 2;
+    if (fn.loader) regs.regs[2] = fn.caller;
+    regs.regs[30] = 0;
+    regs.pc = fn.addr;
+    regs.sp = (remote - 128) & ~0xful;
+    if (write_regs(child, &regs) < 0 || pt(PTRACE_CONT, child, 0, 0) < 0) {
+        write_regs(child, &slot->saved);
+        pt(PTRACE_DETACH, child, 0, 0);
+        return -1;
+    }
+    slot->pid = child;
+    slot->ticks = 0;
+    slot->live = 1;
+    return 0;
+}
+
+static pid_t born[16];
+static int nborn;
+
+static void note_born(pid_t pid) {
+    int i;
+    if (pid <= 0) return;
+    for (i = 0; i < nborn; i++) if (born[i] == pid) return;
+    if (nborn < 16) born[nborn++] = pid;
+}
+
+static int is_holder_name(const char *s) {
+    if (!s || !s[0]) return 1;
+    return !strcmp(s, "zygote") || !strcmp(s, "zygote64") || !strcmp(s, "zygote32")
+        || !strcmp(s, "usap64") || !strcmp(s, "usap32") || !strcmp(s, "<pre-initialized>")
+        || !strcmp(s, "app_process") || !strcmp(s, "app_process64");
+}
+
+static uint64_t so_sym(pid_t pid, const char *sym) {
+    uint64_t start = 0, off = 0;
+    char path[256];
+    path[0] = 0;
+    if (!map_first(pid, "libphisap.so", 1, &start, &off, path, sizeof path))
+        map_first(pid, "libphisap.so", 0, &start, &off, path, sizeof path);
+    if (!start || !path[0]) return 0;
+    return find_sym_file(path, start, off, sym);
+}
+
+static int call_export(pid_t pid, uint64_t fn) {
+    struct pt_regs_arm64 saved, regs;
+    int err = 0, got = 0, st = 0, i, stopped = 0;
+    pid_t tid;
+    if (!fn) return -1;
+    tid = attach_any(pid, &saved, &err, &got);
+    if (!tid || !got) {
+        if (tid) detach_tid(tid);
+        kill(pid, SIGCONT);
+        return -1;
+    }
+    regs = saved;
+    regs.regs[0] = 0;
+    regs.regs[30] = 0;
+    regs.pc = fn;
+    regs.sp = saved.sp & ~0xfull;
+    if (write_regs(tid, &regs) < 0 || pt(PTRACE_CONT, tid, 0, 0) < 0) {
+        write_regs(tid, &saved);
+        detach_tid(tid);
+        kill(pid, SIGCONT);
+        return -1;
+    }
+    for (i = 0; i < 8 && !timed_out; i++) {
+        if (waitpid(tid, &st, 0) < 0) break;
+        if (!WIFSTOPPED(st)) break;
+        {
+            int sig = WSTOPSIG(st);
+            if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS || sig == SIGILL) {
+                stopped = 1;
+                break;
+            }
+        }
+        if (pt(PTRACE_CONT, tid, 0, 0) < 0) break;
+    }
+    write_regs(tid, &saved);
+    detach_tid(tid);
+    kill(pid, SIGCONT);
+    return stopped ? 0 : -1;
+}
+
+static void wake_born(const char *pkg) {
+    int i;
+    for (i = 0; i < nborn; i++) {
+        char buf[160];
+        uint64_t fn;
+        if (born[i] <= 0) continue;
+        if (!read_cmdline(born[i], buf, sizeof buf)) continue;
+        if (strcmp(buf, pkg) != 0) {
+            if (!is_holder_name(buf)) born[i] = 0;
+            continue;
+        }
+        {
+            int f;
+            int busy = 0;
+            for (f = 0; f < 8; f++) if (fly[f].live && fly[f].pid == born[i]) busy = 1;
+            if (busy) continue;
+        }
+        if (hook_live()) {
+            born[i] = 0;
+            continue;
+        }
+        fn = so_sym(born[i], "phisap_start");
+        if (!fn) continue;
+        boot_log("call phisap_start\n");
+        call_export(born[i], fn);
+        born[i] = 0;
+    }
+}
+
+static void take_child(pid_t child, const char *so) {
+    int i;
+    if (child <= 0) return;
+    note_born(child);
+    if (so_mapped(child)) {
+        pt(PTRACE_DETACH, child, 0, 0);
+        return;
+    }
+    for (i = 0; i < 8; i++) if (!fly[i].live) break;
+    if (i == 8) {
+        pt(PTRACE_DETACH, child, 0, 0);
+        return;
+    }
+    begin_remote(child, so, &fly[i]);
+}
+
+static void service_fly(struct fly_slot *f) {
+    int st = 0;
+    pid_t g;
+    if (!f->live) return;
+    f->ticks++;
+    g = waitpid(f->pid, &st, __WALL | WNOHANG);
+    if (g < 0 && errno == ECHILD) {
+        f->live = 0;
+        return;
+    }
+    if (g == f->pid && !WIFSTOPPED(st)) {
+        f->live = 0;
+        return;
+    }
+    if (g == f->pid && WIFSTOPPED(st)) {
+        int sig = WSTOPSIG(st);
+        if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS || sig == SIGILL) {
+            write_regs(f->pid, &f->saved);
+            pt(PTRACE_DETACH, f->pid, 0, 0);
+            f->live = 0;
+            return;
+        }
+        if (sig == SIGSTOP) sig = 0;
+        pt(PTRACE_CONT, f->pid, 0, (void *)(long)sig);
+        return;
+    }
+    if (f->ticks > 300) {
+        write_regs(f->pid, &f->saved);
+        pt(PTRACE_DETACH, f->pid, 0, 0);
+        f->live = 0;
+    }
+}
+
+static void service_zygote(pid_t zy, const char *so) {
+    int st = 0;
+    pid_t g = waitpid(zy, &st, __WALL | WNOHANG);
+    int event, sig;
+    unsigned long msg = 0;
+    if (g != zy || !WIFSTOPPED(st)) return;
+    event = (st >> 16) & 0xff;
+    if (event == PTRACE_EVENT_FORK) {
+        pt(PTRACE_GETEVENTMSG, zy, 0, &msg);
+        pt(PTRACE_CONT, zy, 0, 0);
+        take_child((pid_t)msg, so);
+        return;
+    }
+    if (event == PTRACE_EVENT_VFORK) {
+        pt(PTRACE_GETEVENTMSG, zy, 0, &msg);
+        if (msg) pt(PTRACE_DETACH, (pid_t)msg, 0, 0);
+        pt(PTRACE_CONT, zy, 0, 0);
+        return;
+    }
+    sig = WSTOPSIG(st);
+    if (sig == SIGSTOP || sig == SIGTRAP) sig = 0;
+    pt(PTRACE_CONT, zy, 0, (void *)(long)sig);
+}
+
+static pid_t spawn_reopen(const char *pkg) {
+    char cmd[1100];
+    pid_t p;
+    snprintf(cmd, sizeof cmd,
+             "for d in /proc/[0-9]*; do "
+             "c=$(tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null) || continue ; "
+             "case \"$c\" in "
+             "usap64|usap32|'<pre-initialized>'*) kill \"${d##*/}\" 2>/dev/null || true ;; "
+             "esac ; done ; "
+             "sleep 0.4 ; am force-stop '%s' ; sleep 0.3 ; "
+             "comp=$(cmd package resolve-activity --brief -a android.intent.action.MAIN "
+             "-c android.intent.category.LAUNCHER '%s' 2>/dev/null | tail -n 1) ; "
+             "case \"$comp\" in "
+             "*/*) am start --user 0 -n \"$comp\" ;; "
+             "*) am start --user 0 -a android.intent.action.MAIN "
+             "-c android.intent.category.LAUNCHER -p '%s' ;; esac",
+             pkg, pkg, pkg);
+    p = fork();
+    if (p < 0) return 0;
+    if (p == 0) {
+        execl("/system/bin/sh", "sh", "-c", cmd, (char *)0);
+        _exit(127);
+    }
+    return p;
+}
+
+/* 不读已经在跑的游戏的寄存器。盯住 zygote 的下一次 fork，在子进程还没变成游戏之前把库送进去。 */
+static int zygote_watch(const char *pkg, const char *so) {
+    pid_t zy;
+    pid_t helper = 0;
+    int elapsed = 0;
+    int i;
+    long opts = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK;
+    zy = find_exact("zygote64");
+    if (!zy) zy = find_exact("zygote");
+    if (!zy) {
+        boot_log("no zygote\n");
+        return -1;
+    }
+    if (pt(PTRACE_SEIZE, zy, 0, (void *)opts) < 0) {
+        boot_log("seize zygote failed\n");
+        return -1;
+    }
+    watched_zygote = zy;
+    boot_log("watching zygote\n");
+    helper = spawn_reopen(pkg);
+    while (elapsed < 8000 && !timed_out) {
+        service_zygote(zy, so);
+        for (i = 0; i < 8; i++) service_fly(&fly[i]);
+        if ((elapsed % 20) == 0) wake_born(pkg);
+        if ((elapsed % 40) == 0 && hook_live()) {
+            boot_log("hook live at fork\n");
+            break;
+        }
+        usleep(2000);
+        elapsed += 2;
+    }
+    if (helper > 0) {
+        int st = 0;
+        kill(helper, SIGTERM);
+        waitpid(helper, &st, WNOHANG);
+    }
+    drop_fly();
+    detach_zygote();
+    return hook_live() ? 0 : -1;
+}
+
+static int preload_once(const char *pkg, const char *so) {
+    char cmd[640];
+    int i;
+    if (!so || so[0] != '/' || strchr(so, ' ') || strchr(so, '\'') || strchr(so, '"')) return -1;
+    if (strlen(so) + 12 > 91) return -1;
+    clear_wraps(pkg);
+    snprintf(cmd, sizeof cmd, "setprop wrap.%s LD_PRELOAD=%s", pkg, so);
+    run_sh(cmd, 2000);
+    boot_log("preload set\n");
+    snprintf(cmd, sizeof cmd, "am force-stop '%s'", pkg);
+    run_sh(cmd, 4000);
+    start_pkg(pkg);
+    for (i = 0; i < 40 && !timed_out; i++) {
+        if (hook_live()) return 0;
+        usleep(100000);
+    }
+    return hook_live() ? 0 : -1;
+}
+
+static void reopen_plain(const char *pkg) {
+    clear_wraps(pkg);
+    if (find_exact(pkg) > 0) return;
+    start_pkg(pkg);
+}
+
+static int boot_main(const char *pkg, const char *so) {
+    char appso[256];
+    const char *watch_so = "/data/local/tmp/libphisap.so";
+    if (!pkg || !pkg[0] || !so || so[0] != '/') {
+        fprintf(stderr, "参数不对\n");
+        return 2;
+    }
+    signal(SIGALRM, on_alarm);
+    signal(SIGTERM, on_alarm);
+    signal(SIGINT, on_alarm);
+    alarm(22);
+    relax_selinux();
+    write_target(pkg);
+    clear_wraps(pkg);
+    stage_so(so);
+    say_status("正在启动时送入，游戏会自己重新打开");
+    if (zygote_watch(pkg, watch_so) == 0 || hook_live()) {
+        alarm(0);
+        clear_wraps(pkg);
+        say_status("已在启动时送入");
+        printf("ok boot\n");
+        return 0;
+    }
+    alarm(0);
+    timed_out = 0;
+    say_status("改为启动时加载库");
+    if (ensure_app_so(pkg, so, appso, sizeof appso) != 0)
+        snprintf(appso, sizeof appso, "%s", watch_so);
+    if (preload_once(pkg, appso) == 0 ||
+        (strcmp(appso, watch_so) != 0 && preload_once(pkg, watch_so) == 0)) {
+        clear_wraps(pkg);
+        say_status("已在启动时送入");
+        printf("ok preload\n");
+        return 0;
+    }
+    alarm(0);
+    timed_out = 0;
+    clear_wraps(pkg);
+    reopen_plain(pkg);
+    clear_wraps(pkg);
+    say_status("包装已撤，游戏可以自己打开");
+    fprintf(stderr, "启动加载失败，包装已撤\n");
+    return 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "boot") == 0)
+        return boot_main(argv[2], argv[3]);
     if (argc != 3) {
-        fprintf(stderr, "%s 用法: phisap-inject <pid> <so>\n", INJECT_MARK);
+        fprintf(stderr, "%s 用法: phisap-inject <pid> <so> | boot <pkg> <so>\n", INJECT_MARK);
         return 2;
     }
     pid_t pid = (pid_t)atoi(argv[1]);
@@ -791,6 +1361,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     detach_tid(traced);
-    fprintf(stderr, "读寄存器失败 %d\n", reg_err ? reg_err : EBUSY);
+    if (!got_regs)
+        fprintf(stderr, "读寄存器失败 %d\n", reg_err ? reg_err : EBUSY);
+    else
+        fprintf(stderr, "入口没挂上\n");
     return 1;
 }
