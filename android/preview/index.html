@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>phisap 手机版</title>
+<style>
+  :root {
+    --bg: #121218;
+    --surface: #1c1c24;
+    --surface2: #26262f;
+    --line: #34343f;
+    --text: #f4f1f3;
+    --muted: #9a93a0;
+    --accent: #f26192;
+    --ink: #2a1020;
+    --ok: #7dcea0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      radial-gradient(900px 480px at 80% -10%, rgba(242,97,146,.18), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+    display: flex;
+    gap: 48px;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 40px 24px 64px;
+  }
+  .phone {
+    width: 390px;
+    height: 800px;
+    background: #0e0e13;
+    border: 1px solid #2a2a34;
+    border-radius: 36px;
+    padding: 14px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.45);
+    flex: none;
+  }
+  .screen {
+    height: 100%;
+    background: var(--bg);
+    border-radius: 26px;
+    overflow: auto;
+    padding: 28px 22px 32px;
+  }
+  .kicker {
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+  }
+  h1 { margin: 4px 0 0; font-size: 40px; font-weight: 560; letter-spacing: -.03em; }
+  .pill {
+    display: inline-flex;
+    margin-top: 14px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--surface2);
+    color: var(--ok);
+    font-size: 13px;
+  }
+  .card {
+    margin-top: 22px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 18px;
+  }
+  .plan-name { font-size: 20px; }
+  .hint { color: var(--muted); font-size: 13px; line-height: 1.45; margin-top: 6px; }
+  button {
+    font: inherit;
+    border: 0;
+    cursor: pointer;
+  }
+  .ghost, .stepper button {
+    background: var(--surface2);
+    color: var(--text);
+    border-radius: 16px;
+  }
+  .ghost { width: 100%; height: 48px; margin-top: 16px; }
+  .row {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .row .copy { flex: 1; }
+  .stepper button { width: 42px; height: 42px; border-radius: 14px; font-size: 20px; }
+  .offset { width: 64px; text-align: center; font-size: 18px; }
+  .start {
+    width: 100%;
+    height: 56px;
+    margin-top: 18px;
+    border-radius: 18px;
+    background: var(--accent);
+    color: var(--ink);
+    font-size: 18px;
+    font-weight: 650;
+  }
+  .start.stop { background: #3a3a46; color: var(--text); }
+  h2 { margin: 28px 0 0; font-size: 16px; font-weight: 600; }
+  .steps { color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .steps p { margin: 10px 0 0; }
+  .ceiling { color: var(--accent); font-size: 13px; line-height: 1.5; margin-top: 16px; }
+  .side { max-width: 460px; padding-top: 12px; }
+  .side h2 { margin-top: 0; font-size: 28px; letter-spacing: -.03em; }
+  .side p { color: var(--muted); line-height: 1.6; }
+  .side strong { color: var(--text); font-weight: 600; }
+  ol { color: var(--muted); line-height: 1.55; padding-left: 18px; }
+  li { margin: 8px 0; }
+  .log {
+    margin-top: 18px;
+    background: #0e0e13;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 12px 14px;
+    color: var(--ok);
+    font-size: 13px;
+    min-height: 44px;
+  }
+  @media (max-width: 860px) {
+    body { flex-direction: column; align-items: center; }
+  }
+</style>
+</head>
+<body>
+  <div class="phone">
+    <div class="screen">
+      <div class="kicker">手机版</div>
+      <h1>phisap</h1>
+      <div class="pill" id="status">还没进游戏</div>
+      <div class="card">
+        <div class="plan-name" id="plan">还没有计划</div>
+        <div class="hint" id="meta">从电脑版「导出到手机」，再在这里导入。电脑版的 ADB 演奏不用关。</div>
+        <button class="ghost" id="import">导入计划</button>
+      </div>
+      <div class="card row">
+        <div class="copy">
+          <div>偏移</div>
+          <div class="hint">正数延后，负数提前。只留这一个数。</div>
+        </div>
+        <div class="stepper"><button id="minus">−</button></div>
+        <div class="offset" id="offset">0</div>
+        <div class="stepper"><button id="plus">+</button></div>
+      </div>
+      <button class="start" id="start">开始</button>
+      <button class="ghost" id="test">测试点一下</button>
+      <h2>怎么接上</h2>
+      <div class="steps">
+        <p>计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</p>
+        <p>有 root：在 LSPosed 打开本模块，作用域只勾 Phigros。进游戏后侧边会出现开始。</p>
+        <p>不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持不变。嵌进去之后不用再勾 LSPosed。</p>
+      </div>
+      <div class="ceiling">权限到 root 为止。不需要电脑常开，也不另装一套框架。</div>
+    </div>
+  </div>
+  <div class="side">
+    <h2>一个 APK 进游戏，电脑版照旧。</h2>
+    <p>参考的那个包不是改安装包里的图片文件。它自己是模块：<strong>LSPosed</strong> 在游戏启动时把它载进 Phigros 进程；没有 root 时用 <strong>NPatch</strong> 嵌进游戏，包名不变。配置界面留在模块里，游戏里只挂一个小按钮。两边用一个只允许模块和游戏访问的接口传设置。</p>
+    <ol>
+      <li>电脑版继续规划，也继续用 ADB 演奏。</li>
+      <li>导出的计划和手机版是同一份 1280×720。</li>
+      <li>手机上只调偏移，然后在游戏侧边点开始。</li>
+    </ol>
+    <div class="log" id="log">配置已保存。进游戏后点侧边的 phisap。</div>
+  </div>
+<script>
+  let offset = 0;
+  let playing = false;
+  const plans = ["还没有计划", "Chart_AT.algored", "测试点击"];
+  let plan = 0;
+  const log = (t) => { document.getElementById("log").textContent = t; };
+  const show = () => {
+    document.getElementById("offset").textContent = (offset > 0 ? "+" : "") + offset;
+    document.getElementById("plan").textContent = plans[plan];
+    document.getElementById("start").textContent = playing ? "停止" : "开始";
+    document.getElementById("start").classList.toggle("stop", playing);
+  };
+  document.getElementById("minus").onclick = () => { offset -= 5; show(); log("偏移 " + offset + " ms，正数延后。"); };
+  document.getElementById("plus").onclick = () => { offset += 5; show(); log("偏移 " + offset + " ms，正数延后。"); };
+  document.getElementById("import").onclick = () => { plan = plan === 1 ? 2 : 1; show(); log("已导入 " + plans[plan] + "。电脑版 ADB 演奏不变。"); };
+  document.getElementById("start").onclick = () => {
+    playing = !playing;
+    document.getElementById("status").textContent = playing ? "游戏里已加载" : "还没进游戏";
+    show();
+    log(playing ? "已交给游戏。侧边按钮 4 秒内开始，偏移 " + offset + " ms。" : "已停止。");
+  };
+  document.getElementById("test").onclick = () => {
+    plan = 2; playing = true; show();
+    document.getElementById("status").textContent = "游戏里已加载";
+    log("测试点击：屏幕中心按一下再松开。用来确认注入，不打谱。");
+  };
+</script>
+</body>
+</html>

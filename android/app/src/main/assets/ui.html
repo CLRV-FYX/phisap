@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>phisap</title>
+<style>
+  :root {
+    --bg: #121218;
+    --surface: #1c1c24;
+    --line: #34343f;
+    --text: #f4f1f3;
+    --muted: #9a93a0;
+    --accent: #f26192;
+    --ink: #2a1020;
+    --ok: #7dcea0;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+    min-height: 100vh;
+    padding: 28px 20px 40px;
+    background:
+      radial-gradient(700px 360px at 90% -10%, rgba(242,97,146,.22), transparent 60%),
+      var(--bg);
+  }
+  .kicker { color: var(--muted); letter-spacing: .18em; font-size: 12px; text-transform: uppercase; }
+  h1 { margin: 6px 0 0; font-size: 40px; font-weight: 560; letter-spacing: -.03em; }
+  .sub { color: var(--muted); margin-top: 8px; line-height: 1.45; }
+  .card {
+    margin-top: 18px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 16px;
+  }
+  .name { font-size: 20px; }
+  .hint { color: var(--muted); font-size: 13px; line-height: 1.45; margin-top: 6px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .grow { flex: 1; }
+  button, .filebtn {
+    font: inherit;
+    border: 0;
+    border-radius: 14px;
+    padding: 12px 14px;
+    background: #2a2a34;
+    color: var(--text);
+  }
+  button.primary {
+    width: 100%;
+    margin-top: 16px;
+    background: var(--accent);
+    color: var(--ink);
+    font-size: 18px;
+    font-weight: 650;
+    padding: 16px;
+    border-radius: 18px;
+  }
+  button.ghost { background: transparent; color: var(--muted); }
+  .step { width: 44px; height: 44px; border-radius: 14px; }
+  .offset { font-variant-numeric: tabular-nums; font-size: 28px; min-width: 72px; text-align: center; }
+  .status {
+    margin-top: 14px;
+    color: var(--ok);
+    font-size: 14px;
+    line-height: 1.4;
+    min-height: 1.4em;
+  }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .pill {
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 8px 12px;
+    color: var(--muted);
+    background: transparent;
+  }
+  .pill.on { background: var(--accent); color: var(--ink); border-color: transparent; }
+  input[type=file] { display: none; }
+  .count { display: none; }
+</style>
+</head>
+<body>
+  <div class="kicker">pocket</div>
+  <h1>phisap</h1>
+  <div class="sub">Phigros 和 Phira 共用一份计划。Phira 必须给 root，走真实触摸。</div>
+
+  <div class="card">
+    <div class="name" id="plan">还没有计划</div>
+    <div class="hint" id="meta">从电脑版「导出到手机」，再导入那份 json。电脑版的 ADB 演奏不用关。</div>
+    <div class="row" style="margin-top:14px">
+      <label class="filebtn" for="file">导入计划</label>
+      <input id="file" type="file" accept="application/json,.json,text/plain" />
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hint">偏移。正数延后，负数提前。和电脑版同一个方向。</div>
+    <div class="row" style="margin-top:10px">
+      <button class="step" id="minus" type="button">−</button>
+      <div class="offset grow" id="offset">0</div>
+      <button class="step" id="plus" type="button">+</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hint">方向。自动会在倒数结束、已经切进游戏之后读屏幕。测试点落在画面偏右；如果跑到上边或下边，换左转或右转。</div>
+    <div class="pills" id="rots">
+      <button class="pill on" type="button" data-rot="-1">自动</button>
+      <button class="pill" type="button" data-rot="1">左转</button>
+      <button class="pill" type="button" data-rot="3">右转</button>
+      <button class="pill" type="button" data-rot="4">不旋转</button>
+    </div>
+  </div>
+
+  <button class="primary" id="start" type="button">开始</button>
+  <div class="row">
+    <button class="ghost grow" id="stop" type="button">停止</button>
+    <button class="ghost grow" id="test" type="button">测试点一下</button>
+  </div>
+  <div class="status" id="status">就绪。播放需要 root。</div>
+  <div class="hint" style="margin-top:18px">
+    支持 com.PigeonGames.Phigros、org.flos.phira、org.flos.phira.modded。
+    点开始后有 3 秒，切到游戏里让谱面开始。Phira 不是 Unity，进程里的点击进不去。
+  </div>
+<script>
+  var offset = 0;
+  var rot = -1;
+  var planName = "";
+  var events = 0;
+  var asked = 0;
+
+  function $(id) { return document.getElementById(id); }
+  function call(name, a, b) {
+    try {
+      if (!window.Phi) return "";
+      if (b !== undefined) return Phi[name](a, b);
+      if (a !== undefined) return Phi[name](a);
+      return Phi[name]();
+    } catch (e) {
+      return "";
+    }
+  }
+  function showOffset() {
+    $("offset").textContent = (offset > 0 ? "+" : "") + offset;
+  }
+  function showPlan() {
+    $("plan").textContent = planName || "还没有计划";
+    $("meta").textContent = events ? (events + " 个事件 · 1280×720") : "从电脑版「导出到手机」，再导入那份 json。";
+  }
+  function paintRot() {
+    var nodes = $("rots").querySelectorAll("button");
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].className = "pill" + (Number(nodes[i].getAttribute("data-rot")) === rot ? " on" : "");
+    }
+  }
+  function refresh() {
+    var raw = call("status");
+    if (!raw) return;
+    try {
+      var s = JSON.parse(raw);
+      offset = s.offset || 0;
+      rot = s.rot === undefined ? rot : s.rot;
+      if (s.plan) planName = s.plan;
+      if (s.events) events = s.events;
+      showOffset();
+      showPlan();
+      paintRot();
+      if (s.msg) {
+        if (asked && s.msg.indexOf("正在请求 root") >= 0 && Date.now() - asked > 4000) {
+          $("status").textContent = "没有拿到 root。请在 Magisk 里允许 phisap。";
+        } else {
+          $("status").textContent = s.msg;
+        }
+      }
+    } catch (e) {}
+  }
+  $("minus").onclick = function () { offset -= 5; showOffset(); call("setOffset", String(offset)); };
+  $("plus").onclick = function () { offset += 5; showOffset(); call("setOffset", String(offset)); };
+  $("rots").onclick = function (ev) {
+    var t = ev.target;
+    if (!t.getAttribute) return;
+    var v = t.getAttribute("data-rot");
+    if (v === null) return;
+    rot = Number(v);
+    paintRot();
+    call("setRot", String(rot));
+  };
+  $("file").onchange = function () {
+    var f = $("file").files && $("file").files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var text = String(reader.result || "");
+      var msg = call("importPlan", f.name, text);
+      $("status").textContent = msg || "已导入";
+      refresh();
+    };
+    reader.readAsText(f);
+  };
+  $("start").onclick = function () {
+    asked = Date.now();
+    $("status").textContent = "3 秒后开始。现在切到 Phira 或 Phigros。";
+    call("prepare", "0");
+  };
+  $("test").onclick = function () {
+    asked = Date.now();
+    $("status").textContent = "3 秒后在画面偏右点一下。现在切到游戏。";
+    call("prepare", "1");
+  };
+  $("stop").onclick = function () {
+    call("stop");
+    $("status").textContent = "已停止";
+  };
+  refresh();
+  setInterval(refresh, 700);
+</script>
+</body>
+</html>

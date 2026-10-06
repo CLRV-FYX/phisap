@@ -23,6 +23,11 @@ REPORT_LIMIT = 12      # 结束时最多列出这么多次延迟
 # 阈值取3ms时每次都会被睡过头, 事件系统性晚发最多15ms。main.py 启动时会把
 # 计时器精度调到1ms, 那时这个3ms阈值才真正生效。
 BUSY_WAIT_MS = 3
+# 上一批真正花在发送上的时间, 下一批提前这么久开始发, 让事件落到计划时刻而不是落在发送之后。
+# 上限 12ms: 只吃掉链路本身的迟到, 不把用户旋钮上的偏移再挪一截。不到 2ms 的发送当没这回事,
+# 避免测试时钟和极短 sendall 被提前量来回抖。
+SEND_AHEAD_CAP_MS = 12.0
+SEND_AHEAD_MIN_MS = 2.0
 
 
 def raise_timer_resolution() -> bool:
@@ -119,17 +124,24 @@ def run_player(send: Callable[[list], None], ans_iter: Iterator[tuple[int, list]
     gc.disable()
     try:
         timestamp, events = first_event if first_event is not None else next(ans_iter)
+        last_send_ms = 0.0
         while running() and (should_continue is None or should_continue()):
-            wait = timestamp - (clock() - start_time()) * 1000
+            elapsed = (clock() - start_time()) * 1000
+            ahead = min(SEND_AHEAD_CAP_MS, last_send_ms) if last_send_ms >= SEND_AHEAD_MIN_MS else 0.0
+            wait = timestamp - ahead - elapsed
             if wait > 0:
                 if idle is not None and wait > 8:
                     idle()
                 elif wait > BUSY_WAIT_MS:
                     sleep(0.001)
                 continue
+            # 迟到按计划时刻算, 不把提前量算进去。提前量只是为了抵消发送本身花的时间。
+            late = elapsed - timestamp
             _t0 = clock()
             send(events)
-            stats.record(timestamp, -wait, events, (clock() - _t0) * 1000)
+            send_ms = (clock() - _t0) * 1000
+            last_send_ms = send_ms
+            stats.record(timestamp, late, events, send_ms)
             timestamp, events = next(ans_iter)
     except StopIteration:
         pass

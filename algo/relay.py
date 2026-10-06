@@ -85,7 +85,8 @@ def _room(pos: tuple[float, float], n: tuple[float, float], margin: float):
     return (lo, hi) if lo <= hi else None
 
 
-def helper_position(line, note, ms: float, pos: tuple[float, float]) -> tuple[float, float] | None:
+def helper_position(line, note, ms: float, pos: tuple[float, float],
+                    blocked=None) -> tuple[float, float] | None:
     """接力触点按下的位置: 把 pos 沿垂直于判定线的方向挪(不改变沿判定线方向的投影, 判定不受影响),
     挪到离屏幕边缘至少 EDGE_INSET 并避开左上角暂停按钮的地方(做不到就退一步: 只要在屏幕内);
     找不到避开暂停按钮的位置返回 None。
@@ -103,9 +104,11 @@ def helper_position(line, note, ms: float, pos: tuple[float, float]) -> tuple[fl
                             key=lambda v: abs(v - s0))
         for sv in candidates or [s0]:
             cand = (pos[0] + n[0] * sv, pos[1] + n[1] * sv)
-            if not in_pause_box(cand):
+            if not in_pause_box(cand) and not (blocked and blocked(cand)):
                 return cand
-    return None if in_pause_box(pos) else pos
+    if in_pause_box(pos) or (blocked and blocked(pos)):
+        return None
+    return pos
 
 
 def find_teleports(track: HoldTrack) -> list[tuple[int, tuple, tuple]]:
@@ -181,7 +184,7 @@ class _ClickGuard:
 
 
 def plan_hold_relays(tracks: list[HoldTrack], events, pool: list[int], heads, cooldown: int,
-                     console=None) -> RelayStats:
+                     console=None, blocked=None) -> RelayStats:
     """给判定区瞬移的长条加接力触点, 就地修改 events。
 
     tracks:   已分配触点的长条
@@ -222,13 +225,15 @@ def plan_hold_relays(tracks: list[HoldTrack], events, pool: list[int], heads, co
                 if t_next is not None:
                     t_up = max(t_up, t_next + RELAY_LAG_MS)
                 cover_end = min(end, (t_next - 1) if t_next is not None else t_up)
-                s_new = helper_position(track.line, track.note, tj, s_far)
+                s_new = helper_position(
+                    track.line, track.note, tj, s_far,
+                    blocked=None if blocked is None else (lambda p, _ms=tj: blocked(p, _ms)))
                 if t_dn < track.start + START_GUARD_MS:
                     reason = 'head'
                 elif tj >= end - 1:
                     reason = 'end'
                 elif s_new is None:
-                    reason = 'unsafe'    # 只能落在暂停按钮上
+                    reason = 'red' if blocked is not None else 'unsafe'    # 红场, 或只能落在暂停按钮上
                 elif not all(in_strip(track.line, track.note, u, s_new)
                              for u in range(tj, cover_end + 1, SAMPLE_MS)):
                     reason = 'drift'     # 判定区很快又移走了, 静止的接力触点跟不上
@@ -277,7 +282,8 @@ def plan_hold_relays(tracks: list[HoldTrack], events, pool: list[int], heads, co
         skipped = {k[8:]: v for k, v in stats.items() if k.startswith('skipped_')}
         if skipped:
             names = {'capacity': '触点不够', 'click': '会误触附近的tap/hold', 'drift': '判定区很快又移走',
-                     'head': '离按下太近', 'end': '在长条末尾', 'unsafe': '只能落在暂停按钮上'}
+                     'head': '离按下太近', 'end': '在长条末尾', 'unsafe': '只能落在暂停按钮上',
+                     'red': '只能落在红场里'}
             msg += '; 放弃' + ', '.join(f'{v}簇({names.get(k, k)})' for k, v in sorted(skipped.items()))
         console.print(msg)
     return stats

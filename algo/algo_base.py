@@ -35,7 +35,23 @@ MAX_POINTERS = 16
 # v11: 长条判定线瞬移时加接力触点(整体时间偏差容忍度从±40ms扩到±90ms, 见 algo/relay.py);
 #      flick很密的谱面自动增加滑键触点, 排不下的flick推迟/短划(见 algo3.solve_with)
 # v12: 音符落在左上角暂停键区域时, 触点沿垂直于判定线的方向平移到区域外(见 avoid_pause_button)
-PLAN_CACHE_SUFFIX = '.ans.v12.json'
+# v13: 规划时间加上谱面 offset; 缓存文件名带上算法和触点数; algored(噪点红场)
+# v14: algored 按红块出现到消失的整段躲开, 在垂直线上选离红场足够远的点, 不再往红场里按下
+# v15: 红场在动, 只躲这一毫秒的位置; 这一下没缝就在判定窗里等它让开
+# v16: 红场按 4.0.1 原生判定几何(只在 enable 区间、正确缓动和缩放锚点);
+#      规划窗优先 Perfect ±40ms, 最远 Good ±80ms
+# v17: 长条在红场赶到之前先按在垂线空位上, 接住之后再松开原来的触点;
+#      不再贴着红边, 也不把判定线瞬移当成扫过红场
+# v18: 换手的新按下不再落进别的音符的判定窗(不抢判定、不打出 Bad);
+#      长条头优先 ±40ms, 不贴 Good 外沿, 免得 60fps 一帧顶出 ±80ms
+# v19: 换手至少重叠一帧再松原来的; 判定线瞬移时手指还在判定带里就停住, 不跳过红场
+# v20: 长条坐进垂线空位中间, 不再贴着红边跟着挪; 红场期间不再逐毫秒补 MOVE
+# v21: 离开红边就停, 不走到空位正中间, 也不跟着判定线的垂直滑动跳;
+#      只有屏幕点马上进红场才剪掉旧手指。走到正中间会自己送进从中间长出来的红区,
+#      跟着跳又会一根接一根换手。
+# v22: 同一时刻叠在同一个点上的音符拆成两根手指。叠在一个像素上, 设备会合成一次触摸, 另一颗漏判。
+# v23: 长条走到一半贴到另一根手指上时也拆开。只在开头拆, 后面滑到一起设备还是会合成一次。
+PLAN_CACHE_SUFFIX = '.ans.v24.json'
 
 
 def distance_of(p1: tuple[float, float], p2: tuple[float, float]):
@@ -415,9 +431,33 @@ SWEEP_POINTER_BASE_MIN = 2000
 
 
 def first_note_ms(chart) -> int | None:
-    """谱面第一个音符的判定时间(ms)"""
+    """谱面第一个音符的判定时间(ms)。不含 chart.offset, 和 solve() 的时间轴一致。
+
+    播放时的时间轴要再加上 offset(见 chart_offset_ms / shift_plan): offset>=0 时
+    音乐先响, 谱面晚这么多秒。手动对齐用的是「第一个音符」, 两边一起加, 差值不变。
+    """
     times = [round(line.seconds(n.time) * 1000) for line in chart.judge_lines for n in line.notes]
     return min(times) if times else None
+
+
+def chart_offset_ms(chart) -> int:
+    """谱面 offset 换算成毫秒。非数字或缺失按 0。"""
+    try:
+        return int(round(float(getattr(chart, 'offset', 0) or 0) * 1000))
+    except (TypeError, ValueError):
+        return 0
+
+
+def shift_plan(events, chart):
+    """把规划整体平移 chart.offset 秒, 让事件时间和音乐对齐。offset 为 0 时原样返回。"""
+    shift = chart_offset_ms(chart)
+    if not shift:
+        return events
+    from collections import defaultdict
+    out = defaultdict(list)
+    for ts, evs in events.items():
+        out[ts + shift].extend(evs)
+    return out
 
 
 def manual_start_plan(plan: list, first_note: int | None, sweep_pointer_base: int = SWEEP_POINTER_BASE_MIN) -> list:
@@ -468,6 +508,6 @@ def load_from_json(in_file: IO) -> dict[int, list[VirtualTouchEvent]]:
 
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'recalc_pos', 'in_screen',
-           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'FLICK_START', 'FLICK_END', 'FLICK_RADIUS', 'thin_path', 'first_note_ms', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
+           'MAX_POINTERS', 'PLAN_CACHE_SUFFIX', 'FLICK_START', 'FLICK_END', 'FLICK_RADIUS', 'thin_path', 'first_note_ms', 'chart_offset_ms', 'shift_plan', 'manual_start_plan', 'note_state', 'note_point', 'flick_path', 'flick_time_shift',
            'clamp_to_screen', 'hold_point', 'JUDGE_HALF_WIDTH', 'PAUSE_BUTTON_BOX', 'PAUSE_EXIT_MARGIN', 'in_pause_box',
            'avoid_pause_button', 'pause_free_intervals', 'pause_presses', 'warn_pause_presses']

@@ -193,7 +193,8 @@ class TestWriteChart(Base):
         A.write_chart(self.tracks, 'S', 'Chart_IN.json', b'{"v":1}')
         A.write_chart(self.tracks, 'S', 'Chart_HD.json', b'{"v":1}')
         keep = ['Chart_HD.ans.v12.json', 'Chart_IN.json.bak', 'Chart_INX.ans.v12.json', 'notes.txt']
-        drop = ['Chart_IN.ans.v12.json', 'Chart_IN.ans.v9.json', 'Chart_IN.ans.json']
+        drop = ['Chart_IN.ans.v12.json', 'Chart_IN.ans.v9.json', 'Chart_IN.ans.json',
+                'Chart_IN.algored.p16.ans.v13.json']
         for n in keep + drop:
             with open(os.path.join(folder, n), 'w') as f:
                 f.write('x')
