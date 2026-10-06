@@ -21,7 +21,19 @@ if [ -z "$PKG" ]; then
 fi
 
 mkdir -p "$D" /sdcard/phisap 2>/dev/null
-rm -f "$D/phisap-stop"
+stop_old_tapd() {
+  touch "$D/phisap-stop" 2>/dev/null || true
+  killall phisap-tapd libphisap-tapd.so 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if ! pidof phisap-tapd >/dev/null 2>&1 && ! pidof libphisap-tapd.so >/dev/null 2>&1; then break; fi
+    killall phisap-tapd libphisap-tapd.so 2>/dev/null || true
+    sleep 0.1
+    i=$((i + 1))
+  done
+  rm -f "$D/phisap-stop"
+}
+stop_old_tapd
 say "悬浮窗开着，正在进游戏"
 
 SO="$LIBDIR/libphisap.so"
@@ -92,9 +104,24 @@ fi
 cp -f "$INJ" "$D/phisap-inject" 2>/dev/null || true
 chmod 755 "$D/phisap-inject" 2>/dev/null || true
 
-echo 0 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null
+PTRACE_OLD=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true)
+PTRACE_CHANGED=0
 OLD=$(getenforce 2>/dev/null || true)
+lower_ptrace_scope() {
+  [ -n "$PTRACE_OLD" ] && [ "$PTRACE_OLD" != 0 ] || return 0
+  if printf '0\n' > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null; then
+    PTRACE_CHANGED=1
+  fi
+}
+restore_ptrace_scope() {
+  if [ "$PTRACE_CHANGED" = 1 ] && [ -n "$PTRACE_OLD" ]; then
+    if printf '%s\n' "$PTRACE_OLD" > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null; then
+      PTRACE_CHANGED=0
+    fi
+  fi
+}
 restore() {
+  restore_ptrace_scope
   if [ "$OLD" = "Enforcing" ]; then
     setenforce 1 2>/dev/null || true
   fi
@@ -233,6 +260,7 @@ do_inject() {
   if [ "$OLD" = "Enforcing" ]; then
     setenforce 0 2>/dev/null || true
   fi
+  lower_ptrace_scope
   for pid in $pids; do
     case "$seen" in
       *" $pid "*) continue ;;
@@ -241,6 +269,8 @@ do_inject() {
     for so in $GAMESO "$D/libphisap.so" "$SO"; do
       [ -n "$so" ] && [ -f "$so" ] || continue
       err=$(try_inject "$pid" "$so") && {
+        restore_ptrace_scope
+        if [ "$OLD" = "Enforcing" ]; then setenforce 1 2>/dev/null || true; fi
         say "已送进，等钩子回报"
         return 0
       }
@@ -251,6 +281,7 @@ do_inject() {
       esac
     done
   done
+  restore_ptrace_scope
   if [ "$OLD" = "Enforcing" ]; then
     setenforce 1 2>/dev/null || true
   fi
@@ -266,12 +297,15 @@ run_boot() {
   if [ "$OLD" = "Enforcing" ]; then
     setenforce 0 2>/dev/null || true
   fi
+  lower_ptrace_scope
   out=""
   if [ -x "$D/phisap-inject" ]; then
     out=$("$D/phisap-inject" boot "$PKG" "$SO_USE" 2>&1) || true
   elif [ -x "$INJ" ]; then
     out=$("$INJ" boot "$PKG" "$SO_USE" 2>&1) || true
   fi
+  restore_ptrace_scope
+  if [ "$OLD" = "Enforcing" ]; then setenforce 1 2>/dev/null || true; fi
   printf '%s\n' "$out" >> "$D/phisap-boot.log" 2>/dev/null || true
   clear_wrap
   case "$out" in
