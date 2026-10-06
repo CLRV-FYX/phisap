@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dexlib import Asm, DexBuilder
 from panel_ui import add_panel
+from xposed_dex import add_xposed_loader
 
 PUB = 0x1
 PRIV = 0x2
@@ -15,7 +16,6 @@ ACT = 'Lapp/phisap/pocket/MainActivity;'
 INJ = 'Lapp/phisap/pocket/Injector;'
 WRK = 'Lapp/phisap/pocket/Worker;'
 CHR = 'Lapp/phisap/pocket/Chrome;'
-HOOK = 'Lapp/phisap/pocket/HookEntry;'
 TAP = 'Lapp/phisap/pocket/Tap;'
 TICK = 'Lapp/phisap/pocket/FloatTick;'
 
@@ -36,7 +36,9 @@ def build_dex() -> bytes:
     _worker(dex)
     _injector(dex)
     _float_tick(dex)
-    # 不放 HookEntry。它实现的 Xposed 接口手机上通常没有，严格的 dexopt 会整包拒绝。
+    # 入口由 LSPosed 根据 assets/xposed_init 加载；普通启动路径不会主动解析这些接口。
+    # 它在 Phigros 的 Application.attach 之后，以游戏进程自身的 UID 调用 System.load。
+    add_xposed_loader(dex)
     return dex.build()
 
 
@@ -113,7 +115,7 @@ def _safe_activity(dex: DexBuilder):
     on.invoke('virtual', M('Landroid/app/Activity;', 'setContentView', 'V', ('Landroid/view/View;',)), [14, 0])
     on.label('s')
     # 一打开就清掉上次留下的 wrap。不清的话，Phigros 图标会一直打不开。
-    on.const_string(2, "setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh; killall phisap-inject; killall libphisap-inject.so")
+    on.const_string(2, "setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh")
     on.new(1, WRK)
     on.invoke('direct', M(WRK, '<init>', 'V', ('Ljava/lang/String;',)), [1, 2])
     on.invoke('virtual', M('Ljava/lang/Thread;', 'start'), [1])
@@ -628,7 +630,7 @@ def _safe_play(dex: DexBuilder):
     stop.if_eqz(1, 'no_proc')
     stop.invoke('virtual', M('Ljava/lang/Process;', 'destroy'), [1])
     stop.label('no_proc')
-    stop.const_string(0, "touch /data/local/tmp/phisap-stop; chmod 666 /data/local/tmp/phisap-stop; echo 已停止 > /data/local/tmp/phisap-status; chmod 666 /data/local/tmp/phisap-status; touch /data/user/0/com.PigeonGames.Phigros/files/phisap-stop /data/user/0/org.flos.phira/files/phisap-stop /data/user/0/org.flos.phira.modded/files/phisap-stop; killall phisap-tapd; killall libphisap-tapd.so; killall phisap-inject; killall libphisap-inject.so; setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh")
+    stop.const_string(0, "touch /data/local/tmp/phisap-stop; chmod 666 /data/local/tmp/phisap-stop; echo 已停止 > /data/local/tmp/phisap-status; chmod 666 /data/local/tmp/phisap-status; touch /data/user/0/com.PigeonGames.Phigros/files/phisap-stop /data/user/0/org.flos.phira/files/phisap-stop /data/user/0/org.flos.phira.modded/files/phisap-stop; killall phisap-tapd; killall libphisap-tapd.so; setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh")
     stop.new(1, WRK)
     stop.invoke('direct', M(WRK, '<init>', 'V', ('Ljava/lang/String;',)), [1, 0])
     stop.invoke('virtual', M('Ljava/lang/Thread;', 'start'), [1])
@@ -1220,13 +1222,14 @@ def _pocket_live(dex: DexBuilder):
     ei.const_string(2, '-c')
     ei.aput(2, 0, 1, 'object')
     ei.const(1, 2)
-    ei.const_string(2, "setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh; killall phisap-inject; killall libphisap-inject.so")
+    ei.const_string(2, "setprop wrap.com.PigeonGames.Phigros ''; setprop wrap.org.flos.phira ''; setprop wrap.org.flos.phira.modded ''; resetprop --delete wrap.com.PigeonGames.Phigros; resetprop --delete wrap.org.flos.phira; resetprop --delete wrap.org.flos.phira.modded; rm -f /data/local/tmp/phisap-wrap.sh")
     ei.aput(2, 0, 1, 'object')
     ei.invoke('static', M('Ljava/lang/Runtime;', 'getRuntime', 'Ljava/lang/Runtime;'), [], 1)
     ei.invoke('virtual', M('Ljava/lang/Runtime;', 'exec', 'Ljava/lang/Process;', ('[Ljava/lang/String;',)), [1, 0], 1)
     ei.invoke('virtual', M('Ljava/lang/Process;', 'waitFor', 'I'), [1])
-    ei.invoke('direct', M(ACT, 'openGame', 'V', ()), [7])
-    for asset in ('inside.sh', 'phisap-tapd', 'phisap-inject', 'libphisap.so'):
+    # inside.sh must prepare hook config and tapd before launching the game;
+    # launching here first would miss Application.attach and falsely rely on ptrace.
+    for asset in ('inside.sh', 'phisap-tapd'):
         ei.const_string(0, asset)
         ei.invoke('direct', M(ACT, 'copyAsset', 'V', ('Ljava/lang/String;',)), [7, 0])
     ei.invoke('direct', M(ACT, 'insideCmd', 'Ljava/lang/String;', ()), [7], 0)
@@ -2980,22 +2983,6 @@ def _injector(dex: DexBuilder):
     main.ret()
     main.try_all('s', 'h', 'h')
     dex.add_method(INJ, 'main', 'V', ('[Ljava/lang/String;',), PUB | STAT, main)
-
-
-
-def _hook(dex: DexBuilder):
-    dex.add_class(HOOK, 'Ljava/lang/Object;', interfaces=('Lde/robv/android/xposed/IXposedHookLoadPackage;',))
-    init = Asm(1, 1)
-    init.invoke('direct', M('Ljava/lang/Object;', '<init>'), [0])
-    init.ret()
-    dex.add_method(HOOK, '<init>', 'V', (), INIT, init)
-    hp = Asm(2, 2)
-    hp.ret()
-    dex.add_method(
-        HOOK, 'handleLoadPackage', 'V',
-        ('Lde/robv/android/xposed/callbacks/XC_LoadPackage$LoadPackageParam;',),
-        PUB, hp,
-    )
 
 
 def _tap(dex: DexBuilder):

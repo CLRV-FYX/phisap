@@ -138,6 +138,7 @@ function Update-Phisap {
     Say ''
     Say '[完成] 已更新到最新代码！运行 start.cmd 即可启动。' 'Green'
     Say '       旧版本文件已备份在隐藏目录 .old_version 中（下次更新时会被覆盖）。'
+    Say '       安卓：安装 android\phisap-pocket.apk 后，在 LSPosed 启用 PhiSAP 并勾选游戏。已打开的游戏需先强制停止；只有 maps 确认后才报告库已加载。' 'Yellow'
 }
 
 try {

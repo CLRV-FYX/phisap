@@ -574,13 +574,12 @@ def build() -> Path:
     native = build_native()
     files.append(('lib/arm64-v8a/libphisap.so', native['so']))
     files.append(('lib/arm64-v8a/libphisap-tapd.so', native['tapd']))
-    files.append(('lib/arm64-v8a/libphisap-inject.so', native['inject']))
     files.append(('lib/arm64-v8a/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/libphisap.so', native['so']))
     files.append(('assets/phisap-tapd', native['tapd']))
-    files.append(('assets/phisap-inject', native['inject']))
     files.append(('assets/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/inside.sh', native['script']))
+    files.append(('assets/xposed_init', b'app.phisap.pocket.HookEntry\n'))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)
@@ -589,8 +588,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='25'" not in badging:
-        raise RuntimeError('versionCode 不是 25')
+    if "versionCode='26'" not in badging:
+        raise RuntimeError('versionCode 不是 26')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -599,6 +598,8 @@ def build() -> Path:
         # 主题必须写进二进制清单。没有主题时，有的手机会在 onCreate 之前拆掉窗口。
         if 'theme' not in xml:
             raise RuntimeError('清单没有系统主题')
+    if 'xposedmodule' not in xml or 'xposedminversion' not in xml or ')=93' not in xml:
+        raise RuntimeError('APK 清单没有声明为 LSPosed 模块')
     resources = subprocess.check_output([str(_find_aapt2()), 'dump', 'resources', str(OUT)], text=True)
     for needle in (
         '0x7f040000 layout/activity_main',
@@ -611,8 +612,17 @@ def build() -> Path:
     ):
         if needle not in resources:
             raise RuntimeError(f'资源 id 变了: {needle}')
-    if b'Lde/robv/android/xposed/IXposedHookLoadPackage;' in dex:
-        raise RuntimeError('dex 仍引用不存在的 Xposed 接口')
+    for descriptor in (
+        b'Lde/robv/android/xposed/IXposedHookLoadPackage;',
+        b'Lde/robv/android/xposed/IXposedHookZygoteInit;',
+        b'Lde/robv/android/xposed/XposedHelpers;',
+    ):
+        if descriptor not in dex:
+            raise RuntimeError(f'Xposed 进程内加载入口缺少 {descriptor.decode()}')
+    if 'System.load succeeded in target process'.encode() not in dex:
+        raise RuntimeError('Xposed 入口没有调用 System.load')
+    if b'phisap-inject' in dex:
+        raise RuntimeError('DEX 仍引用旧的跨进程注入器')
     if '正在进游戏'.encode() not in dex or '可看状态并改设置'.encode() not in dex or b'libphisap.so' not in dex:
         raise RuntimeError('进程内入口没有进 dex')
     if b'ioctlInt' in dex:
@@ -622,24 +632,26 @@ def build() -> Path:
     _require_no_ioctl_int(dex)
     with zipfile.ZipFile(OUT) as blob:
         names = set(blob.namelist())
-        inject_blob = blob.read('assets/phisap-inject')
         ioctl_blob = blob.read('lib/arm64-v8a/libphisap-ioctl.so')
-    if b'phisap-inject-25' not in inject_blob:
-        raise RuntimeError('安装包里的 inject 不是这一版')
+        xposed_init = blob.read('assets/xposed_init').decode('ascii').strip()
+    if xposed_init != 'app.phisap.pocket.HookEntry':
+        raise RuntimeError('assets/xposed_init 没指向真实入口类')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in ioctl_blob:
         raise RuntimeError('安装包里的触摸库没有 nioctl')
     for need in (
         'lib/arm64-v8a/libphisap.so',
         'lib/arm64-v8a/libphisap-tapd.so',
-        'lib/arm64-v8a/libphisap-inject.so',
         'assets/inside.sh',
         'assets/phisap-tapd',
-        'assets/phisap-inject',
+        'assets/libphisap.so',
+        'assets/xposed_init',
         'assets/libphisap-ioctl.so',
         'lib/arm64-v8a/libphisap-ioctl.so',
     ):
         if need not in names:
             raise RuntimeError(f'安装包缺 {need}')
+    if 'assets/phisap-inject' in names or 'lib/arm64-v8a/libphisap-inject.so' in names:
+        raise RuntimeError('APK 仍打包旧 ptrace 注入器')
     return OUT
 
 

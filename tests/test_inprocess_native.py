@@ -179,14 +179,15 @@ class InProcessLauncherRegressionTest(unittest.TestCase):
         self.assertIn('killall phisap-tapd libphisap-tapd.so', stop)
         self.assertIn('pidof libphisap-tapd.so', stop)
 
-    def test_ptrace_scope_is_restored_after_injection(self):
-        self.assertIn('PTRACE_OLD=$(cat /proc/sys/kernel/yama/ptrace_scope', INSIDE_SH)
-        self.assertIn('restore_ptrace_scope()', INSIDE_SH)
-        self.assertIn("printf '%s\\n' \"$PTRACE_OLD\" > /proc/sys/kernel/yama/ptrace_scope", INSIDE_SH)
-        boot = INSIDE_SH.split('run_boot() {', 1)[1].split('\nsay "正在清掉上次', 1)[0]
-        self.assertLess(boot.index('lower_ptrace_scope'), boot.index('out=$("$D/phisap-inject"'))
-        self.assertLess(boot.index('out=$("$D/phisap-inject"'), boot.index('restore_ptrace_scope'))
-
+    def test_launcher_requires_a_real_in_process_library_mapping(self):
+        self.assertIn('/proc/$pid/maps', INSIDE_SH)
+        self.assertIn("grep -q 'libphisap", INSIDE_SH)
+        self.assertIn('Application.attach', INSIDE_SH)
+        self.assertIn('System.load', INSIDE_SH)
+        self.assertIn('LSPosed 只在进程启动时加载模块', INSIDE_SH)
+        self.assertNotIn('phisap-inject', INSIDE_SH)
+        self.assertNotIn('PTRACE', INSIDE_SH.upper())
+        self.assertNotIn('setenforce', INSIDE_SH)
 
 if __name__ == '__main__':
     unittest.main()

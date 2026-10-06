@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">phisap</string>
-    <string name="xposed_description">phisap 手机版。Phigros 可在进程里播放；Phira 走 root 真实触摸。规划仍在电脑版。</string>
+    <string name="xposed_description">PhiSAP 的游戏进程内加载模块。启用后在 Application.attach 中 System.load libphisap.so。</string>
     <string name="brand">phisap</string>
     <string name="brand_sub">手机版</string>
     <string name="status_waiting">还没进游戏</string>
@@ -16,7 +16,7 @@
     <string name="test_tap">测试点一下</string>
     <string name="setup_title">怎么接上</string>
     <string name="step_pc">计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</string>
-    <string name="step_lsposed">有 root：Phigros、Phira（org.flos.phira）和改版（org.flos.phira.modded）都从本应用直接播放。Phira 是 Rust，进程内点击进不去，必须给 root，用真实触摸。</string>
+    <string name="step_lsposed">先在 LSPosed 启用 PhiSAP 并把游戏加入作用域。若游戏已打开，先强制停止；LSPosed 只在进程启动时加载，不能追溯注入。点开始后仅在确认 libphisap.so 已映射到游戏进程时显示已加载。</string>
     <string name="step_npatch">只打 Phigros 且不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持 com.PigeonGames.Phigros。这条路打不了 Phira。</string>
     <string name="ceiling">权限到 root 为止。不需要电脑常开，也不改第二套框架。</string>
 </resources>

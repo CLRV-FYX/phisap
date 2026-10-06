@@ -1,4 +1,4 @@
-"""编方式二用的三个 ARM64 程序：游戏内钩子、root 触摸守护、注入器。"""
+"""构建游戏内 ARM64 钩子、root 触摸守护和 native ioctl 桥。"""
 from __future__ import annotations
 
 import os
@@ -56,7 +56,7 @@ def _section_names(blob: bytes) -> list[str]:
 
 
 def _prebuilt_native() -> dict[str, bytes] | None:
-    """没装 zig 时沿用已验证过的 aarch64 钩子。这次只改 Java 悬浮窗，不重编 so。"""
+    """没装 Zig 时沿用当前 APK 中已验证的 ARM64 钩子、触摸守护和 ioctl 桥。"""
     import zipfile
     apk = ROOT / 'android' / 'phisap-pocket.apk'
     if not apk.is_file():
@@ -72,10 +72,10 @@ def _prebuilt_native() -> dict[str, bytes] | None:
 
         so = pick('lib/arm64-v8a/libphisap.so', 'assets/libphisap.so')
         tapd = pick('assets/phisap-tapd', 'lib/arm64-v8a/libphisap-tapd.so')
-        inject = pick('assets/phisap-inject', 'lib/arm64-v8a/libphisap-inject.so')
-    if not so or not tapd or not inject:
+        ioctl = pick('assets/libphisap-ioctl.so', 'lib/arm64-v8a/libphisap-ioctl.so')
+    if not so or not tapd or not ioctl:
         return None
-    return {'so': so, 'tapd': tapd, 'inject': inject}
+    return {'so': so, 'tapd': tapd, 'ioctl': ioctl}
 
 
 def _needed_libc(blob: bytes) -> bool:
@@ -129,7 +129,6 @@ def build_native() -> dict[str, bytes]:
         out.mkdir(parents=True, exist_ok=True)
         so = out / 'libphisap.so'
         tapd = out / 'phisap-tapd'
-        inject = out / 'phisap-inject'
         stub_dir = out / 'stub'
         stub_dir.mkdir(parents=True, exist_ok=True)
         subprocess.check_call([
@@ -155,11 +154,6 @@ def build_native() -> dict[str, bytes]:
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
             '-fno-stack-protector', str(NATIVE / 'tapd.c'), '-o', str(tapd),
         ])
-        subprocess.check_call([
-            zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
-            '-fno-stack-protector', str(NATIVE / 'inject.c'), str(NATIVE / 'elfhelp.c'), str(NATIVE / 'cave.S'),
-            '-o', str(inject),
-        ])
         ioctl = out / 'libphisap-ioctl.so'
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
@@ -170,13 +164,14 @@ def build_native() -> dict[str, bytes]:
         blobs = {
             'so': so.read_bytes(),
             'tapd': tapd.read_bytes(),
-            'inject': inject.read_bytes(),
             'ioctl': ioctl.read_bytes(),
         }
     else:
-        raise RuntimeError('找不到 zig，不能用旧包里的 inject 交差')
+        blobs = _prebuilt_native()
+        if blobs is None:
+            raise RuntimeError('找不到 zig，且当前 APK 中没有可复用的已验证原生库')
     blobs['script'] = script
-    for name in ('so', 'tapd', 'inject'):
+    for name in ('so', 'tapd', 'ioctl'):
         if _elf_machine(blobs[name]) != 0xB7:
             raise RuntimeError(f'{name} 不是 aarch64')
     if blobs['so'][16] != 3:
@@ -187,22 +182,19 @@ def build_native() -> dict[str, bytes]:
     for needle in (b'JudgeLineControl', b'UpdateInfo', b'libil2cpp.so', b'phisap-hook'):
         if needle not in blobs['so']:
             raise RuntimeError(f'钩子里没有 {needle.decode()}')
-    if b'clear_wrap' not in blobs['script'] or b'force-stop' in blobs['script']:
-        raise RuntimeError('启动脚本还在包装或强停游戏，会让游戏打不开')
-    if b'setprop "wrap.$PKG" "$D/phisap-wrap.sh"' in blobs['script']:
-        raise RuntimeError('启动脚本还在设置 wrap')
-    if b'boot' not in blobs['script'] or '包装已撤'.encode() not in blobs['script']:
-        raise RuntimeError('启动脚本没有改走启动时送入')
+    script_text = blobs['script']
+    if b'force-stop' in script_text or b'ptrace' in script_text or b'setenforce' in script_text:
+        raise RuntimeError('新启动脚本仍尝试强停、ptrace 或关闭 SELinux')
+    if b'phisap-inject' in script_text or b'PTRACE_' in script_text:
+        raise RuntimeError('启动脚本仍走旧注入器')
+    if b'/proc/$pid/maps' not in script_text or b'libphisap\\.so' not in script_text:
+        raise RuntimeError('启动脚本没有用进程 maps 验证库是否实际加载')
+    if b'Application.attach' not in script_text or b'System.load' not in script_text:
+        raise RuntimeError('启动脚本没有说明进程内 System.load 路径')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'phisap-inject-25' not in blobs['inject']:
-        raise RuntimeError('inject 不是这一版，不能用旧的')
-    if b'phisap-boot-25' not in blobs['inject'] or b'LD_PRELOAD=' not in blobs['inject']:
-        raise RuntimeError('inject 没有清掉上次的包装')
     if b'zygisk_module_entry' not in blobs['so']:
-        raise RuntimeError('钩子没有 Zygisk 入口')
-    if b'phisap-ov' not in blobs['inject']:
-        raise RuntimeError('inject 不会撤掉系统库挂载')
+        raise RuntimeError('原生库缺少旧环境兼容入口')
     if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:
         raise RuntimeError('钩子不会在进程启动后再开工')
     if not _needed_libc(blobs['so']):
