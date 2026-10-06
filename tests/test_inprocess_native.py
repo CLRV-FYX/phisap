@@ -3,6 +3,7 @@
 These inspect the low-level sources rather than importing the separate Gradle
 implementation; the APK packages the files under tools/native/.
 """
+import ast
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ HOOK_ASM = (ROOT / 'tools/native/hook.S').read_text(encoding='utf-8')
 HOOK_C = (ROOT / 'tools/native/hook.c').read_text(encoding='utf-8')
 TAPD_C = (ROOT / 'tools/native/tapd.c').read_text(encoding='utf-8')
 INSIDE_SH = (ROOT / 'tools/native/inside.sh').read_text(encoding='utf-8')
+INJECT_C = (ROOT / 'tools/native/inject.c').read_text(encoding='utf-8')
+UPDATE_CMD = (ROOT / 'update.cmd').read_text(encoding='utf-8')
 
 
 class HookTrampolineRegressionTest(unittest.TestCase):
@@ -128,6 +131,49 @@ int main(void) {{
 
 
 class InProcessLauncherRegressionTest(unittest.TestCase):
+    def test_remote_loader_waits_for_thread_stops_and_validates_return_sentinel(self):
+        invoker = INJECT_C.split('static int invoke_remote(', 1)[1].split('\n#ifndef PTRACE_O_TRACEFORK', 1)[0]
+        self.assertIn('waitpid(pid, &st, __WALL)', invoker)
+        self.assertIn('stop_sig == SIGSEGV && have_regs && regs.pc == 0', invoker)
+        self.assertIn('Other signals (including an internal dlopen SIGSEGV) are not success.', invoker)
+
+    def test_boot_waits_for_game_code_before_remote_loading(self):
+        boot = INJECT_C.split('static int boot_main(', 1)[1]
+        self.assertIn('i < 120', boot)
+        self.assertIn('if (game > 0 && caller_of(game))', boot)
+        self.assertNotIn('i > 20', boot)
+        self.assertIn('游戏原生库还在加载，请到首页后重试', boot)
+
+    def test_failed_live_patch_falls_back_to_an_already_enabled_zygisk(self):
+        boot = INJECT_C.split('static int boot_main(', 1)[1]
+        self.assertIn('if (zygisk_ready() && install_zygisk_module(appso) == 0)', boot)
+        self.assertIn('handoff_zygote(pkg)', boot)
+        self.assertIn('handoff zygisk', boot)
+        zygote_script = INJECT_C.split('static const char ZYGOTE_SH[] =', 1)[1].split('static int install_zygisk_module', 1)[0]
+        self.assertIn('resolve-activity --brief', zygote_script)
+        self.assertIn('am start --user 0', zygote_script)
+        script = ''.join(
+            ast.literal_eval(line.strip().rstrip(';'))
+            for line in zygote_script.splitlines()
+            if line.strip().startswith('"')
+        )
+        checked = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_code_page_failures_include_address_and_errno(self):
+        text_writer = INJECT_C.split('static int poke_text_exact(', 1)[1].split(
+            'static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n) {', 1
+        )[0]
+        self.assertIn('PTRACE_POKETEXT', text_writer)
+        self.assertNotIn('process_vm_writev(pid', text_writer)
+        self.assertIn('text write %s at %llx errno=%d', INJECT_C)
+        self.assertIn('text_write_failed("代码洞")', INJECT_C)
+        self.assertIn('text_write_failed("入口分支")', INJECT_C)
+
+    def test_windows_updater_targets_the_branch_with_the_current_fixes(self):
+        self.assertIn("$Branch = 'arena/369a6f58-phisap'", UPDATE_CMD)
+        self.assertNotIn("$Branch = 'arena/01a0fd15-phisap'", UPDATE_CMD)
+
     def test_tap_daemon_is_restarted_for_the_current_apk_assets(self):
         stop = INSIDE_SH.split('stop_old_tapd() {', 1)[1].split('\nsay "悬浮窗开着', 1)[0]
         self.assertIn('killall phisap-tapd libphisap-tapd.so', stop)

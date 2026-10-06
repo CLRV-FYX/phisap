@@ -35,7 +35,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-24";
+static const char INJECT_MARK[] = "phisap-inject-25";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -453,21 +453,70 @@ static void ensure_stopped(pid_t game, pid_t tid) {
 #endif
 
 static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n);
+static int text_poke_errno;
+static uint64_t text_poke_addr;
+
+static int poke_text_exact(pid_t pid, uint64_t addr, const void *src, size_t n) {
+    const unsigned char *p = src;
+    size_t i = 0;
+    while (i < n) {
+        uint64_t aligned = (addr + i) & ~7ull;
+        unsigned long word;
+        long cur;
+        size_t off = (size_t)((addr + i) - aligned);
+        size_t take = 8 - off;
+        errno = 0;
+        cur = pt(PTRACE_PEEKDATA, pid, (void *)aligned, 0);
+        if (cur == -1 && errno) return -1;
+        word = (unsigned long)cur;
+        if (take > n - i) take = n - i;
+        memcpy((unsigned char *)&word + off, p + i, take);
+        errno = 0;
+        if (pt(PTRACE_POKETEXT, pid, (void *)aligned, (void *)word) < 0) {
+            int poke_errno = errno;
+            errno = 0;
+            if (pt(PTRACE_POKEDATA, pid, (void *)aligned, (void *)word) < 0) {
+                errno = errno ? errno : poke_errno;
+                return -1;
+            }
+        }
+        i += take;
+    }
+    return 0;
+}
 
 /* 代码页必须走 ptrace。process_vm_writev 写得进，但不会刷指令缓存，游戏仍执行旧指令。 */
 static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
     const unsigned char *p = src;
     size_t i = 0;
-    if (addr & 7) return poke_exact(pid, addr, src, n);
+    text_poke_errno = 0;
+    text_poke_addr = addr;
+    if (addr & 7) {
+        if (poke_text_exact(pid, addr, src, n) == 0) return 0;
+        text_poke_errno = errno ? errno : EIO;
+        return -1;
+    }
     while (i + 8 <= n) {
         unsigned long word = 0;
+        int poke_errno;
         memcpy(&word, p + i, 8);
-        if (pt(PTRACE_POKETEXT, pid, (void *)(addr + i), (void *)word) < 0 &&
-            pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0)
-            return -1;
+        errno = 0;
+        if (pt(PTRACE_POKETEXT, pid, (void *)(addr + i), (void *)word) < 0) {
+            poke_errno = errno;
+            errno = 0;
+            if (pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0) {
+                text_poke_errno = errno ? errno : (poke_errno ? poke_errno : EIO);
+                text_poke_addr = addr + i;
+                return -1;
+            }
+        }
         i += 8;
     }
-    if (i < n) return poke_exact(pid, addr + i, p + i, n - i);
+    if (i < n && poke_text_exact(pid, addr + i, p + i, n - i) != 0) {
+        text_poke_errno = errno ? errno : EIO;
+        text_poke_addr = addr + i;
+        return -1;
+    }
     return 0;
 }
 
@@ -960,6 +1009,16 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
 
 static uint64_t biggest_app_exec(pid_t pid);
 
+static void text_write_failed(const char *phase) {
+    char note[160];
+    int err = text_poke_errno ? text_poke_errno : EIO;
+    snprintf(note, sizeof note, "text write %s at %llx errno=%d\n", phase,
+             (unsigned long long)text_poke_addr, err);
+    boot_log(note);
+    snprintf(note, sizeof note, "%s写入失败 errno=%d", phase, err);
+    write_why(note);
+}
+
 /* 不改寄存器。把一条热指令换成跳转，由空隙里的代码自己 open 库再用 fd 加载。
  * 这样不靠应用命名空间是否允许这条路径。用完把原指令写回去。 */
 static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn) {
@@ -1061,8 +1120,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         if (poke_text(tid, cave, tmp, need) != 0) {
             cont_game(game);
             detach_tid(tid);
-            boot_log("text poke fail\n");
-            write_why("写不进代码页");
+            text_write_failed("代码洞");
             return -1;
         }
         entry = encode_b(hook, cave);
@@ -1076,8 +1134,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         if (!wrote8 && poke_text(tid, hook, &entry, 4) != 0) {
             cont_game(game);
             detach_tid(tid);
-            boot_log("branch poke fail\n");
-            write_why("写不进代码页");
+            text_write_failed("入口分支");
             return -1;
         }
     }
@@ -1126,28 +1183,67 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
 static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
                          uint64_t a0, uint64_t a1, uint64_t a2, int loader, unsigned long *out) {
     struct pt_regs_arm64 regs = *saved;
+    int got = 0, st = 0, stop_sig = 0, wait_err = 0, reg_err = 0, have_regs = 0, stopped = 1;
+    char note[192];
+    *out = 0;
     regs.regs[0] = a0;
     regs.regs[1] = a1;
     if (loader) regs.regs[2] = a2;
     regs.regs[30] = 0;
     regs.pc = fn;
     regs.sp = (a0 - 128) & ~0xful;
-    if (write_regs(pid, &regs) < 0 || pt(PTRACE_CONT, pid, 0, 0) < 0) {
+    if (write_regs(pid, &regs) < 0) {
+        wait_err = errno ? errno : EIO;
         write_regs(pid, saved);
-        return -1;
+        goto done;
     }
-    int got = 0, st = 0;
+    if (pt(PTRACE_CONT, pid, 0, 0) < 0) {
+        wait_err = errno ? errno : EIO;
+        write_regs(pid, saved);
+        goto done;
+    }
+    stopped = 0;
     for (int i = 0; i < 8 && !timed_out; i++) {
-        if (waitpid(pid, &st, 0) < 0) break;
-        if (!WIFSTOPPED(st)) break;
-        int sig = WSTOPSIG(st);
-        if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGBUS) { got = 1; break; }
-        if (pt(PTRACE_CONT, pid, 0, 0) < 0) break;
+        pid_t waited;
+        errno = 0;
+        waited = waitpid(pid, &st, __WALL);
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            wait_err = errno ? errno : ECHILD;
+            break;
+        }
+        if (waited != pid || !WIFSTOPPED(st)) break;
+        stopped = 1;
+        stop_sig = WSTOPSIG(st);
+        if (read_regs(pid, &regs, &reg_err) == 0) have_regs = 1;
+        /* x30 is deliberately zero: a normal AArch64 return faults at PC 0.
+         * Other signals (including an internal dlopen SIGSEGV) are not success. */
+        if (stop_sig == SIGSEGV && have_regs && regs.pc == 0) {
+            got = 1;
+            break;
+        }
+        if (stop_sig == SIGSEGV || stop_sig == SIGBUS || stop_sig == SIGTRAP || stop_sig == SIGILL)
+            break;
+        if (pt(PTRACE_CONT, pid, 0, 0) < 0) {
+            wait_err = errno ? errno : EIO;
+            break;
+        }
+        stopped = 0;
     }
-    read_regs(pid, &regs, 0);
-    *out = regs.regs[0];
-    write_regs(pid, saved);
-    if (!got || timed_out) return -2;
+    if (!stopped) {
+        pt(PTRACE_INTERRUPT, pid, 0, 0);
+        stopped = wait_stop(pid, 500);
+    }
+    if (!have_regs && stopped && read_regs(pid, &regs, &reg_err) == 0) have_regs = 1;
+    if (got && have_regs) *out = (unsigned long)regs.regs[0];
+    if (stopped) write_regs(pid, saved);
+done:
+    snprintf(note, sizeof note,
+             "remote fn=%llx stop=%d pc=%llx x0=%lx wait=%d reg=%d got=%d\n",
+             (unsigned long long)fn, stop_sig, (unsigned long long)regs.pc,
+             *out, wait_err, reg_err, got);
+    boot_log(note);
+    if (!got || !have_regs || timed_out) return -2;
     return 0;
 }
 
@@ -2348,6 +2444,9 @@ static const char ZYGOTE_SH[] =
     "  printf '%s\\n' '模块让系统不稳，已关掉并再开一次' > /data/local/tmp/phisap-status\n"
     "  exit 1\n"
     "fi\n"
+    "comp=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $PKG 2>/dev/null | tail -n 1)\n"
+    "case $comp in */*) am start --user 0 -n $comp ;; *) am start --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p $PKG ;; esac\n"
+    "sleep 3\n"
     "am start --user 0 -n app.phisap.pocket/.MainActivity >/dev/null 2>&1 || true\n"
     "log relaunched\n"
     "exit 0\n";
@@ -2416,7 +2515,7 @@ static void boot_ok(const char *pkg) {
 static int boot_main(const char *pkg, const char *so) {
     char appso[512];
     char patched[256];
-    int i, disk_tried = 0;
+    int i, disk_tried = 0, native_ready = 0;
     pid_t game;
     /* 不再包装，也不再挂系统库。先从文件挂入口；挂不上再改已经解压的游戏库。 */
     if (!pkg || !pkg[0] || !so || so[0] != '/') {
@@ -2441,7 +2540,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-24\n");
+    boot_log("phisap-boot-25\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
@@ -2451,9 +2550,12 @@ static int boot_main(const char *pkg, const char *so) {
         say_status("正在打开游戏");
         start_pkg(pkg);
     }
-    for (i = 0; i < 40 && !timed_out; i++) {
+    for (i = 0; i < 120 && !timed_out; i++) {
         game = find_exact(pkg);
-        if (game > 0 && (caller_of(game) || i > 20)) break;
+        if (game > 0 && caller_of(game)) {
+            native_ready = 1;
+            break;
+        }
         usleep(200000);
     }
     game = find_exact(pkg);
@@ -2462,6 +2564,16 @@ static int boot_main(const char *pkg, const char *so) {
         repair_all(pkg);
         say_status("游戏没起来，没有改系统库");
         fprintf(stderr, "启动加载失败，包装已撤\n");
+        return 1;
+    }
+    if (!native_ready) {
+        alarm(0);
+        timed_out = 0;
+        repair_all(pkg);
+        cont_game(game);
+        write_why("游戏原生库还在加载，请到首页后重试");
+        say_status("游戏原生库还在加载，请到首页后重试");
+        fprintf(stderr, "启动加载失败，游戏原生库尚未就绪\n");
         return 1;
     }
     if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
@@ -2477,6 +2589,21 @@ static int boot_main(const char *pkg, const char *so) {
     if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {
         boot_ok(pkg);
         return 0;
+    }
+    /* If Zygisk is already active, prefer its in-process module entry over
+       rewriting a read-only executable page in the live game. */
+    if (zygisk_ready() && install_zygisk_module(appso) == 0) {
+        repair_all(pkg);
+        cont_game(find_exact(pkg));
+        alarm(0);
+        timed_out = 0;
+        if (handoff_zygote(pkg) == 0) {
+            say_status("正在重开系统界面，改用 Zygisk 进程内加载");
+            printf("handoff zygisk\n");
+            return 0;
+        }
+        run_sh("touch /data/adb/modules/phisap/disable", 1500);
+        write_why("Zygisk 重启失败，模块已禁用");
     }
     cont_game(find_exact(pkg));
     alarm(0);
