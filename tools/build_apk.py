@@ -589,8 +589,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='22'" not in badging:
-        raise RuntimeError('versionCode 不是 22')
+    if "versionCode='23'" not in badging:
+        raise RuntimeError('versionCode 不是 23')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -624,7 +624,7 @@ def build() -> Path:
         names = set(blob.namelist())
         inject_blob = blob.read('assets/phisap-inject')
         ioctl_blob = blob.read('lib/arm64-v8a/libphisap-ioctl.so')
-    if b'phisap-inject-22' not in inject_blob:
+    if b'phisap-inject-23' not in inject_blob:
         raise RuntimeError('安装包里的 inject 不是这一版')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in ioctl_blob:
         raise RuntimeError('安装包里的触摸库没有 nioctl')

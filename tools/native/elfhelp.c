@@ -467,6 +467,94 @@ int elf_hook_site(const char *path, uint64_t file_base,
     return -1;
 }
 
+static int hookable_insn(uint32_t insn) {
+    if (!insn) return 0;
+    /* nop / bti / pac / aut。搬到空隙里执行会把返回地址签错。 */
+    if ((insn & 0xFFFFF01Fu) == 0xD503201Fu) return 0;
+    if (insn_pcrel(insn)) return 0;
+    if ((insn & 0xFFFFFC1Fu) == 0xD65F0000u) return 0;
+    if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) return 0;
+    return 1;
+}
+
+/* 文件大小经常刚好等于内存大小，空白在映射按页对齐之后，不在文件里。 */
+static uint64_t tail_cave(const Elf64_Phdr *ph, int nph, uint64_t bias, uint64_t map_end,
+                          uint64_t hook, size_t need, size_t back_off) {
+    int i;
+    for (i = 0; i < nph; i++) {
+        uint64_t content_end, mem_end, limit, cave;
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+        content_end = bias + ph[i].p_vaddr + ph[i].p_filesz;
+        mem_end = bias + ph[i].p_vaddr + ph[i].p_memsz;
+        if (map_end > content_end && map_end - content_end <= 0x4000)
+            limit = map_end;
+        else
+            limit = (mem_end + 0xfff) & ~0xfffull;
+        /* 只占用本段页尾的空白，不能把后面的代码当成空隙。 */
+        if (limit <= content_end || limit - content_end > 0x4000) continue;
+        cave = (content_end + 7) & ~7ull;
+        if (cave < content_end || limit < cave + need) continue;
+        if (!in_branch(hook, cave) || !in_branch(cave + back_off, hook + 4)) continue;
+        return cave;
+    }
+    return 0;
+}
+
+int elf_hook_site_span(const char *path, uint64_t file_base,
+                       uint64_t map_start, uint64_t map_off, uint64_t map_end,
+                       const char *const *syms, int nsyms,
+                       size_t need, size_t back_off,
+                       uint64_t *hook, uint32_t *orig, uint64_t *cave) {
+    int fd, i, saw_sym = 0, saw_insn = 0;
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[64];
+    uint64_t bias = 0;
+    if (!path || !syms || nsyms <= 0 || !hook || !orig || !cave || need < 16) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (load_elf(fd, file_base, &eh, ph, 64) != 0 || bias_of(ph, eh.e_phnum, map_start, map_off, file_base, &bias) != 0) {
+        close(fd);
+        return -1;
+    }
+    for (i = 0; i < nsyms; i++) {
+        uint64_t addr = 0;
+        uint32_t first = 0;
+        int step;
+        if (!syms[i] || sym_addr(fd, file_base, ph, eh.e_phnum, bias, syms[i], &addr) != 0) continue;
+        saw_sym = 1;
+        if (read_insn(fd, file_base, ph, eh.e_phnum, bias, addr, &first) != 0) continue;
+        if ((first >> 26) == 0x05) {
+            uint32_t raw = first & 0x03ffffffu;
+            int32_t imm = (int32_t)(raw << 6) >> 6;
+            uint64_t dest = addr + ((int64_t)imm << 2);
+            uint32_t next = 0;
+            if (read_insn(fd, file_base, ph, eh.e_phnum, bias, dest, &next) == 0 && next) {
+                addr = dest;
+            }
+        }
+        for (step = 0; step < 16; step++) {
+            uint64_t at = addr + (uint64_t)step * 4;
+            uint32_t insn = 0;
+            uint64_t z;
+            if (read_insn(fd, file_base, ph, eh.e_phnum, bias, at, &insn) != 0) break;
+            if (!hookable_insn(insn)) continue;
+            saw_insn = 1;
+            z = tail_cave(ph, eh.e_phnum, bias, map_end, at, need, back_off);
+            if (!z) z = file_cave(fd, file_base, ph, eh.e_phnum, bias, at, need, back_off);
+            if (!z) continue;
+            *hook = at;
+            *orig = insn;
+            *cave = z;
+            close(fd);
+            return 0;
+        }
+    }
+    close(fd);
+    if (!saw_sym) return -2;
+    if (!saw_insn) return -3;
+    return -4;
+}
+
 struct DynInfo {
     uint64_t dyn_off;
     uint64_t dyn_sz;

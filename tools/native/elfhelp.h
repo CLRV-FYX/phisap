@@ -20,6 +20,14 @@ int elf_hook_site(const char *path, uint64_t file_base,
                   size_t need, size_t back_off,
                   uint64_t *hook, uint32_t *orig, uint64_t *cave);
 
+/* map_end 是这条可执行映射在进程里的结尾。页面对齐多出来的空白也算空隙。
+ * 成功 0；打不开 -1；没有符号 -2；开头不能挂 -3；没有空隙 -4。 */
+int elf_hook_site_span(const char *path, uint64_t file_base,
+                       uint64_t map_start, uint64_t map_off, uint64_t map_end,
+                       const char *const *syms, int nsyms,
+                       size_t need, size_t back_off,
+                       uint64_t *hook, uint32_t *orig, uint64_t *cave);
+
 /* 已经有这个 DT_NEEDED 返回 1，否则 0。读失败返回 -1。 */
 int elf_has_needed(const char *path, const char *soname);
 

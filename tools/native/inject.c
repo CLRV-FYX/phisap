@@ -35,7 +35,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-22";
+static const char INJECT_MARK[] = "phisap-inject-23";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -857,23 +857,104 @@ struct FileSite {
     uint64_t map_off;
 };
 
+/* 最大的可执行映射结尾。页面对齐多出来的空白就在这里。 */
+static int rx_span(pid_t pid, const char *needle, uint64_t *start, uint64_t *end, uint64_t *off, char *path, size_t path_n) {
+    char maps_path[64];
+    FILE *f;
+    char line[512];
+    unsigned long long best_sz = 0;
+    int found = 0;
+    snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", (int)pid);
+    f = fopen(maps_path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0, o = 0;
+        char perms[8] = {0};
+        char *slash;
+        char got[256];
+        if (!strstr(line, needle)) continue;
+        if (sscanf(line, "%llx-%llx %7s %llx", &a, &b, perms, &o) < 3) continue;
+        if (!strchr(perms, 'x') || b <= a || b - a < best_sz) continue;
+        slash = strchr(line, '/');
+        if (!slash) continue;
+        sscanf(slash, "%255s", got);
+        if (!got[0]) continue;
+        best_sz = b - a;
+        *start = a;
+        *end = b;
+        *off = o;
+        snprintf(path, path_n, "%s", got);
+        found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
 static int locate_hook(pid_t game, size_t need, size_t back_off,
                        uint64_t *hook, uint32_t *orig, uint64_t *cave, uint64_t *app_base,
                        struct FileSite *site) {
+    static const char *sys_libs[] = {"libc.so", "libdl.so", 0};
+    static const char *const sys_syms[] = {
+        "clock_gettime", "__clock_gettime", "gettimeofday", "nanosleep",
+        "ioctl", "read", "write", "memcpy", "malloc", "pthread_mutex_lock"
+    };
     static const char *app_libs[] = {"libil2cpp.so", "libunity.so", "libmain.so", 0};
     static const char *const app_syms[] = {"il2cpp_runtime_invoke", "il2cpp_init", "clock_gettime", "gettimeofday"};
-    static const char *sys_libs[] = {"libc.so", "libdl.so", 0};
-    static const char *const sys_syms[] = {"clock_gettime", "gettimeofday", "ioctl", "__clock_gettime", "memcpy", "read"};
-    int i;
+    int i, saw_file = 0, worst = -1;
     *app_base = 0;
     *hook = 0;
     *cave = 0;
     for (i = 0; app_libs[i]; i++) {
+        uint64_t start = 0, off = 0;
         char path[256];
-        uint64_t base = 0, start = 0, off = 0;
+        if (map_first(game, app_libs[i], 1, &start, &off, path, sizeof path) && !*app_base)
+            *app_base = start;
+    }
+    for (i = 0; sys_libs[i]; i++) {
+        char path[256], shown[256], alt[160];
+        uint64_t base = 0, start = 0, off = 0, end = 0, rx_s = 0, rx_e = 0, rx_o = 0;
+        int rc;
+        shown[0] = 0;
+        if (rx_span(game, sys_libs[i], &rx_s, &rx_e, &rx_o, shown, sizeof shown))
+            end = rx_e;
+        if (resolve_lib(game, sys_libs[i], path, sizeof path, &base, &start, &off) && access(path, R_OK) == 0) {
+            saw_file = 1;
+        } else if (rx_s && shown[0] && !strstr(shown, ".apk")) {
+            snprintf(alt, sizeof alt, "/proc/%d/map_files/%llx-%llx", (int)game,
+                     (unsigned long long)rx_s, (unsigned long long)rx_e);
+            if (access(alt, R_OK) == 0) snprintf(path, sizeof path, "%s", alt);
+            else if (access(shown, R_OK) == 0) snprintf(path, sizeof path, "%s", shown);
+            else continue;
+            base = 0;
+            start = rx_s;
+            off = rx_o;
+            saw_file = 1;
+        } else {
+            continue;
+        }
+        rc = elf_hook_site_span(path, base, start, off, end, sys_syms, 10, need, back_off, hook, orig, cave);
+        if (rc == 0) {
+            if (site) {
+                snprintf(site->path, sizeof site->path, "%s", path);
+                site->file_base = base;
+                site->map_start = start;
+                site->map_off = off;
+            }
+            boot_log("site libc\n");
+            return 0;
+        }
+        if (rc < worst) worst = rc;
+    }
+    for (i = 0; app_libs[i]; i++) {
+        char path[256];
+        uint64_t base = 0, start = 0, off = 0, end = 0;
+        int rc;
         if (!resolve_lib(game, app_libs[i], path, sizeof path, &base, &start, &off)) continue;
-        if (!*app_base) *app_base = start;
-        if (elf_hook_site(path, base, start, off, app_syms, 4, need, back_off, hook, orig, cave) == 0) {
+        if (access(path, R_OK) != 0) continue;
+        saw_file = 1;
+        rx_span(game, app_libs[i], &start, &end, &off, path, sizeof path);
+        rc = elf_hook_site_span(path, base, start, off, end, app_syms, 4, need, back_off, hook, orig, cave);
+        if (rc == 0) {
             if (site) {
                 snprintf(site->path, sizeof site->path, "%s", path);
                 site->file_base = base;
@@ -883,23 +964,13 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
             boot_log("site app\n");
             return 0;
         }
-    }
-    for (i = 0; sys_libs[i]; i++) {
-        char path[256];
-        uint64_t base = 0, start = 0, off = 0;
-        if (!resolve_lib(game, sys_libs[i], path, sizeof path, &base, &start, &off)) continue;
-        if (elf_hook_site(path, base, start, off, sys_syms, 6, need, back_off, hook, orig, cave) == 0) {
-            if (site) {
-                snprintf(site->path, sizeof site->path, "%s", path);
-                site->file_base = base;
-                site->map_start = start;
-                site->map_off = off;
-            }
-            boot_log(*app_base ? "site libc caller\n" : "site libc\n");
-            return 0;
-        }
+        if (rc < worst) worst = rc;
     }
     boot_log("no file site\n");
+    if (!saw_file) write_why("找不到 libc");
+    else if (worst == -2) write_why("没有可挂的函数");
+    else if (worst == -3) write_why("函数开头不能挂");
+    else write_why("入口旁边没有空隙");
     return -1;
 }
 
@@ -938,7 +1009,8 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     if (path_lit_off + 8 > blob_n || dlopen_off + 8 > blob_n) return -1;
     if (locate_hook(game, need, back_off, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
         boot_log("file hook miss\n");
-        write_why("找不到游戏库入口");
+        if (access("/data/local/tmp/phisap-why", R_OK) != 0)
+            write_why("找不到游戏库入口");
         return -1;
     }
     if (app_base) fn->caller = app_base;
@@ -2370,7 +2442,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-22\n");
+    boot_log("phisap-boot-23\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
