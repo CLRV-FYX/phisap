@@ -35,7 +35,7 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-23";
+static const char INJECT_MARK[] = "phisap-inject-24";
 static char last_why[96];
 
 static volatile int timed_out;
@@ -454,32 +454,16 @@ static void ensure_stopped(pid_t game, pid_t tid) {
 
 static int poke_exact(pid_t pid, uint64_t addr, const void *src, size_t n);
 
-/* 代码页经常不能读。整字写入时不先 peek，避免 XOM 把写入也带失败。 */
+/* 代码页必须走 ptrace。process_vm_writev 写得进，但不会刷指令缓存，游戏仍执行旧指令。 */
 static int poke_text(pid_t pid, uint64_t addr, const void *src, size_t n) {
-    struct iovec local;
-    struct iovec remote;
-    char mempath[64];
-    int fd;
     const unsigned char *p = src;
     size_t i = 0;
-    local.iov_base = (void *)src;
-    local.iov_len = n;
-    remote.iov_base = (void *)addr;
-    remote.iov_len = n;
-    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) return 0;
-    snprintf(mempath, sizeof mempath, "/proc/%d/mem", (int)pid);
-    fd = open(mempath, O_WRONLY);
-    if (fd >= 0) {
-        ssize_t w = pwrite(fd, src, n, (off_t)addr);
-        close(fd);
-        if (w == (ssize_t)n) return 0;
-    }
     if (addr & 7) return poke_exact(pid, addr, src, n);
     while (i + 8 <= n) {
         unsigned long word = 0;
         memcpy(&word, p + i, 8);
-        if (pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0 &&
-            pt(PTRACE_POKETEXT, pid, (void *)(addr + i), (void *)word) < 0)
+        if (pt(PTRACE_POKETEXT, pid, (void *)(addr + i), (void *)word) < 0 &&
+            pt(PTRACE_POKEDATA, pid, (void *)(addr + i), (void *)word) < 0)
             return -1;
         i += 8;
     }
@@ -1016,7 +1000,8 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     if (app_base) fn->caller = app_base;
     if (!fn->caller) fn->caller = caller_of(game);
     if (!fn->caller) fn->caller = biggest_app_exec(game);
-    open_fn = sym_in(game, "libc.so", "open");
+    open_fn = sym_in(game, "libc.so", "openat");
+    if (!open_fn) open_fn = sym_in(game, "libc.so", "__openat");
     ext_fn = sym_in(game, "libdl.so", "android_dlopen_ext");
     if (!ext_fn) ext_fn = sym_in(game, "linker64", "android_dlopen_ext");
     snprintf(note, sizeof note, "hook %llx cave %llx ext %llx\n",
@@ -1099,7 +1084,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     cont_game(game);
     detach_tid(tid);
     waited = 0;
-    while (waited < 3000 && !timed_out) {
+    while (waited < 6000 && !timed_out) {
         if (so_mapped(game)) break;
         usleep(20000);
         waited += 20;
@@ -1107,7 +1092,17 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     mapped = so_mapped(game);
     {
         pid_t held = attach_any(game, &dummy, &aerr, &agot);
+        unsigned char flag = 0;
+        int saw_flag = 0;
         if (held) {
+            unsigned long w;
+            uint64_t aligned = flag_at & ~7ull;
+            errno = 0;
+            w = (unsigned long)pt(PTRACE_PEEKDATA, held, (void *)aligned, 0);
+            if (!(w == (unsigned long)-1 && errno)) {
+                flag = ((unsigned char *)&w)[flag_at & 7];
+                saw_flag = 1;
+            }
             if (wrote8) {
                 uint32_t pair[2];
                 pair[0] = orig;
@@ -1118,10 +1113,14 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
             }
             detach_tid(held);
         }
+        cont_game(game);
+        if (!mapped) {
+            if (!open_fn) write_why("没有 openat");
+            else if (saw_flag && flag == 0) write_why("入口没被调用");
+            else write_why("游戏打不开库文件");
+        }
+        return mapped ? 0 : -1;
     }
-    cont_game(game);
-    if (!mapped) write_why(ext_fn ? "打开了但库没映射" : "没有 android_dlopen_ext");
-    return mapped ? 0 : -1;
 }
 
 static int invoke_remote(pid_t pid, struct pt_regs_arm64 *saved, uint64_t fn,
@@ -2442,7 +2441,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-23\n");
+    boot_log("phisap-boot-24\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
@@ -2467,6 +2466,12 @@ static int boot_main(const char *pkg, const char *so) {
     }
     if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
         boot_log("so beside game lib\n");
+    {
+        char fileso[512];
+        snprintf(fileso, sizeof fileso, "/data/user/0/%s/files/libphisap.so", pkg);
+        if (access(fileso, R_OK) == 0)
+            snprintf(appso, sizeof appso, "%s", fileso);
+    }
     run_sh(": > /data/local/tmp/phisap-hook.log ; chmod 666 /data/local/tmp/phisap-hook.log", 2000);
     say_status("游戏已打开，正在送进进程");
     if (inject_fresh(pkg, appso) == 0 || loaded(pkg)) {

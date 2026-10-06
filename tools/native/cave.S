@@ -11,7 +11,7 @@
 .global lit_path
 
 // 整段搬进游戏的可执行空隙。路径和一次性标记放在可写内存里。
-// 先用 open + android_dlopen_ext(库 fd) 绕过应用命名空间，失败再普通 dlopen。
+// openat 打开应用自己的库文件，再用 android_dlopen_ext(库 fd) 绕过命名空间。
 blob:
     ldr x16, lit_flag
     cbz x16, go
@@ -26,15 +26,16 @@ go:
     sub sp, sp, #64
 
     ldr x16, lit_open
-    cbz x16, plain
-    ldr x0, lit_path
-    mov w1, #0
+    cbz x16, done
+    mov x0, #-100
+    ldr x1, lit_path
+    mov w2, #0
     blr x16
-    tbnz x0, #63, plain
+    tbnz x0, #63, done
     mov w19, w0
 
     ldr x16, lit_ext
-    cbz x16, plain
+    cbz x16, done
     mov x2, sp
     stp xzr, xzr, [x2]
     stp xzr, xzr, [x2, #16]
@@ -44,14 +45,6 @@ go:
     str w19, [x2, #28]
     ldr x0, lit_path
     mov w1, #2
-    blr x16
-    cbnz x0, done
-plain:
-    ldr x16, lit_dlopen
-    cbz x16, done
-    ldr x0, lit_path
-    mov w1, #2
-    ldr x2, lit_caller
     blr x16
 done:
     add sp, sp, #64
