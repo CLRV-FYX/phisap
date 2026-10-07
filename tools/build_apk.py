@@ -580,6 +580,8 @@ def build() -> Path:
     files.append(('assets/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/inside.sh', native['script']))
     files.append(('assets/xposed_init', b'app.phisap.pocket.HookEntry\n'))
+    scope_list = POCKET / 'META-INF' / 'xposed' / 'scope.list'
+    files.append(('META-INF/xposed/scope.list', scope_list.read_bytes()))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)
@@ -588,8 +590,8 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='26'" not in badging:
-        raise RuntimeError('versionCode 不是 26')
+    if "versionCode='27'" not in badging:
+        raise RuntimeError('versionCode 不是 27')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -634,8 +636,11 @@ def build() -> Path:
         names = set(blob.namelist())
         ioctl_blob = blob.read('lib/arm64-v8a/libphisap-ioctl.so')
         xposed_init = blob.read('assets/xposed_init').decode('ascii').strip()
+        xposed_scope = set(blob.read('META-INF/xposed/scope.list').decode('utf-8').splitlines())
     if xposed_init != 'app.phisap.pocket.HookEntry':
         raise RuntimeError('assets/xposed_init 没指向真实入口类')
+    if not {'com.PigeonGames.Phigros', 'org.flos.phira', 'org.flos.phira.modded'} <= xposed_scope:
+        raise RuntimeError('LSPosed 默认作用域缺少受支持的游戏包')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in ioctl_blob:
         raise RuntimeError('安装包里的触摸库没有 nioctl')
     for need in (

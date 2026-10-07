@@ -21,6 +21,7 @@ if [ -z "$PKG" ]; then
   say "没有包名"
   exit 1
 fi
+HOOK_STATUS="/data/user/0/$PKG/files/phisap/xposed.status"
 
 mkdir -p "$D" /sdcard/phisap 2>/dev/null || true
 
@@ -90,6 +91,11 @@ game_pids() {
   done
 }
 
+hook_status() {
+  [ -r "$HOOK_STATUS" ] || return 1
+  tr '\n' ' ' < "$HOOK_STATUS" 2>/dev/null | cut -c1-160
+}
+
 hooked_pid() {
   for pid in $(game_pids "$PKG"); do
     if [ -r "/proc/$pid/maps" ] && grep -q 'libphisap\.so' "/proc/$pid/maps" 2>/dev/null; then
@@ -126,23 +132,39 @@ run_boot() {
         say "已确认 libphisap.so 映射在游戏进程 $pid"
         return 0
       fi
+      status=$(hook_status || true)
+      case "$status" in
+        error:*) say "Xposed 进程内加载失败：${status#error: }"; return 1 ;;
+      esac
       stopped && { say "已停止"; return 1; }
       i=$((i + 1))
       sleep 0.2
     done
-    say "游戏进程仍在运行，但 maps 中没有 libphisap.so。LSPosed 只在进程启动时加载模块，不能追溯注入；启用 PhiSAP 并勾选 $PKG 后，请强制停止再重新打开游戏。当前未注入。"
+    status=$(hook_status || true)
+    case "$status" in
+      error:*) say "Xposed 进程内加载失败：${status#error: }" ;;
+      '') say "游戏仍在运行，但没有收到 Xposed attach 回报。请在 LSPosed 启用 PhiSAP、确认 $PKG 已勾选，然后强制停止并重开游戏；可用 adb logcat -s PhiSAP-Xposed 查看原因。" ;;
+      *) say "Xposed 已回报 '$status'，但 maps 中没有 libphisap.so。请查看 adb logcat -s PhiSAP-Xposed。" ;;
+    esac
     return 1
   fi
 
-  say "正在打开游戏，等待进程内 System.load"
+  # Clear stale status from a previous process so only this launch can satisfy
+  # the hook handshake.
+  rm -f "$HOOK_STATUS" 2>/dev/null || true
+  say "正在打开游戏，等待进程内 System.load（最多 30 秒）"
   launch
   i=0
-  while [ "$i" -lt 180 ]; do
+  while [ "$i" -lt 60 ]; do
     stopped && { say "已停止"; return 1; }
     if pid=$(hooked_pid); then
       say "已确认 libphisap.so 映射在游戏进程 $pid"
       return 0
     fi
+    status=$(hook_status || true)
+    case "$status" in
+      error:*) say "Xposed 进程内加载失败：${status#error: }"; return 1 ;;
+    esac
     if [ -z "$(game_pids "$PKG")" ] && [ "$i" -gt 20 ]; then
       break
     fi
@@ -151,7 +173,11 @@ run_boot() {
   done
 
   if [ -n "$(game_pids "$PKG")" ]; then
-    say "游戏已打开，但 maps 中没有 libphisap.so。请确认 LSPosed 中已启用 PhiSAP、作用域包含 $PKG，并在重启游戏后再试。没有把进程检测当作注入成功。"
+    status=$(hook_status || true)
+    case "$status" in
+      '') say "游戏已启动，但 30 秒内没有收到 LSPosed attach 回报。请启用 PhiSAP、确认 $PKG 作用域已勾选并强制停止重开；可用 adb logcat -s PhiSAP-Xposed 查看原因。" ;;
+      *) say "Xposed 最后状态 '$status'，但 maps 中没有 libphisap.so；没有把进程检测当作加载成功。可用 adb logcat -s PhiSAP-Xposed 查看详细错误。" ;;
+    esac
   else
     say "游戏没有启动，且未检测到 libphisap.so"
   fi

@@ -20,7 +20,7 @@ python tools/build_apk.py
 ```
 
 Install the Python requirements first; APK signing requires `cryptography`.
-The output is `android/phisap-pocket.apk` (version code 26 / version 3.4). The
+The output is `android/phisap-pocket.apk` (version code 27 / version 3.5). The
 custom DEX is audited, the manifest is inspected with `aapt2`, and the APK's v1
 and v2 signatures are checked by the build script. This is a static build check,
 not a device injection test.
@@ -29,15 +29,18 @@ not a device injection test.
 
 1. Install/update `android/phisap-pocket.apk` and have a compatible LSPosed
    manager/framework active.
-2. In LSPosed, enable **PhiSAP** and manually add the target game package to its
-   scope. The hand-built APK omits the optional `xposedscope` resource so its
-   fixed UI resource IDs do not shift.
-3. If the game is already open, force-stop it yourself. LSPosed hooks processes
-   when they start; pressing Start while an unhooked process is alive will show
-   an explicit failure and will not claim success.
+2. The APK ships `META-INF/xposed/scope.list` with the pocket app and all three
+   supported game packages, following PhiSkin's scope mechanism. In LSPosed,
+   verify PhiSAP is enabled and the package you use is checked (especially when
+   updating an already-installed module, since existing scope preferences may
+   be retained).
+3. If the game is already open, force-stop it first. LSPosed hooks processes
+   when they start; it cannot attach to an already-running process.
 4. Open PhiSAP and press Start. The helper prepares shared config first, then
-   launches the game. It reports loaded only after the game process maps
-   `libphisap.so`.
+   launches the game. It checks the target-process maps and the loader's
+   `files/phisap/xposed.status` handshake. It stops waiting after 30 seconds and
+   reports whether LSPosed never called `Application.attach` or `System.load`
+   failed, rather than leaving a permanent waiting message.
 
 For independent verification on a rooted device:
 

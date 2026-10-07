@@ -21,6 +21,7 @@ final class NativeLoader {
             return;
         }
         attempted = true;
+        report(target, "attach-reached");
         ZipFile module = null;
         try {
             if (modulePath == null || modulePath.isEmpty()) {
@@ -36,6 +37,7 @@ final class NativeLoader {
             if (!dir.isDirectory() && !dir.mkdirs()) {
                 throw new IllegalStateException("cannot create " + dir);
             }
+            report(target, "extracting-native");
             File temp = new File(dir, "libphisap.so.tmp");
             File dest = new File(dir, "libphisap.so");
             try (InputStream in = module.getInputStream(entry);
@@ -57,9 +59,12 @@ final class NativeLoader {
             if (!temp.renameTo(dest)) {
                 throw new IllegalStateException("cannot install native payload");
             }
+            report(target, "calling-System.load");
             System.load(dest.getAbsolutePath());
+            report(target, "loaded");
             Log.i(TAG, "System.load succeeded in target process: " + dest);
         } catch (Throwable error) {
+            report(target, "error: " + error);
             Log.e(TAG, "System.load failed in target process", error);
         } finally {
             if (module != null) {
@@ -68,6 +73,21 @@ final class NativeLoader {
                 } catch (Exception ignored) {
                 }
             }
+        }
+    }
+
+    private static void report(Context target, String status) {
+        try {
+            File dir = new File(target.getFilesDir(), "phisap");
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                return;
+            }
+            File statusFile = new File(dir, "xposed.status");
+            try (FileOutputStream out = new FileOutputStream(statusFile, false)) {
+                out.write(status.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.getFD().sync();
+            }
+        } catch (Throwable ignored) {
         }
     }
 }

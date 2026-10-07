@@ -20,6 +20,7 @@ class XposedLoaderTest(unittest.TestCase):
         cls.launcher = (ROOT / 'tools/native/inside.sh').read_text(encoding='utf-8')
         cls.app_builder = (ROOT / 'tools/app_dex.py').read_text(encoding='utf-8')
         cls.manifest = (ROOT / 'android/pocket/AndroidManifest.xml').read_text(encoding='utf-8')
+        cls.scope_list = set((ROOT / 'android/pocket/META-INF/xposed/scope.list').read_text(encoding='utf-8').splitlines())
 
     def test_real_xposed_entry_uses_standard_api_descriptors(self):
         for descriptor in (
@@ -48,13 +49,20 @@ class XposedLoaderTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIn(value, self.dex_text)
 
-    def test_apk_is_declared_as_an_xposed_module(self):
+    def test_apk_is_declared_as_an_xposed_module_with_default_game_scopes(self):
         self.assertIn('android:name="xposedmodule" android:value="true"', self.manifest)
         self.assertIn('android:name="xposedminversion" android:value="93"', self.manifest)
-        # No resource array is added to the aapt2 table because the hand-built
-        # UI DEX depends on stable id/layout resource IDs. Scope is selected in
-        # LSPosed, and HookEntry itself package-gates the callback.
+        expected = {'app.phisap.pocket', 'com.PigeonGames.Phigros', 'org.flos.phira', 'org.flos.phira.modded'}
+        self.assertTrue(expected <= self.scope_list)
         self.assertIn('com.PigeonGames.Phigros', self.dex_text)
+
+    def test_loader_reports_callback_load_and_native_errors_to_the_launcher(self):
+        for value in ('writeStatus', 'xposed.status', 'attach-reached', 'calling-System.load', 'loaded', 'error: '):
+            with self.subTest(value=value):
+                self.assertIn(value, self.dex_text)
+        self.assertIn('hook_status()', self.launcher)
+        self.assertIn('最多 30 秒', self.launcher)
+        self.assertIn('没有收到 LSPosed attach 回报', self.launcher)
 
     def test_launcher_only_succeeds_after_maps_confirms_loaded_library(self):
         self.assertIn('/proc/$pid/maps', self.launcher)
@@ -63,7 +71,8 @@ class XposedLoaderTest(unittest.TestCase):
         self.assertNotIn('phisap-inject', self.launcher)
         self.assertNotIn('setenforce', self.launcher)
         self.assertNotIn('PTRACE', self.launcher.upper())
-        self.assertIn('LSPosed 只在进程启动时加载模块', self.launcher)
+        self.assertIn('没有收到 LSPosed attach 回报', self.launcher)
+        self.assertIn('等待进程内 System.load（最多 30 秒）', self.launcher)
 
     def test_in_process_startup_prepares_config_before_game_launch(self):
         enter = self.app_builder.split("ei = Asm(8, 1)", 1)[1].split("dex.add_method(ACT, 'enterInside'", 1)[0]
@@ -78,8 +87,11 @@ class XposedLoaderTest(unittest.TestCase):
             packaged_dex = apk.read('classes.dex')
             native = apk.read('assets/libphisap.so')
             xposed_init = apk.read('assets/xposed_init').decode('ascii').strip()
+            xposed_scope = set(apk.read('META-INF/xposed/scope.list').decode('utf-8').splitlines())
         audit_dex(packaged_dex)
         self.assertEqual(xposed_init, 'app.phisap.pocket.HookEntry')
+        expected_scope = {'com.PigeonGames.Phigros', 'org.flos.phira', 'org.flos.phira.modded'}
+        self.assertTrue(expected_scope <= xposed_scope)
         self.assertIn('IXposedHookZygoteInit', packaged_dex.decode('latin1'))
         self.assertEqual(native[:4], bytes([0x7f]) + b'ELF')
         self.assertIn('assets/inside.sh', names)
