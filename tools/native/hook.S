@@ -10,7 +10,8 @@
 // 游戏调用被换掉的方法时先进这里。先把原方法跑完（它会更新这一帧的位置），
 // 再读音符。x0 是 this，必须在调用原方法之后从栈上取回来。
 hook_entry:
-    stp x29, x30, [sp, #-224]!
+    // Keep 16-byte SP alignment and leave room for the original return value.
+    stp x29, x30, [sp, #-304]!
     stp x0, x1, [sp, #16]
     stp x2, x3, [sp, #32]
     stp x4, x5, [sp, #48]
@@ -20,22 +21,38 @@ hook_entry:
     stp q2, q3, [sp, #128]
     stp q4, q5, [sp, #160]
     stp q6, q7, [sp, #192]
+
+    // get_tramp is a C call and clobbers x0 (including this) and argument regs.
     bl get_tramp
-    cbz x0, 1f
-    blr x0
-1:
+    mov x16, x0
     ldp x0, x1, [sp, #16]
-    bl sample_line
-    ldp q6, q7, [sp, #192]
-    ldp q4, q5, [sp, #160]
-    ldp q2, q3, [sp, #128]
-    ldp q0, q1, [sp, #96]
-    ldp x8, x9, [sp, #80]
-    ldp x6, x7, [sp, #64]
-    ldp x4, x5, [sp, #48]
     ldp x2, x3, [sp, #32]
-    ldp x0, x1, [sp, #16]
-    ldp x29, x30, [sp], #224
+    ldp x4, x5, [sp, #48]
+    ldp x6, x7, [sp, #64]
+    ldp x8, x9, [sp, #80]
+    ldp q0, q1, [sp, #96]
+    ldp q2, q3, [sp, #128]
+    ldp q4, q5, [sp, #160]
+    ldp q6, q7, [sp, #192]
+    cbz x16, 1f
+    blr x16
+
+    // Preserve the original method's integer and vector return registers while
+    // sampling. UpdateInfo/Update are void today, but keeping the ABI intact is cheap.
+    stp x0, x1, [sp, #224]
+    stp q0, q1, [sp, #240]
+    stp q2, q3, [sp, #272]
+    ldr x0, [sp, #16]
+    bl sample_line
+    ldp q2, q3, [sp, #272]
+    ldp q0, q1, [sp, #240]
+    ldp x0, x1, [sp, #224]
+    b 2f
+1:
+    ldr x0, [sp, #16]
+    bl sample_line
+2:
+    ldp x29, x30, [sp], #304
     ret
 
 // x0=fn x1=self x2=method x3=out(V3*)

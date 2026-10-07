@@ -716,7 +716,7 @@ static void *mi_get_w, *mi_get_h;
 static void *fn_get_main, *fn_w2s, *fn_get_tr, *fn_get_pos, *fn_get_right, *fn_get_w, *fn_get_h;
 static void *cached_cam;
 static int screen_w, screen_h;
-static int geom_tries;
+static long long screen_check_at;
 static int hooked;
 static int in_sample;
 
@@ -748,19 +748,33 @@ static int tap_connect(void) {
     return fd;
 }
 
-static void tap_send(int action, int slot, int x, int y) {
+static int tap_send(int action, int slot, int x, int y) {
     struct Msg m;
     m.magic = 0x31534850u;
     m.action = action;
     m.slot = slot;
     m.x = x;
     m.y = y;
-    if (tap_fd < 0) tap_fd = tap_connect();
-    if (tap_fd < 0) return;
+    int connected_now = tap_fd < 0;
+    if (connected_now) tap_fd = tap_connect();
+    if (tap_fd < 0) { size_sent = 0; return 0; }
+    if (connected_now && action != 8 && screen_w > 100 && screen_h > 100) {
+        struct Msg size = {0x31534850u, 8, 0, screen_w, screen_h};
+        if (send(tap_fd, &size, sizeof size, 0x4000) != (long)sizeof size) {
+            close(tap_fd);
+            tap_fd = -1;
+            size_sent = 0;
+            return 0;
+        }
+        size_sent = 1;
+    }
     if (send(tap_fd, &m, sizeof m, 0x4000) != (long)sizeof m) {
         close(tap_fd);
         tap_fd = -1;
+        size_sent = 0;
+        return 0;
     }
+    return 1;
 }
 
 struct Finger {
@@ -842,24 +856,34 @@ static void resolve_unity(void) {
 }
 
 static int ensure_screen(void) {
-    if (screen_w > 100 && screen_h > 100) return 1;
-    if (!fn_get_w || !fn_get_h || !mi_get_w || !mi_get_h) return 0;
+    if (!fn_get_w || !fn_get_h || !mi_get_w || !mi_get_h)
+        return screen_w > 100 && screen_h > 100;
+
+    long long now = now_ms();
+    if (screen_w > 100 && screen_h > 100 && now < screen_check_at) return 1;
+    screen_check_at = now + 500;
+
     int w = call_int(fn_get_w, mi_get_w);
     int h = call_int(fn_get_h, mi_get_h);
-    if (w < 100 || h < 100 || w > 8000 || h > 8000) return 0;
-    screen_w = w;
-    screen_h = h;
-    if (!size_sent) { tap_send(8, 0, w, h); size_sent = 1; }
-    log_num("screen_w ", w);
-    log_num("screen_h ", h);
+    if (w < 100 || h < 100 || w > 8000 || h > 8000)
+        return screen_w > 100 && screen_h > 100;
+    if (w != screen_w || h != screen_h) {
+        if (screen_w > 100 && screen_h > 100) release_all();
+        screen_w = w;
+        screen_h = h;
+        size_sent = 0;
+        log_num("screen_w ", w);
+        log_num("screen_h ", h);
+    }
+    // Also refresh the daemon's cached game-size on a new connection or a display
+    // service restart, even when Unity's dimensions themselves did not change.
+    size_sent = tap_send(8, 0, w, h);
     return 1;
 }
 
 static int ensure_geom(void) {
-    if (fn_get_main && fn_w2s && fn_get_tr && screen_w > 100) return 1;
-    if (geom_tries++ > 30) return 0;
     ensure_screen();
-    return fn_get_main && fn_w2s && fn_get_tr && screen_w > 100;
+    return fn_get_main && fn_w2s && fn_get_tr && screen_w > 100 && screen_h > 100;
 }
 
 static int line_axes(void *self, float *sx, float *sy, float *rx, float *ry) {
@@ -1164,9 +1188,9 @@ static int hook_method(void *klass, const char *name) {
     if (rc != 0) {
         tramp_ptr = fn;
         __sync_synchronize();
-        if (protect_span(m, 8, 3) == 0) *(void **)m = (void *)hook_entry;
-        else if (readable(m, 8)) *(void **)m = (void *)hook_entry;
-        else return 0;
+        if (protect_span(m, sizeof(void *), 3) != 0) return 0;
+        *(void **)m = (void *)hook_entry;
+        __sync_synchronize();
         log_raw("methodPointer swapped\n");
     }
     return 1;
@@ -1232,9 +1256,11 @@ static void *worker(void *arg) {
     }
     hooked = 1;
     write_status("已挂钩 UpdateInfo");
-    for (int i = 0; i < 40 && (!fn_w2s || !fn_get_tr); i++) {
+    for (int i = 0; i < 60 &&
+         (!fn_get_main || !fn_w2s || !fn_get_tr || !fn_get_w || !fn_get_h); i++) {
+        wait_if_stopped();
         resolve_unity();
-        usleep(100000);
+        usleep(500000);
     }
     if (!fn_w2s) log_raw("no WorldToScreenPoint\n");
     return 0;

@@ -6,12 +6,18 @@ android {
     namespace "app.phisap.pocket"
     compileSdk 34
 
+    sourceSets {
+        main {
+            assets.srcDir("$buildDir/generated/phisap-assets")
+        }
+    }
+
     defaultConfig {
         applicationId "app.phisap.pocket"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 27
+        versionName "3.5"
     }
 
     compileOptions {
@@ -24,6 +30,35 @@ android {
             minifyEnabled false
         }
     }
+}
+
+def nativePayloadApk = rootProject.file("phisap-pocket.apk")
+def generatedNativeAsset = layout.buildDirectory.file("generated/phisap-assets/libphisap.so")
+tasks.register("extractPocketNativeAsset") {
+    inputs.file(nativePayloadApk)
+    outputs.file(generatedNativeAsset)
+    doLast {
+        if (!nativePayloadApk.isFile()) {
+            throw new GradleException("Build android/phisap-pocket.apk first")
+        }
+        def outputFile = generatedNativeAsset.get().asFile
+        outputFile.parentFile.mkdirs()
+        def archive = new java.util.zip.ZipFile(nativePayloadApk)
+        try {
+            def entry = archive.getEntry("assets/libphisap.so")
+            if (entry == null) {
+                throw new GradleException("Pocket APK has no assets/libphisap.so")
+            }
+            archive.getInputStream(entry).withCloseable { input ->
+                outputFile.withOutputStream { output -> input.transferTo(output) }
+            }
+        } finally {
+            archive.close()
+        }
+    }
+}
+tasks.named("preBuild").configure {
+    dependsOn("extractPocketNativeAsset")
 }
 
 dependencies {

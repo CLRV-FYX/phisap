@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">phisap</string>
-    <string name="xposed_description">phisap 手机版。Phigros 可在进程里播放；Phira 走 root 真实触摸。规划仍在电脑版。</string>
+    <string name="xposed_description">PhiSAP 的游戏进程内加载模块。启用后在 Application.attach 中 System.load libphisap.so。</string>
     <string name="brand">phisap</string>
-    <string name="brand_sub">手机版 3.2</string>
+    <string name="brand_sub">手机版 3.5</string>
     <string name="status_waiting">还没进游戏</string>
     <string name="status_live">游戏里已加载</string>
     <string name="plan_empty">还没有计划</string>
@@ -16,7 +16,7 @@
     <string name="test_tap">测试点一下</string>
     <string name="setup_title">怎么接上</string>
     <string name="step_pc">计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</string>
-    <string name="step_lsposed">点开始就会进游戏。右上角悬浮窗能看状态、偏移、方式和游戏，也能改、能收起，不挡整屏。随时点停止。进程内不需要计划。Phira 没有 il2cpp，请选外部触摸。</string>
+    <string name="step_lsposed">APK 会按 PhiSkin 方式预选 PhiSAP 和支持的游戏作用域；仍请在 LSPosed 确认模块已启用、当前游戏已勾选。若游戏已经打开，先强制停止。点开始后 30 秒内应确认进程内加载；若未加载，会区分未收到 Xposed 回调和 System.load 报错，不再一直等待。Phira 没有 il2cpp，请选外部触摸。</string>
     <string name="step_npatch">只打 Phigros 且不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持 com.PigeonGames.Phigros。这条路打不了 Phira。</string>
     <string name="ceiling">权限到 root 为止。不需要电脑常开，也不改第二套框架。</string>
 </resources>

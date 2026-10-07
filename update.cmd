@@ -15,7 +15,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 $Repo   = 'CLRV-FYX/phisap'
-$Branch = 'arena/01a0fd15-phisap'
+$Branch = 'arena/369a6f58-phisap'
 # 更新时保留的用户数据（其余旧文件会先移入 .old_version 备份目录，再放入新版本文件）
 $Keep   = @('Assets', 'cache', '.git', '.old_version')
 # 下载地址：依次尝试，GitHub 直连失败时使用第三方加速镜像
@@ -138,6 +138,7 @@ function Update-Phisap {
     Say ''
     Say '[完成] 已更新到最新代码！运行 start.cmd 即可启动。' 'Green'
     Say '       旧版本文件已备份在隐藏目录 .old_version 中（下次更新时会被覆盖）。'
+    Say '       安卓：安装 android\phisap-pocket.apk 后，在 LSPosed 启用 PhiSAP 并勾选游戏。已打开的游戏需先强制停止；只有 maps 确认后才报告库已加载。' 'Yellow'
 }
 
 try {
