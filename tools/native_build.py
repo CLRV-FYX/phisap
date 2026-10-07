@@ -1,4 +1,4 @@
-"""构建游戏内 ARM64 钩子、root 触摸守护和 native ioctl 桥。"""
+"""构建 ARM64 游戏钩子、root 触摸守护、进程注入器和 native ioctl 桥。"""
 from __future__ import annotations
 
 import os
@@ -56,7 +56,7 @@ def _section_names(blob: bytes) -> list[str]:
 
 
 def _prebuilt_native() -> dict[str, bytes] | None:
-    """没装 Zig 时沿用当前 APK 中已验证的 ARM64 钩子、触摸守护和 ioctl 桥。"""
+    """Reuse a complete root-only native payload from the checked-in APK when Zig is unavailable."""
     import zipfile
     apk = ROOT / 'android' / 'phisap-pocket.apk'
     if not apk.is_file():
@@ -72,10 +72,11 @@ def _prebuilt_native() -> dict[str, bytes] | None:
 
         so = pick('lib/arm64-v8a/libphisap.so', 'assets/libphisap.so')
         tapd = pick('assets/phisap-tapd', 'lib/arm64-v8a/libphisap-tapd.so')
+        inject = pick('assets/phisap-inject', 'lib/arm64-v8a/libphisap-inject.so')
         ioctl = pick('assets/libphisap-ioctl.so', 'lib/arm64-v8a/libphisap-ioctl.so')
-    if not so or not tapd or not ioctl:
+    if not so or not tapd or not inject or not ioctl:
         return None
-    return {'so': so, 'tapd': tapd, 'ioctl': ioctl}
+    return {'so': so, 'tapd': tapd, 'inject': inject, 'ioctl': ioctl}
 
 
 def _needed_libc(blob: bytes) -> bool:
@@ -129,6 +130,7 @@ def build_native() -> dict[str, bytes]:
         out.mkdir(parents=True, exist_ok=True)
         so = out / 'libphisap.so'
         tapd = out / 'phisap-tapd'
+        inject = out / 'phisap-inject'
         stub_dir = out / 'stub'
         stub_dir.mkdir(parents=True, exist_ok=True)
         subprocess.check_call([
@@ -154,6 +156,12 @@ def build_native() -> dict[str, bytes]:
             zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
             '-fno-stack-protector', str(NATIVE / 'tapd.c'), '-o', str(tapd),
         ])
+        subprocess.check_call([
+            zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
+            '-fno-stack-protector', '-ffunction-sections', '-fdata-sections',
+            '-Wl,--gc-sections', str(NATIVE / 'inject.c'), str(NATIVE / 'elfhelp.c'),
+            str(NATIVE / 'cave.S'), '-o', str(inject),
+        ])
         ioctl = out / 'libphisap-ioctl.so'
         subprocess.check_call([
             zig, 'cc', '-target', 'aarch64-linux-android', '-shared', '-fPIC',
@@ -164,6 +172,7 @@ def build_native() -> dict[str, bytes]:
         blobs = {
             'so': so.read_bytes(),
             'tapd': tapd.read_bytes(),
+            'inject': inject.read_bytes(),
             'ioctl': ioctl.read_bytes(),
         }
     else:
@@ -171,7 +180,7 @@ def build_native() -> dict[str, bytes]:
         if blobs is None:
             raise RuntimeError('找不到 zig，且当前 APK 中没有可复用的已验证原生库')
     blobs['script'] = script
-    for name in ('so', 'tapd', 'ioctl'):
+    for name in ('so', 'tapd', 'inject', 'ioctl'):
         if _elf_machine(blobs[name]) != 0xB7:
             raise RuntimeError(f'{name} 不是 aarch64')
     if blobs['so'][16] != 3:
@@ -183,18 +192,29 @@ def build_native() -> dict[str, bytes]:
         if needle not in blobs['so']:
             raise RuntimeError(f'钩子里没有 {needle.decode()}')
     script_text = blobs['script']
-    if b'force-stop' in script_text or b'ptrace' in script_text or b'setenforce' in script_text:
-        raise RuntimeError('新启动脚本仍尝试强停、ptrace 或关闭 SELinux')
-    if b'phisap-inject' in script_text or b'PTRACE_' in script_text:
-        raise RuntimeError('启动脚本仍走旧注入器')
+    if b'force-stop' in script_text or b'wrap.' in script_text or b'zygisk' in script_text.lower():
+        raise RuntimeError('root 启动脚本仍依赖强停、wrap 或 Zygisk')
+    if b'LSPosed' in script_text or b'xposed' in script_text.lower():
+        raise RuntimeError('root 启动脚本仍依赖外部 Xposed 框架')
+    if b'libphisap-inject' not in script_text or b'"$target_pid" "$SO_USE"' not in script_text:
+        raise RuntimeError('启动脚本没有调用 APK 内的 root 注入器')
     if b'/proc/$pid/maps' not in script_text or b'libphisap\\.so' not in script_text:
         raise RuntimeError('启动脚本没有用进程 maps 验证库是否实际加载')
-    if b'Application.attach' not in script_text or b'System.load' not in script_text:
-        raise RuntimeError('启动脚本没有说明进程内 System.load 路径')
+    if b'libil2cpp\\.so' not in script_text or '已加载并挂钩'.encode() not in script_text:
+        raise RuntimeError('启动脚本没有等游戏原生库并核对 hook 状态')
+    if b'setenforce 0' in script_text and (b'trap ' not in script_text or b'setenforce 1' not in script_text):
+        raise RuntimeError('临时 SELinux 放行没有保证恢复')
+    if b'phisap-inject-26' not in blobs['inject']:
+        raise RuntimeError('APK root 注入器不是当前版本')
+    if b'PTRACE_ATTACH' not in (NATIVE / 'inject.c').read_bytes() or b'dlopen' not in blobs['inject']:
+        raise RuntimeError('root 注入器缺少目标进程加载逻辑')
+    for retired in (b'zygisk', b'phisap-boot-25', b'boot <pkg>'):
+        if retired in blobs['inject'].lower():
+            raise RuntimeError(f'root 注入器仍包含旧的外部加载路径: {retired.decode()}')
     if b'/dev/uinput' not in blobs['tapd']:
         raise RuntimeError('触摸守护没有打开 uinput')
-    if b'zygisk_module_entry' not in blobs['so']:
-        raise RuntimeError('原生库缺少旧环境兼容入口')
+    if b'zygisk' in blobs['so'].lower() or b'zygisk' in blobs['inject'].lower():
+        raise RuntimeError('APK 原生载荷不得带入 Zygisk 依赖')
     if b'usap64' not in blobs['so'] or b'phisap-hook-12' not in blobs['so'] or b'phisap_start' not in blobs['so']:
         raise RuntimeError('钩子不会在进程启动后再开工')
     if not _needed_libc(blobs['so']):

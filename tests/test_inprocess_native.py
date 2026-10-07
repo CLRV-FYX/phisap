@@ -3,7 +3,6 @@
 These inspect the low-level sources rather than importing the separate Gradle
 implementation; the APK packages the files under tools/native/.
 """
-import ast
 from pathlib import Path
 import shutil
 import subprocess
@@ -137,28 +136,13 @@ class InProcessLauncherRegressionTest(unittest.TestCase):
         self.assertIn('stop_sig == SIGSEGV && have_regs && regs.pc == 0', invoker)
         self.assertIn('Other signals (including an internal dlopen SIGSEGV) are not success.', invoker)
 
-    def test_boot_waits_for_game_code_before_remote_loading(self):
-        boot = INJECT_C.split('static int boot_main(', 1)[1]
-        self.assertIn('i < 120', boot)
-        self.assertIn('if (game > 0 && caller_of(game))', boot)
-        self.assertNotIn('i > 20', boot)
-        self.assertIn('游戏原生库还在加载，请到首页后重试', boot)
-
-    def test_failed_live_patch_falls_back_to_an_already_enabled_zygisk(self):
-        boot = INJECT_C.split('static int boot_main(', 1)[1]
-        self.assertIn('if (zygisk_ready() && install_zygisk_module(appso) == 0)', boot)
-        self.assertIn('handoff_zygote(pkg)', boot)
-        self.assertIn('handoff zygisk', boot)
-        zygote_script = INJECT_C.split('static const char ZYGOTE_SH[] =', 1)[1].split('static int install_zygisk_module', 1)[0]
-        self.assertIn('resolve-activity --brief', zygote_script)
-        self.assertIn('am start --user 0', zygote_script)
-        script = ''.join(
-            ast.literal_eval(line.strip().rstrip(';'))
-            for line in zygote_script.splitlines()
-            if line.strip().startswith('"')
-        )
-        checked = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True)
-        self.assertEqual(checked.returncode, 0, checked.stderr)
+    def test_packaged_injector_exposes_only_the_direct_pid_so_entry(self):
+        main = INJECT_C.split('int main(int argc, char **argv) {', 1)[1]
+        self.assertIn('用法: phisap-inject <pid> <so>', main)
+        self.assertNotIn('boot_main(argv', main)
+        self.assertNotIn('strcmp(argv[1], "boot")', main)
+        self.assertIn('resolve_open(pid)', main)
+        self.assertIn('attach_any(pid', main)
 
     def test_code_page_failures_include_address_and_errno(self):
         text_writer = INJECT_C.split('static int poke_text_exact(', 1)[1].split(
@@ -174,21 +158,38 @@ class InProcessLauncherRegressionTest(unittest.TestCase):
         self.assertIn("$Branch = 'arena/369a6f58-phisap'", UPDATE_CMD)
         self.assertNotIn("$Branch = 'arena/01a0fd15-phisap'", UPDATE_CMD)
 
+    def test_windows_updater_describes_the_root_only_android_install(self):
+        self.assertIn('并授予 root 即可', UPDATE_CMD)
+        self.assertIn('无需安装或配置 LSPosed', UPDATE_CMD)
+        self.assertIn('已打开时会直接注入并核对 maps', UPDATE_CMD)
+
     def test_tap_daemon_is_restarted_for_the_current_apk_assets(self):
-        stop = INSIDE_SH.split('stop_old_tapd() {', 1)[1].split('\nsay "悬浮窗开着', 1)[0]
+        stop = INSIDE_SH.split('stop_old_tapd() {', 1)[1].split('\n}', 1)[0]
         self.assertIn('killall phisap-tapd libphisap-tapd.so', stop)
         self.assertIn('pidof libphisap-tapd.so', stop)
 
-    def test_launcher_requires_a_real_in_process_library_mapping(self):
+    def test_launcher_directly_injects_and_only_succeeds_after_maps_confirmation(self):
+        self.assertIn('id -u', INSIDE_SH)
+        self.assertIn('"$INJ" "$target_pid" "$SO_USE"', INSIDE_SH)
         self.assertIn('/proc/$pid/maps', INSIDE_SH)
-        self.assertIn("grep -q 'libphisap", INSIDE_SH)
-        self.assertIn('Application.attach', INSIDE_SH)
-        self.assertIn('System.load', INSIDE_SH)
-        self.assertIn('没有收到 Xposed attach 回报', INSIDE_SH)
-        self.assertIn('强制停止并重开', INSIDE_SH)
-        self.assertNotIn('phisap-inject', INSIDE_SH)
-        self.assertNotIn('PTRACE', INSIDE_SH.upper())
-        self.assertNotIn('setenforce', INSIDE_SH)
+        self.assertIn("grep -q 'libphisap\\.so'", INSIDE_SH)
+        self.assertIn('已确认 libphisap.so 映射在 Phigros 进程', INSIDE_SH)
+        self.assertIn('libil2cpp\\.so', INSIDE_SH)
+        self.assertIn('30 秒内钩子未完成', INSIDE_SH)
+        self.assertNotIn('force-stop', INSIDE_SH)
+        self.assertNotIn('boot "$PKG"', INSIDE_SH)
+        self.assertNotIn('LSPosed', INSIDE_SH)
+        self.assertIn('setenforce 0', INSIDE_SH)
+        self.assertIn('setenforce 1', INSIDE_SH)
+
+    def test_native_initialization_times_out_before_launcher_and_reports_retry_action(self):
+        self.assertIn('i < 150', HOOK_C)  # 15 s IL2CPP initialization ceiling
+        self.assertIn('i < 100 && !line', HOOK_C)  # 10 s class lookup ceiling
+        self.assertIn('15 秒内初始化失败', HOOK_C)
+        self.assertIn('没有 JudgeLineControl；', HOOK_C)
+        self.assertIn('重启游戏重试', HOOK_C)
+        self.assertIn('while [ "$i" -lt 60 ]', INSIDE_SH)  # 30 s outer ceiling
+        self.assertIn('"没找到 il2cpp"*|"没有 JudgeLineControl"*', INSIDE_SH)
 
 if __name__ == '__main__':
     unittest.main()

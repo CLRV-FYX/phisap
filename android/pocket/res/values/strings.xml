@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">phisap</string>
-    <string name="xposed_description">PhiSAP 的游戏进程内加载模块。启用后在 Application.attach 中 System.load libphisap.so。</string>
+    <string name="app_name">PhiSAP Root</string>
     <string name="brand">phisap</string>
-    <string name="brand_sub">手机版 3.5</string>
+    <string name="brand_sub">Root 进程注入版 3.7</string>
     <string name="status_waiting">还没进游戏</string>
     <string name="status_live">游戏里已加载</string>
     <string name="plan_empty">还没有计划</string>
@@ -16,7 +15,6 @@
     <string name="test_tap">测试点一下</string>
     <string name="setup_title">怎么接上</string>
     <string name="step_pc">计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</string>
-    <string name="step_lsposed">APK 会按 PhiSkin 方式预选 PhiSAP 和支持的游戏作用域；仍请在 LSPosed 确认模块已启用、当前游戏已勾选。若游戏已经打开，先强制停止。点开始后 30 秒内应确认进程内加载；若未加载，会区分未收到 Xposed 回调和 System.load 报错，不再一直等待。Phira 没有 il2cpp，请选外部触摸。</string>
-    <string name="step_npatch">只打 Phigros 且不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持 com.PigeonGames.Phigros。这条路打不了 Phira。</string>
+    <string name="step_root">安装这一 APK 并授予 SU root 后点开始。内置 ARM64 注入器会直接加载到已打开的 Phigros 进程；若游戏未启动才会代为打开。无需安装、启用或配置 LSPosed/Zygisk，也不会强停游戏。会核对进程 maps 和钩子状态，失败会显示明确原因，不会无限等待。Phira 使用 root 真实触摸，不加载 Phigros 专用钩子。</string>
     <string name="ceiling">权限到 root 为止。不需要电脑常开，也不改第二套框架。</string>
 </resources>

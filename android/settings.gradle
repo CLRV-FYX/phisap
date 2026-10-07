@@ -13,4 +13,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "phisap-pocket"
-include ":app", ":xposed-stub"
+include ":app"

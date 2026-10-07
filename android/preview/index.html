@@ -154,15 +154,15 @@
       <h2>怎么接上</h2>
       <div class="steps">
         <p>计划在电脑版生成。导出后导入这里。电脑版继续用 ADB 打，两边互不替代。</p>
-        <p>有 root：在 LSPosed 打开本模块，作用域只勾 Phigros。进游戏后侧边会出现开始。</p>
-        <p>不给 root：用 NPatch 把这个 APK 嵌进 Phigros，包名保持不变。嵌进去之后不用再勾 LSPosed。</p>
+        <p>授予 root：直接把内置 ARM64 钩子加载到 Phigros 进程；游戏已打开也不需要重启。无需另装或配置 LSPosed。</p>
+        <p>Phira 使用 APK 内的 root 真实触摸守护；Phigros 的进程钩子和触摸守护都随同一个 APK 提供。</p>
       </div>
       <div class="ceiling">权限到 root 为止。不需要电脑常开，也不另装一套框架。</div>
     </div>
   </div>
   <div class="side">
     <h2>一个 APK 进游戏，电脑版照旧。</h2>
-    <p>参考的那个包不是改安装包里的图片文件。它自己是模块：<strong>LSPosed</strong> 在游戏启动时把它载进 Phigros 进程；没有 root 时用 <strong>NPatch</strong> 嵌进游戏，包名不变。配置界面留在模块里，游戏里只挂一个小按钮。两边用一个只允许模块和游戏访问的接口传设置。</p>
+    <p>手机端是一个完整 APK。授予 root 后，由 APK 内置的 ARM64 注入器把原生钩子加载进现有 Phigros 进程，并启动 root 触摸守护；不要求再安装或配置运行框架。</p>
     <ol>
       <li>电脑版继续规划，也继续用 ADB 演奏。</li>
       <li>导出的计划和手机版是同一份 1280×720。</li>

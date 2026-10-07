@@ -186,15 +186,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="@string/step_lsposed"
-            android:textColor="@color/muted"
-            android:textSize="13sp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/step_npatch"
+            android:text="@string/step_root"
             android:textColor="@color/muted"
             android:textSize="13sp" />
 

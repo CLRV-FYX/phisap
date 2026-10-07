@@ -2,24 +2,36 @@ package app.phisap.pocket;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Point;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.Display;
+import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
 
-/** 配置只有计划和偏移。演奏发生在游戏里，不在这个界面上假装已经点下去了。 */
+/** Configuration UI and the APK-bundled root-only game-process loader. */
 public final class MainActivity extends Activity {
     private static final int PICK = 1;
+    private static final String PHIGROS = "com.PigeonGames.Phigros";
+    private static final String[] ROOT_PAYLOAD = {
+            "inside.sh", "phisap-tapd", "phisap-inject", "libphisap.so"
+    };
+
     private PocketStore store;
     private TextView status;
     private TextView planName;
     private TextView planMeta;
     private TextView offsetValue;
     private int offset;
+    private volatile boolean starting;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,7 +61,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        status.setText(store.injectedRecently() ? R.string.status_live : R.string.status_waiting);
+        showCurrentStatus();
     }
 
     private void bump(int delta) {
@@ -90,8 +102,101 @@ public final class MainActivity extends Activity {
                 return;
             }
         }
-        getContentResolver().call(ModProvider.URI, "requestPlay", null, null);
-        Toast.makeText(this, "Phigros 侧边按钮 4 秒内会开始。Phira 请用 root 真实触摸，进程内点不进去。", Toast.LENGTH_LONG).show();
+        if (starting) {
+            return;
+        }
+        starting = true;
+        status.setText("正在请求 root；请允许 SU 权限…");
+        new Thread(this::runRootLoader, "phisap-root-loader").start();
+    }
+
+    private void runRootLoader() {
+        File statusFile = new File(getFilesDir(), "status.txt");
+        try {
+            for (String name : ROOT_PAYLOAD) {
+                copyAsset(name);
+            }
+            statusFile.delete();
+
+            Point size = new Point();
+            WindowManager manager = getWindowManager();
+            Display display = manager.getDefaultDisplay();
+            display.getRealSize(size);
+            int rotation = display.getRotation();
+            String files = getFilesDir().getAbsolutePath();
+            String libDir = getApplicationInfo().nativeLibraryDir;
+            String command = "sh " + quote(new File(getFilesDir(), "inside.sh").getAbsolutePath())
+                    + " " + quote(files)
+                    + " " + quote(libDir)
+                    + " " + quote(PHIGROS)
+                    + " " + Math.max(1, size.x)
+                    + " " + Math.max(1, size.y)
+                    + " " + rotation
+                    + " > /dev/null 2>&1";
+
+            Process root = Runtime.getRuntime().exec(new String[]{"su", "-c", command});
+            while (!root.waitFor(500, TimeUnit.MILLISECONDS)) {
+                showCurrentStatus();
+            }
+            int exitCode = root.exitValue();
+            String finalStatus = readStatus(statusFile);
+            if (finalStatus.isEmpty()) {
+                finalStatus = exitCode == 0
+                        ? "root 加载命令已完成，但没有状态回报"
+                        : "root 请求失败（退出码 " + exitCode + "）；请允许 phisap 的 SU 权限";
+            }
+            showStatus(finalStatus);
+        } catch (Throwable error) {
+            showStatus("root 加载失败：" + error);
+        } finally {
+            starting = false;
+        }
+    }
+
+    private void copyAsset(String name) throws Exception {
+        File outFile = new File(getFilesDir(), name);
+        try (InputStream in = getAssets().open(name);
+             FileOutputStream out = new FileOutputStream(outFile, false)) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+            out.getFD().sync();
+        }
+    }
+
+    private void showCurrentStatus() {
+        showStatus(readStatus(new File(getFilesDir(), "status.txt")));
+    }
+
+    private String readStatus(File file) {
+        if (!file.isFile()) {
+            return "";
+        }
+        try (InputStream in = new java.io.FileInputStream(file);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[1024];
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+            return out.toString(StandardCharsets.UTF_8.name()).trim();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void showStatus(String value) {
+        if (value == null || value.isEmpty()) {
+            value = getString(R.string.status_waiting);
+        }
+        final String message = value;
+        runOnUiThread(() -> status.setText(message));
+    }
+
+    private static String quote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     @Override

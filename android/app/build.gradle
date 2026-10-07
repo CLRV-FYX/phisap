@@ -9,6 +9,7 @@ android {
     sourceSets {
         main {
             assets.srcDir("$buildDir/generated/phisap-assets")
+            jniLibs.srcDir("$buildDir/generated/phisap-jniLibs")
         }
     }
 
@@ -16,8 +17,8 @@ android {
         applicationId "app.phisap.pocket"
         minSdk 26
         targetSdk 34
-        versionCode 27
-        versionName "3.5"
+        versionCode 29
+        versionName "3.7"
     }
 
     compileOptions {
@@ -33,24 +34,43 @@ android {
 }
 
 def nativePayloadApk = rootProject.file("phisap-pocket.apk")
-def generatedNativeAsset = layout.buildDirectory.file("generated/phisap-assets/libphisap.so")
-tasks.register("extractPocketNativeAsset") {
+def generatedAssets = layout.buildDirectory.dir("generated/phisap-assets")
+def generatedJniLibs = layout.buildDirectory.dir("generated/phisap-jniLibs")
+tasks.register("extractPocketNativeAssets") {
     inputs.file(nativePayloadApk)
-    outputs.file(generatedNativeAsset)
+    outputs.dir(generatedAssets)
+    outputs.dir(generatedJniLibs)
     doLast {
         if (!nativePayloadApk.isFile()) {
             throw new GradleException("Build android/phisap-pocket.apk first")
         }
-        def outputFile = generatedNativeAsset.get().asFile
-        outputFile.parentFile.mkdirs()
+        def assetDir = generatedAssets.get().asFile
+        def jniDir = generatedJniLibs.get().asFile
+        assetDir.mkdirs()
+        jniDir.mkdirs()
         def archive = new java.util.zip.ZipFile(nativePayloadApk)
         try {
-            def entry = archive.getEntry("assets/libphisap.so")
-            if (entry == null) {
-                throw new GradleException("Pocket APK has no assets/libphisap.so")
+            ["libphisap.so", "inside.sh", "phisap-tapd", "phisap-inject"].each { name ->
+                def entry = archive.getEntry("assets/${name}")
+                if (entry == null) {
+                    throw new GradleException("Pocket APK has no assets/${name}")
+                }
+                def outputFile = new File(assetDir, name)
+                outputFile.parentFile.mkdirs()
+                archive.getInputStream(entry).withCloseable { input ->
+                    outputFile.withOutputStream { output -> input.transferTo(output) }
+                }
             }
-            archive.getInputStream(entry).withCloseable { input ->
-                outputFile.withOutputStream { output -> input.transferTo(output) }
+            ["libphisap.so", "libphisap-tapd.so", "libphisap-inject.so"].each { name ->
+                def entry = archive.getEntry("lib/arm64-v8a/${name}")
+                if (entry == null) {
+                    throw new GradleException("Pocket APK has no ARM64 lib/${name}")
+                }
+                def outputFile = new File(jniDir, "arm64-v8a/${name}")
+                outputFile.parentFile.mkdirs()
+                archive.getInputStream(entry).withCloseable { input ->
+                    outputFile.withOutputStream { output -> input.transferTo(output) }
+                }
             }
         } finally {
             archive.close()
@@ -58,10 +78,9 @@ tasks.register("extractPocketNativeAsset") {
     }
 }
 tasks.named("preBuild").configure {
-    dependsOn("extractPocketNativeAsset")
+    dependsOn("extractPocketNativeAssets")
 }
 
 dependencies {
     implementation "androidx.appcompat:appcompat:1.7.0"
-    compileOnly project(":xposed-stub")
 }

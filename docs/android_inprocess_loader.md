@@ -1,55 +1,62 @@
-# Android in-process native loading
+# Android root-only game-process loader
 
-The hand-built pocket APK (`tools/build_apk.py`) is also an LSPosed module. Its
-`assets/xposed_init` entry hooks the target app's `Application.attach` callback.
-Inside that app process it copies `assets/libphisap.so` from the module APK into
-the target app's private `files/phisap` directory, marks the file read-only, and
-calls `System.load` with the absolute path. The root helper only prepares the
-hook configuration/touch daemon, launches the game if it is not already running,
-and checks `/proc/<game-pid>/maps` for `libphisap.so`.
+The release pocket APK (`android/phisap-pocket.apk`, built by
+`tools/build_apk.py`) is self-contained. After the user grants SU/root, its
+bundled ARM64 `phisap-inject` helper attaches to the selected running Phigros
+process and calls the target process's dynamic linker to load the bundled
+`libphisap.so`. If Phigros is not running, the helper launches it and waits for
+`libil2cpp.so` before injecting. If Phigros is already open, it does not force
+stop or restart it. The APK also bundles and starts its root touch daemon.
 
-This path does not use the old `phisap-inject`/ptrace loader. A process that was
-already running before LSPosed loaded the module cannot be retroactively hooked.
-The helper deliberately reports that case as **not injected**; it does not kill
-or silently restart the game.
+This release path does **not** install, enable, or configure LSPosed, Zygisk,
+NPatch, or a separate module. It confirms the library mapping in
+`/proc/<pid>/maps`, then relays the native hook's bounded startup status to the
+app. A missing mapping, failed ptrace, linker error, or hook initialization
+failure is reported as an error; the app does not treat process detection as a
+successful load or wait forever. Native IL2CPP API discovery is capped at 15
+seconds and `JudgeLineControl` lookup at 10 seconds, inside the launcher's
+30-second status deadline. Hard failures remain visible and direct the user to
+restart the game before retrying rather than silently repeating the wait. Phira
+uses the root touch daemon and does not use the Phigros-specific IL2CPP hook.
 
-## Build
+The packaged injector exposes only the direct `<pid> <so-path>` entry point;
+the native build strips the old boot-mode code and rejects Zygisk strings in the
+payload. It does not set a persistent launch property or modify system mounts.
+If SELinux blocks the initial attach, the helper makes one best-effort retry
+with SELinux temporarily permissive and restores the original Enforcing state
+on every exit path. Version 3.7 performs a one-time migration from old saved
+settings: it selects the in-process path and replaces old `System.load` status
+text with a visible `PhiSAP Root 3.7` marker.
+
+## Build and verification
 
 ```sh
 python tools/build_apk.py
+python -m unittest tests.test_root_loader tests.test_inprocess_native
 ```
 
 Install the Python requirements first; APK signing requires `cryptography`.
-The output is `android/phisap-pocket.apk` (version code 27 / version 3.5). The
-custom DEX is audited, the manifest is inspected with `aapt2`, and the APK's v1
-and v2 signatures are checked by the build script. This is a static build check,
-not a device injection test.
+A Zig 0.13-compatible compiler (`zig cc`, via `PATH` or `ZIG`) is needed to
+rebuild the ARM64 hook, touch daemon, ioctl bridge, and root injector from source.
+The builder uses the checked-in `aapt2` and fetches the Android platform jar if
+it is missing. The output is `android/phisap-pocket.apk` (version code 29 / 3.7).
+The builder includes all native payloads in the same signed APK, audits the
+hand-built DEX, inspects the manifest and payload, and verifies v1/v2 signatures.
+Static checks validate the root loading path and shell syntax; they do not prove
+runtime injection on a device.
 
-## Device setup and use
+## Device verification
 
-1. Install/update `android/phisap-pocket.apk` and have a compatible LSPosed
-   manager/framework active.
-2. The APK ships `META-INF/xposed/scope.list` with the pocket app and all three
-   supported game packages, following PhiSkin's scope mechanism. In LSPosed,
-   verify PhiSAP is enabled and the package you use is checked (especially when
-   updating an already-installed module, since existing scope preferences may
-   be retained).
-3. If the game is already open, force-stop it first. LSPosed hooks processes
-   when they start; it cannot attach to an already-running process.
-4. Open PhiSAP and press Start. The helper prepares shared config first, then
-   launches the game. It checks the target-process maps and the loader's
-   `files/phisap/xposed.status` handshake. It stops waiting after 30 seconds and
-   reports whether LSPosed never called `Application.attach` or `System.load`
-   failed, rather than leaving a permanent waiting message.
-
-For independent verification on a rooted device:
+After granting root and pressing Start, the UI must first report that
+`libphisap.so` is mapped in the running Phigros PID, then report a native hook
+status such as `已挂钩 UpdateInfo`. On a rooted device this can be independently
+checked with:
 
 ```sh
 adb shell su -c 'for p in $(pidof com.PigeonGames.Phigros); do grep libphisap.so /proc/$p/maps; done'
-adb logcat -s PhiSAP-Xposed
+adb shell su -c 'cat /data/local/tmp/phisap-status; tail -n 40 /data/local/tmp/phisap-hook.log; cat /data/local/tmp/phisap-inject.err'
 ```
 
-A missing maps line means the native library is not mapped in that process. Check
-that LSPosed enabled the module and the game's scope, then check the tagged
-logcat output. No device was available to verify runtime injection while this
-APK was being built.
+No Android device is available in this workspace, so runtime injection and
+actual in-game hook behavior remain unverified here. The APK build and static
+regression tests must not be described as a device-level success test.

@@ -1218,7 +1218,9 @@ static void *worker(void *arg) {
     if (i >= 400) return 0;
     log_raw("phisap-hook-12\n");
     write_status("钩子已进进程");
-    for (int i = 0; i < 900; i++) {
+    /* Keep native startup below inside.sh's 30-second status deadline.
+       A failed attach must become a terminal, actionable report, not a retry loop. */
+    for (int i = 0; i < 150; i++) {
         wait_if_stopped();
         load_maps();
         if (resolve_api() && api.domain_get && api.domain_get()) break;
@@ -1230,13 +1232,13 @@ static void *worker(void *arg) {
         usleep(100000);
     }
     if (!api.ok || !api.domain_get || !api.domain_get()) {
-        write_status("没找到 il2cpp，Phira 请用外部触摸");
+        write_status("没找到 il2cpp API，15 秒内初始化失败；请确认游戏已加载并重启游戏重试");
         return 0;
     }
     if (api.thread_attach) api.thread_attach(api.domain_get());
     write_status("已进 il2cpp，等判定线");
     void *line = 0;
-    for (int i = 0; i < 200 && !line; i++) {
+    for (int i = 0; i < 100 && !line; i++) {
         wait_if_stopped();
         line = find_class("JudgeLineControl", 0);
         if (!line) {
@@ -1245,7 +1247,7 @@ static void *worker(void *arg) {
         }
     }
     if (!line) {
-        write_status("没有 JudgeLineControl");
+        write_status("没有 JudgeLineControl；游戏版本不匹配或尚未加载，请重启游戏重试");
         return 0;
     }
     line_klass = line;
@@ -1266,8 +1268,7 @@ static void *worker(void *arg) {
     return 0;
 }
 
-/* 已经在游戏里就直接开工。若是 zygote 刚 fork 出来的，先别开线程，
-   等注入器看到进程名变成游戏后再调 phisap_start。 */
+/* Constructor runs in the target game because the root injector calls its dynamic linker. */
 __attribute__((visibility("default")))
 void phisap_start(void) {
     static int started;
@@ -1278,58 +1279,6 @@ void phisap_start(void) {
     if (pthread_create(&th, 0, worker, 0) != 0) write_status("钩子线程没起来");
 }
 
-/* Zygisk 在应用进程里 dlopen 这个库。构造函数那时名字可能还是 zygote，所以等专门化之后再开工。
- * 只调用 registerModule。版本不对就返回，不碰别的函数指针，避免把别的应用弄崩。 */
-struct ZygiskAbi {
-    long api_version;
-    void *impl;
-    void (*pre_app)(void *, void *);
-    void (*post_app)(void *, void *);
-    void (*pre_server)(void *, void *);
-    void (*post_server)(void *, void *);
-};
-struct ZygiskTable {
-    void *impl;
-    int (*register_module)(void *, struct ZygiskAbi *);
-};
-static void zygisk_nop(void *impl, void *args) {
-    (void)impl;
-    (void)args;
-}
-static void zygisk_post_app(void *impl, void *args) {
-    char pkg[160];
-    (void)impl;
-    (void)args;
-    if (!read_self_cmd(pkg, sizeof pkg)) return;
-    if (!known_game(pkg)) return;
-    log_raw("phisap-hook-12\n");
-    phisap_start();
-}
-__attribute__((visibility("default")))
-void zygisk_module_entry(void *table, void *env) {
-    struct ZygiskTable *t = table;
-    static struct ZygiskAbi abi;
-    static int dummy;
-    int fd;
-    (void)env;
-    fd = open("/data/adb/modules/phisap/disable", 0, 0);
-    if (fd >= 0) {
-        close(fd);
-        return;
-    }
-    if (!t || !t->register_module) return;
-    abi.impl = &dummy;
-    abi.pre_app = zygisk_nop;
-    abi.post_app = zygisk_post_app;
-    abi.pre_server = zygisk_nop;
-    abi.post_server = zygisk_nop;
-    abi.api_version = 5;
-    if (t->register_module(t, &abi)) return;
-    abi.api_version = 4;
-    if (t->register_module(t, &abi)) return;
-    abi.api_version = 1;
-    t->register_module(t, &abi);
-}
 __attribute__((constructor)) void phisap_init(void) {
     static int once;
     char pkg[160];
@@ -1337,8 +1286,9 @@ __attribute__((constructor)) void phisap_init(void) {
     once = 1;
     signal(13, (void (*)(int))1);
     if (!read_self_cmd(pkg, sizeof pkg)) return;
-    /* 包装提前加载时名字还是 app_process。这时开线程会把游戏打死，所以只在已经是游戏时开工。 */
+    /* Defensive package check: the hook must never start in the pocket app or another process. */
     if (!known_game(pkg)) return;
+    write_status("钩子库已加载，启动初始化");
     log_raw("phisap-hook-12\n");
     phisap_start();
 }

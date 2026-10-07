@@ -35,14 +35,14 @@ struct pt_regs_arm64 {
     unsigned long long pstate;
 };
 
-static const char INJECT_MARK[] = "phisap-inject-25";
+static const char INJECT_MARK[] = "phisap-inject-26";
 static char last_why[96];
 
 static volatile int timed_out;
 static volatile pid_t attached_tid;
 static volatile pid_t watched_zygote;
 static volatile pid_t stopped_game;
-static void boot_log(const char *s);
+static void inject_log(const char *s);
 static void write_why(const char *s);
 
 struct fly_slot {
@@ -362,7 +362,7 @@ static int so_mapped(pid_t pid) {
     f = fopen(path, "r");
     if (!f) return 0;
     while (fgets(line, sizeof line, f)) {
-        if (strstr(line, "libphisap.so") || strstr(line, "/phisap/zygisk/")) {
+        if (strstr(line, "libphisap.so")) {
             fclose(f);
             return 1;
         }
@@ -973,7 +973,7 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
                 site->map_start = start;
                 site->map_off = off;
             }
-            boot_log("site libc\n");
+            inject_log("site libc\n");
             return 0;
         }
         if (rc < worst) worst = rc;
@@ -994,12 +994,12 @@ static int locate_hook(pid_t game, size_t need, size_t back_off,
                 site->map_start = start;
                 site->map_off = off;
             }
-            boot_log("site app\n");
+            inject_log("site app\n");
             return 0;
         }
         if (rc < worst) worst = rc;
     }
-    boot_log("no file site\n");
+    inject_log("no file site\n");
     if (!saw_file) write_why("找不到 libc");
     else if (worst == -2) write_why("没有可挂的函数");
     else if (worst == -3) write_why("函数开头不能挂");
@@ -1014,7 +1014,7 @@ static void text_write_failed(const char *phase) {
     int err = text_poke_errno ? text_poke_errno : EIO;
     snprintf(note, sizeof note, "text write %s at %llx errno=%d\n", phase,
              (unsigned long long)text_poke_addr, err);
-    boot_log(note);
+    inject_log(note);
     snprintf(note, sizeof note, "%s写入失败 errno=%d", phase, err);
     write_why(note);
 }
@@ -1051,7 +1051,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     path_lit_off = (size_t)(lit_path - blob);
     if (path_lit_off + 8 > blob_n || dlopen_off + 8 > blob_n) return -1;
     if (locate_hook(game, need, back_off, &hook, &orig, &cave, &app_base, &site) != 0 || !hook || !cave) {
-        boot_log("file hook miss\n");
+        inject_log("file hook miss\n");
         if (access("/data/local/tmp/phisap-why", R_OK) != 0)
             write_why("找不到游戏库入口");
         return -1;
@@ -1065,7 +1065,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     if (!ext_fn) ext_fn = sym_in(game, "linker64", "android_dlopen_ext");
     snprintf(note, sizeof note, "hook %llx cave %llx ext %llx\n",
              (unsigned long long)hook, (unsigned long long)cave, (unsigned long long)ext_fn);
-    boot_log(note);
+    inject_log(note);
     if (!attached_tid) {
         pid_t held = attach_any(game, &dummy, &aerr, &agot);
         if (!held) {
@@ -1080,7 +1080,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
     if (!flag_at) {
         cont_game(game);
         detach_tid(tid);
-        boot_log("no scratch\n");
+        inject_log("no scratch\n");
         write_why("没有可写内存");
         return -1;
     }
@@ -1103,7 +1103,7 @@ static int hook_inject(pid_t game, pid_t tid, const char *so, struct OpenFn *fn)
         if (poke_exact(tid, path_at, pbuf, plen + 1) != 0 || poke_exact(tid, flag_at, &zero, 1) != 0) {
             cont_game(game);
             detach_tid(tid);
-            boot_log("path poke fail\n");
+            inject_log("path poke fail\n");
             write_why("路径写不进");
             return -1;
         }
@@ -1242,7 +1242,7 @@ done:
              "remote fn=%llx stop=%d pc=%llx x0=%lx wait=%d reg=%d got=%d\n",
              (unsigned long long)fn, stop_sig, (unsigned long long)regs.pc,
              *out, wait_err, reg_err, got);
-    boot_log(note);
+    inject_log(note);
     if (!got || !have_regs || timed_out) return -2;
     return 0;
 }
@@ -1263,8 +1263,8 @@ done:
 #define PTRACE_GETEVENTMSG 0x4201
 #endif
 
-static void boot_log(const char *s) {
-    int fd = open("/data/local/tmp/phisap-boot.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+static void inject_log(const char *s) {
+    int fd = open("/data/local/tmp/phisap-inject.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return;
     write(fd, s, strlen(s));
     close(fd);
@@ -1611,7 +1611,7 @@ static void wake_born(const char *pkg) {
         }
         fn = so_sym(born[i], "phisap_start");
         if (!fn) continue;
-        boot_log("call phisap_start\n");
+        inject_log("call phisap_start\n");
         call_export(born[i], fn);
         born[i] = 0;
     }
@@ -1726,22 +1726,22 @@ static int zygote_watch(const char *pkg, const char *so) {
     zy = find_exact("zygote64");
     if (!zy) zy = find_exact("zygote");
     if (!zy) {
-        boot_log("no zygote\n");
+        inject_log("no zygote\n");
         return -1;
     }
     if (pt(PTRACE_SEIZE, zy, 0, (void *)opts) < 0) {
-        boot_log("seize zygote failed\n");
+        inject_log("seize zygote failed\n");
         return -1;
     }
     watched_zygote = zy;
-    boot_log("watching zygote\n");
+    inject_log("watching zygote\n");
     helper = spawn_reopen(pkg);
     while (elapsed < 8000 && !timed_out) {
         service_zygote(zy, so);
         for (i = 0; i < 8; i++) service_fly(&fly[i]);
         if ((elapsed % 20) == 0) wake_born(pkg);
         if ((elapsed % 40) == 0 && hook_live()) {
-            boot_log("hook live at fork\n");
+            inject_log("hook live at fork\n");
             break;
         }
         usleep(2000);
@@ -2142,12 +2142,12 @@ static int patch_native(const char *pkg, pid_t pid, const char *src, char *so_ou
             if (rc == 0) rc = elf_add_needed(paths[i], "libphisap.so", UNDO_PATH);
             if (rc == 0 || rc == 1) {
                 snprintf(patched, pn, "%s", paths[i]);
-                boot_log(rc == 0 ? "needed patched\n" : "needed already\n");
+                inject_log(rc == 0 ? "needed patched\n" : "needed already\n");
                 return rc;
             }
         }
     }
-    boot_log("no extracted lib\n");
+    inject_log("no extracted lib\n");
     return -1;
 }
 
@@ -2304,7 +2304,7 @@ static int call_dlopen_blind(pid_t game, const char *so) {
         return -1;
     }
     caller = fn.caller ? fn.caller : biggest_app_exec(game);
-    if (fn.loader && !caller) boot_log("blind no caller\n");
+    if (fn.loader && !caller) inject_log("blind no caller\n");
     spin = find_spin(game);
     if (!spin) {
         snprintf(last_why, sizeof last_why, "找不到返回点");
@@ -2352,14 +2352,14 @@ static int call_dlopen_blind(pid_t game, const char *so) {
     regs.pstate = 0;
     if (write_regs(tid, &regs) != 0) {
         snprintf(note, sizeof note, "setregs %d\n", errno);
-        boot_log(note);
+        inject_log(note);
         snprintf(last_why, sizeof last_why, "写寄存器失败 %d", errno);
         detach_tid(tid);
         cont_game(game);
         kill(tid, SIGCONT);
         return -1;
     }
-    boot_log("blind dlopen\n");
+    inject_log("blind dlopen\n");
     detach_tid(tid);
     cont_game(game);
     kill(tid, SIGCONT);
@@ -2540,7 +2540,7 @@ static int boot_main(const char *pkg, const char *so) {
     /* 上次改到一半，先还原，避免游戏起不来。成功留下的依赖没有 undo，不会被清掉。 */
     elf_restore_undo(UNDO_PATH);
     repair_all(pkg);
-    boot_log("phisap-boot-25\n");
+    inject_log("phisap-boot-25\n");
     unlink("/data/local/tmp/phisap-why");
     last_why[0] = 0;
     if (stage_app_lib(pkg, so, appso, sizeof appso) != 0)
@@ -2577,7 +2577,7 @@ static int boot_main(const char *pkg, const char *so) {
         return 1;
     }
     if (place_next_to_game(pkg, game, so, appso, sizeof appso) == 0)
-        boot_log("so beside game lib\n");
+        inject_log("so beside game lib\n");
     {
         char fileso[512];
         snprintf(fileso, sizeof fileso, "/data/user/0/%s/files/libphisap.so", pkg);
@@ -2631,10 +2631,8 @@ static int boot_main(const char *pkg, const char *so) {
 
 
 int main(int argc, char **argv) {
-    if (argc == 4 && strcmp(argv[1], "boot") == 0)
-        return boot_main(argv[2], argv[3]);
     if (argc != 3) {
-        fprintf(stderr, "%s 用法: phisap-inject <pid> <so> | boot <pkg> <so>\n", INJECT_MARK);
+        fprintf(stderr, "%s 用法: phisap-inject <pid> <so>\n", INJECT_MARK);
         return 2;
     }
     pid_t pid = (pid_t)atoi(argv[1]);
@@ -2667,11 +2665,6 @@ int main(int argc, char **argv) {
         }
         close(efd);
     }
-    struct OpenFn fn = resolve_open(pid);
-    if (!fn.addr) {
-        fprintf(stderr, "找不到 dlopen\n");
-        return 1;
-    }
     if (so_mapped(pid)) {
         printf("ok mapped\n");
         return 0;
@@ -2680,16 +2673,26 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_alarm);
     signal(SIGINT, on_alarm);
     alarm(25);
+    struct OpenFn fn = resolve_open(pid);
+    if (!fn.addr) {
+        fprintf(stderr, "找不到 dlopen（目标进程尚未加载 Android linker 或权限受限）\n");
+        return 1;
+    }
     struct pt_regs_arm64 saved;
     int reg_err = 0;
     int got_regs = 0;
+    int remote_rc = -1;
+    int remote_errno = 0;
     pid_t traced = attach_any(pid, &saved, &reg_err, &got_regs);
     if (!traced) {
         if (hook_inject(pid, pid, so, &fn) == 0) {
             printf("ok hook\n");
             return 0;
         }
-        fprintf(stderr, "附加上不去 %d\n", reg_err);
+        if (last_why[0])
+            fprintf(stderr, "ptrace 无法附加（errno=%d %s）；回退失败：%s\n", reg_err, strerror(reg_err), last_why);
+        else
+            fprintf(stderr, "ptrace 无法附加（errno=%d %s），且代码入口回退失败\n", reg_err, strerror(reg_err));
         return 1;
     }
     if (got_regs) {
@@ -2700,9 +2703,13 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "%s", so);
         if (poke(traced, remote, path, strlen(path) + 1) == 0) {
             rc = invoke_remote(traced, &saved, fn.addr, remote, 2, fn.caller, fn.loader, &handle);
+            remote_rc = rc;
+            remote_errno = errno;
             if ((rc != 0 || !handle) && fn.fallback && fn.fallback != fn.addr && !timed_out) {
                 unsigned long handle2 = 0;
                 int rc2 = invoke_remote(traced, &saved, fn.fallback, remote, 2, 0, 0, &handle2);
+                remote_rc = rc2;
+                remote_errno = errno;
                 if (rc2 == 0 && handle2) {
                     handle = handle2;
                     rc = 0;
@@ -2715,6 +2722,8 @@ int main(int argc, char **argv) {
                 printf("ok %lx\n", handle);
                 return 0;
             }
+        } else {
+            remote_errno = errno;
         }
         pt(PTRACE_INTERRUPT, traced, 0, 0);
         wait_stop(traced, 80);
@@ -2725,6 +2734,11 @@ int main(int argc, char **argv) {
     }
     detach_tid(traced);
     cont_game(pid);
-    fprintf(stderr, "入口没挂上\n");
+    if (last_why[0])
+        fprintf(stderr, "远程 dlopen 失败（rc=%d，errno=%d %s）；代码入口回退失败：%s\n",
+                remote_rc, remote_errno, strerror(remote_errno), last_why);
+    else
+        fprintf(stderr, "远程 dlopen 失败（rc=%d，errno=%d %s），代码入口回退失败\n",
+                remote_rc, remote_errno, strerror(remote_errno));
     return 1;
 }

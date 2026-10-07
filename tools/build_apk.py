@@ -144,7 +144,7 @@ def build_manifest() -> bytes:
         'manifest', 'uses-sdk', 'application', 'activity', 'intent-filter', 'action', 'category',
         PKG, 'app.phisap.pocket.MainActivity', 'phisap',
         'android.intent.action.MAIN', 'android.intent.category.LAUNCHER',
-        '2', '1.0', '34', '14', '26', '28', 'true', 'false',
+        '29', '3.7', '34', '14', '26', '28', 'true', 'false',
     ]
     idx = {s: i for i, s in enumerate(strings)}
     uri = idx['http://schemas.android.com/apk/res/android']
@@ -164,8 +164,8 @@ def build_manifest() -> bytes:
     chunks = [
         _ns(0x0100, idx['android'], idx['http://schemas.android.com/apk/res/android']),
         _start(idx['manifest'], [
-            A('versionCode', '2', 'int', 2),
-            A('versionName', '1.0', 'string'),
+            A('versionCode', '29', 'int', 29),
+            A('versionName', '3.7', 'string'),
             A('compileSdkVersion', '34', 'int', 34),
             A('compileSdkVersionCodename', '14', 'string'),
             plain('package', PKG, 'string'),
@@ -574,14 +574,13 @@ def build() -> Path:
     native = build_native()
     files.append(('lib/arm64-v8a/libphisap.so', native['so']))
     files.append(('lib/arm64-v8a/libphisap-tapd.so', native['tapd']))
+    files.append(('lib/arm64-v8a/libphisap-inject.so', native['inject']))
     files.append(('lib/arm64-v8a/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/libphisap.so', native['so']))
     files.append(('assets/phisap-tapd', native['tapd']))
+    files.append(('assets/phisap-inject', native['inject']))
     files.append(('assets/libphisap-ioctl.so', native['ioctl']))
     files.append(('assets/inside.sh', native['script']))
-    files.append(('assets/xposed_init', b'app.phisap.pocket.HookEntry\n'))
-    scope_list = POCKET / 'META-INF' / 'xposed' / 'scope.list'
-    files.append(('META-INF/xposed/scope.list', scope_list.read_bytes()))
     signed = _v1_files(files, key, cert)
     apk = _v2(_zip_compat(signed), key, cert)
     _verify_v2(apk, cert)
@@ -590,8 +589,10 @@ def build() -> Path:
     badging = subprocess.check_output([str(_find_aapt2()), 'dump', 'badging', str(OUT)], text=True)
     if "package: name='app.phisap.pocket'" not in badging or 'app.phisap.pocket.MainActivity' not in badging:
         raise RuntimeError('aapt2 did not recognize the package')
-    if "versionCode='27'" not in badging:
-        raise RuntimeError('versionCode 不是 27')
+    if "versionCode='29'" not in badging:
+        raise RuntimeError('versionCode 不是 29')
+    if "versionName='3.7'" not in badging:
+        raise RuntimeError('versionName 不是 3.7')
     xml = subprocess.check_output(
         [str(_find_aapt2()), 'dump', 'xmltree', '--file', 'AndroidManifest.xml', str(OUT)],
         text=True,
@@ -600,8 +601,8 @@ def build() -> Path:
         # 主题必须写进二进制清单。没有主题时，有的手机会在 onCreate 之前拆掉窗口。
         if 'theme' not in xml:
             raise RuntimeError('清单没有系统主题')
-    if 'xposedmodule' not in xml or 'xposedminversion' not in xml or ')=93' not in xml:
-        raise RuntimeError('APK 清单没有声明为 LSPosed 模块')
+    if 'xposedmodule' in xml or 'xposedminversion' in xml:
+        raise RuntimeError('root-only APK 不得要求外部 Xposed/LSPosed 框架')
     resources = subprocess.check_output([str(_find_aapt2()), 'dump', 'resources', str(OUT)], text=True)
     for needle in (
         '0x7f040000 layout/activity_main',
@@ -619,14 +620,22 @@ def build() -> Path:
         b'Lde/robv/android/xposed/IXposedHookZygoteInit;',
         b'Lde/robv/android/xposed/XposedHelpers;',
     ):
-        if descriptor not in dex:
-            raise RuntimeError(f'Xposed 进程内加载入口缺少 {descriptor.decode()}')
-    if 'System.load succeeded in target process'.encode() not in dex:
-        raise RuntimeError('Xposed 入口没有调用 System.load')
-    if b'phisap-inject' in dex:
-        raise RuntimeError('DEX 仍引用旧的跨进程注入器')
-    if '正在进游戏'.encode() not in dex or '可看状态并改设置'.encode() not in dex or b'libphisap.so' not in dex:
-        raise RuntimeError('进程内入口没有进 dex')
+        if descriptor in dex:
+            raise RuntimeError(f'root-only DEX 不得依赖外部 Xposed API: {descriptor.decode()}')
+    if (
+        '正在请求 root 权限并加载进程内钩子'.encode() not in dex
+        or 'SU 请求失败'.encode() not in dex
+        or b'libphisap.so' not in dex
+    ):
+        raise RuntimeError('游戏加载/状态入口没有进 dex')
+    if b'phisap-inject' not in dex:
+        raise RuntimeError('DEX 没有复制 APK 内的 root 注入器')
+    if b'System.load' in dex:
+        raise RuntimeError('root-only APK 不得保留旧的 System.load 等待路径')
+    if 'PhiSAP Root 3.7'.encode() not in dex or 'loader-version.txt'.encode() not in dex:
+        raise RuntimeError('新 APK 缺少可见版本标识或旧设置迁移')
+    if b'wrap.' in dex or b'resetprop' in dex:
+        raise RuntimeError('root-only DEX 不得修改系统启动 wrap 配置')
     if b'ioctlInt' in dex:
         raise RuntimeError('dex 仍引用 ioctlInt')
     if '触摸库没加载'.encode() not in dex or b'nioctl' not in dex:
@@ -635,28 +644,28 @@ def build() -> Path:
     with zipfile.ZipFile(OUT) as blob:
         names = set(blob.namelist())
         ioctl_blob = blob.read('lib/arm64-v8a/libphisap-ioctl.so')
-        xposed_init = blob.read('assets/xposed_init').decode('ascii').strip()
-        xposed_scope = set(blob.read('META-INF/xposed/scope.list').decode('utf-8').splitlines())
-    if xposed_init != 'app.phisap.pocket.HookEntry':
-        raise RuntimeError('assets/xposed_init 没指向真实入口类')
-    if not {'com.PigeonGames.Phigros', 'org.flos.phira', 'org.flos.phira.modded'} <= xposed_scope:
-        raise RuntimeError('LSPosed 默认作用域缺少受支持的游戏包')
+        inject_blob = blob.read('assets/phisap-inject')
+    if b'phisap-inject-26' not in inject_blob:
+        raise RuntimeError('APK 内没有当前版本的 root 注入器')
+    if b'xposed_init' in b'\n'.join(name.encode() for name in names):
+        raise RuntimeError('root-only APK 不得打包外部 Xposed 入口')
+    if 'META-INF/xposed/scope.list' in names:
+        raise RuntimeError('root-only APK 不得要求 LSPosed scope 配置')
     if b'Java_app_phisap_pocket_Injector_nioctl' not in ioctl_blob:
         raise RuntimeError('安装包里的触摸库没有 nioctl')
     for need in (
         'lib/arm64-v8a/libphisap.so',
         'lib/arm64-v8a/libphisap-tapd.so',
+        'lib/arm64-v8a/libphisap-inject.so',
         'assets/inside.sh',
         'assets/phisap-tapd',
+        'assets/phisap-inject',
         'assets/libphisap.so',
-        'assets/xposed_init',
         'assets/libphisap-ioctl.so',
         'lib/arm64-v8a/libphisap-ioctl.so',
     ):
         if need not in names:
             raise RuntimeError(f'安装包缺 {need}')
-    if 'assets/phisap-inject' in names or 'lib/arm64-v8a/libphisap-inject.so' in names:
-        raise RuntimeError('APK 仍打包旧 ptrace 注入器')
     return OUT
 
 
