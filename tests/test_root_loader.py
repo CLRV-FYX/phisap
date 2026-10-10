@@ -1,5 +1,8 @@
 """Regression checks for the APK's standalone root-only process loader."""
 from pathlib import Path
+import shlex
+import shutil
+import subprocess
 import sys
 import unittest
 import zipfile
@@ -7,8 +10,71 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 
-from app_dex import build_dex  # noqa: E402
-from dexlib import audit_dex  # noqa: E402
+from app_dex import ACT, _safe_play, build_dex  # noqa: E402
+from dexlib import DexBuilder, audit_dex  # noqa: E402
+
+
+def _render_generated_play_shell() -> str:
+    """Evaluate only the StringBuilder part of the hand-built DEX shell method."""
+    dex = DexBuilder()
+    _safe_play(dex)
+    asm = next(method.asm for method in dex._methods if method.name == 'shell')
+    labels = {op[1]: index for index, op in enumerate(asm.ops) if op[0] == 'label'}
+    registers = {}
+    files = {}
+    builders = {}
+    result = None
+    pc = 0
+    while pc < len(asm.ops):
+        op = asm.ops[pc]
+        kind = op[0]
+        if kind == 'string':
+            registers[op[1]] = op[2]
+        elif kind == 'type21' and op[1] == 0x22 and op[3] == 'Ljava/lang/StringBuilder;':
+            builders[op[2]] = ''
+        elif kind == 'field22':
+            _, _, dest, _, field = op
+            registers[dest] = {
+                'sourceDir': '/data/app/app.phisap.pocket/base.apk',
+                'nativeLibraryDir': '/data/app/app.phisap.pocket/lib/arm64',
+                'x': 1920,
+                'y': 1080,
+            }.get(field[1], 0)
+        elif kind == 'invoke':
+            _, _, method, args = op
+            owner, name, (_, parameter_types) = method
+            if owner == ACT and name == 'file':
+                result = '/data/user/0/app.phisap.pocket/files/' + str(registers[args[1]])
+            elif name == 'getAbsolutePath':
+                result = files[args[0]]
+            elif owner == 'Ljava/lang/StringBuilder;' and name == 'append':
+                value = registers.get(args[1], 0)
+                builders[args[0]] += str(value if parameter_types == ('Ljava/lang/String;',) else value)
+                result = None
+            elif owner == 'Ljava/lang/StringBuilder;' and name == 'toString':
+                result = builders[args[0]]
+            elif name == 'getApplicationInfo':
+                result = object()
+            else:
+                result = None
+        elif kind == 'raw' and op[1] and (op[1][0] & 0xff) == 0x0c:  # move-result-object
+            dest = (op[1][0] >> 8) & 0xff
+            registers[dest] = result
+            if isinstance(result, str) and result.startswith('/data/user/0/'):
+                files[dest] = result
+            result = None
+        elif kind == 'if':
+            _, test, reg, _, target = op
+            value = registers.get(reg, 0)
+            take = bool(value) if test == 0x39 else not bool(value) if test == 0x38 else False
+            if take:
+                pc = labels[target]
+                continue
+        elif kind == 'goto':
+            pc = labels[op[1]]
+            continue
+        pc += 1
+    return registers[0]
 
 
 class RootOnlyLoaderTest(unittest.TestCase):
@@ -43,6 +109,47 @@ class RootOnlyLoaderTest(unittest.TestCase):
     def test_dex_does_not_modify_system_wrap_properties(self):
         self.assertNotIn('wrap.', self.dex_text)
         self.assertNotIn('resetprop', self.dex_text)
+
+    def test_external_player_restores_selinux_and_never_imports_stale_shared_plan(self):
+        self.assertIn('old_se=$(getenforce 2>/dev/null || true)', self.dex_text)
+        self.assertIn("trap 'restore_se' EXIT", self.dex_text)
+        self.assertIn("trap 'restore_se; exit 143' TERM", self.dex_text)
+        self.assertIn('setenforce 0', self.dex_text)
+        self.assertIn('setenforce 1', self.dex_text)
+        self.assertIn('changed_se', self.dex_text)
+        self.assertNotIn('pullPushed', self.dex_text)
+        self.assertNotIn('/sdcard/phisap/plan.json', self.dex_text)
+
+    def test_external_play_argument_order_matches_injector_contract(self):
+        play = self.app_builder.split('sh = Asm(16, 1)', 1)[1].split(
+            "dex.add_method(ACT, 'shell'", 1
+        )[0]
+        delay_and_first_library = " 3000 '/data/local/tmp/libphisap-ioctl.so' '"
+        library_tail = "'; rc=$?"
+        self.assertIn(delay_and_first_library, play)
+        self.assertIn(library_tail, play)
+        self.assertLess(play.index(delay_and_first_library), play.index(library_tail))
+        self.assertIn('[4, 10]', play[play.index(delay_and_first_library):])
+
+        command = _render_generated_play_shell()
+        if shutil.which('sh'):
+            subprocess.run(['sh', '-n'], input=command, text=True, check=True, capture_output=True)
+        app_command = command[command.index('CLASSPATH='):command.index('; rc=$?')]
+        tokens = shlex.split(app_command)
+        args = tokens[tokens.index('app.phisap.pocket.Injector') + 1:]
+        self.assertEqual(len(args), 11)
+        self.assertEqual(args[7], '3000')  # parsed as the start-delay argument
+        self.assertEqual(args[8], '/data/local/tmp/libphisap-ioctl.so')
+        self.assertTrue(args[9].endswith('/files/libphisap-ioctl.so'))
+        self.assertTrue(args[10].endswith('/lib/arm64/libphisap-ioctl.so'))
+
+        injector = self.app_builder.split('# main(String[] args)', 1)[1].split(
+            'def _tap(dex: DexBuilder):', 1
+        )[0]
+        self.assertIn('# args: plan offset w h status stop rot delay', injector)
+        self.assertIn("main.const(1, 7)", injector)  # numeric delay argument
+        self.assertIn("main.const(1, 8)\n    main.label('try_lib')", injector)
+        self.assertIn("main.const(0, 11)\n    main.if_lt(1, 0, 'try_lib')", injector)
 
     def test_first_run_migrates_old_mode_and_clears_stale_status(self):
         load_saved = self.app_builder.split("load.const_string(1, 'loader-version.txt')", 1)[1].split(
@@ -113,6 +220,13 @@ class RootOnlyLoaderTest(unittest.TestCase):
             native = apk.read('assets/libphisap.so')
             script = apk.read('assets/inside.sh').decode('utf-8')
         audit_dex(packaged_dex)
+        self.assertEqual(packaged_dex, self.dex)
+        self.assertIn(b"old_se=$(getenforce 2>/dev/null || true)", packaged_dex)
+        self.assertIn(b"trap 'restore_se' EXIT", packaged_dex)
+        self.assertIn(b'trap \'restore_se; exit 143\' TERM', packaged_dex)
+        self.assertIn(b" 3000 '/data/local/tmp/libphisap-ioctl.so' '", packaged_dex)
+        self.assertNotIn(b'pullPushed', packaged_dex)
+        self.assertNotIn(b'/sdcard/phisap/plan.json', packaged_dex)
         self.assertIn(b'phisap-inject-26', inject)
         self.assertIn('用法: phisap-inject <pid> <so>'.encode(), inject)
         self.assertNotIn(b'zygisk', inject.lower())

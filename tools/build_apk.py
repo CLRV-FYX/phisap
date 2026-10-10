@@ -636,6 +636,17 @@ def build() -> Path:
         raise RuntimeError('新 APK 缺少可见版本标识或旧设置迁移')
     if b'wrap.' in dex or b'resetprop' in dex:
         raise RuntimeError('root-only DEX 不得修改系统启动 wrap 配置')
+    if (
+        b'old_se=$(getenforce 2>/dev/null || true)' not in dex
+        or b"trap 'restore_se' EXIT" not in dex
+        or b'trap \'restore_se; exit 143\' TERM' not in dex
+        or b'setenforce 1' not in dex
+    ):
+        raise RuntimeError('外部播放器必须在退出/终止时恢复 SELinux 状态')
+    if b'pullPushed' in dex or b'/sdcard/phisap/plan.json' in dex:
+        raise RuntimeError('APK 不得从共享存储反复导入旧计划')
+    if b" 3000 '/data/local/tmp/libphisap-ioctl.so' '" not in dex:
+        raise RuntimeError('外部播放器必须先传 3000ms 启动偏移，再传触摸库路径')
     if b'ioctlInt' in dex:
         raise RuntimeError('dex 仍引用 ioctlInt')
     if '触摸库没加载'.encode() not in dex or b'nioctl' not in dex:

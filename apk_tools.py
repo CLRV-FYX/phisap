@@ -253,25 +253,39 @@ POCKET_PACKAGE = 'app.phisap.pocket'
 
 
 def push_device_plan(adb: Adb, payload: str) -> str:
-    """第一种方式：计划直接 adb 传到手机，不经过保存对话框。"""
+    """用 ADB 传计划，再由 root 原子地安装到 APK 私有目录。"""
     import tempfile
+
     fd, local = tempfile.mkstemp(suffix='.json')
     remote_tmp = '/data/local/tmp/phisap-plan.json'
+    app_root = f'/data/data/{POCKET_PACKAGE}'
+    app_files = f'{app_root}/files'
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as out:
             out.write(payload)
         adb.run('push', local, remote_tmp, timeout=60)
+        # Do not claim success after an unprivileged copy to /sdcard: the APK has
+        # no shared-storage permission and reads its plan from its private files.
+        # Try `su` first, then a root adbd (where the same guarded script works).
         script = (
-            'mkdir -p /sdcard/phisap; '
-            f'cp {remote_tmp} /sdcard/phisap/plan.json; '
-            'chmod 644 /sdcard/phisap/plan.json; '
-            f'if [ -d /data/data/{POCKET_PACKAGE} ]; then '
-            f'mkdir -p /data/data/{POCKET_PACKAGE}/files; '
-            f'cp {remote_tmp} /data/data/{POCKET_PACKAGE}/files/plan.json; '
-            f'uid=$(stat -c %u /data/data/{POCKET_PACKAGE}); '
-            f'chown "$uid:$uid" /data/data/{POCKET_PACKAGE}/files/plan.json; '
-            f'chmod 600 /data/data/{POCKET_PACKAGE}/files/plan.json; '
-            'fi'
+            'set -eu; '
+            'if [ "$(id -u)" -ne 0 ]; then '
+            'echo "root is required to install a device plan" >&2; exit 77; fi; '
+            f'src={shlex.quote(remote_tmp)}; '
+            f'app_root={shlex.quote(app_root)}; '
+            f'app_files={shlex.quote(app_files)}; '
+            'test -f "$src" || { echo "uploaded plan is missing" >&2; exit 2; }; '
+            'test -d "$app_root" || { echo "PhiSAP APK is not installed" >&2; exit 3; }; '
+            'mkdir -p "$app_files"; '
+            'tmp="$app_files/.plan.json.tmp.$$"; '
+            'trap \'rm -f "$tmp"\' EXIT; '
+            'cp "$src" "$tmp"; '
+            'uid=$(stat -c %u "$app_root"); '
+            'chown "$uid:$uid" "$tmp"; '
+            'chmod 600 "$tmp"; '
+            'mv -f "$tmp" "$app_files/plan.json"; '
+            'test "$(stat -c %u "$app_files/plan.json")" = "$uid"; '
+            'rm -f "$src"'
         )
         last = None
         for cmd in (f'su -c {shlex.quote(script)}', script):
@@ -282,12 +296,12 @@ def push_device_plan(adb: Adb, payload: str) -> str:
             except AdbError as e:
                 last = e
         else:
-            raise AdbError(f'计划没写进手机: {last}')
+            raise AdbError(f'计划没写进 APK 私有目录；请确认 shell 的 SU 授权: {last}')
         try:
             adb.shell(f'am start -n {POCKET_PACKAGE}/.MainActivity', timeout=15)
         except AdbError:
             pass
-        return '已通过 adb 传到手机'
+        return '已通过 ADB + root 传到手机'
     finally:
         try:
             os.unlink(local)

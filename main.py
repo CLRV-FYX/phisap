@@ -648,7 +648,7 @@ class MainPage(ScrollArea):
         self.device_export_btn = PushButton(FIF.PHONE, '传到手机')
         self.device_export_btn.clicked.connect(self.export_device_plan)
         self.device_export_btn.setEnabled(False)
-        self.device_export_btn.setToolTip('adb 直接把计划传到手机版。电脑版照常用 ADB 演奏，规划仍在这边做。')
+        self.device_export_btn.setToolTip('ADB 直接把计划传入手机版私有目录；需要手机已安装口袋版并允许 ADB shell 使用 root。电脑版照常用 ADB 演奏，规划仍在这边做。')
         plan_btn_row.addWidget(self.device_export_btn)
         plan_btn_row.addStretch(1)
         plan_group.vBoxLayout.addLayout(plan_btn_row)
@@ -1617,7 +1617,7 @@ class MainPage(ScrollArea):
             InfoBar.success('已导出', fn, parent=self.window(), duration=2000)
 
     def export_device_plan(self):
-        '''第一种方式：计划直接 adb 传到手机。电脑版的 ADB 演奏不受影响。'''
+        '''用 ADB + root 把计划写入口袋版私有目录。电脑版的 ADB 演奏不受影响。'''
         if not self.plan_path:
             return
         serial = self.devices_box.currentText().strip()
