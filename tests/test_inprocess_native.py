@@ -155,7 +155,8 @@ class InProcessLauncherRegressionTest(unittest.TestCase):
         self.assertIn('text_write_failed("入口分支")', INJECT_C)
 
     def test_windows_updater_targets_the_branch_with_the_current_fixes(self):
-        self.assertIn("$Branch = 'arena/369a6f58-phisap'", UPDATE_CMD)
+        self.assertIn("$Branch = 'arena/47d37e24-phisap'", UPDATE_CMD)
+        self.assertNotIn("$Branch = 'arena/369a6f58-phisap'", UPDATE_CMD)
         self.assertNotIn("$Branch = 'arena/01a0fd15-phisap'", UPDATE_CMD)
 
     def test_windows_updater_describes_the_root_only_android_install(self):
